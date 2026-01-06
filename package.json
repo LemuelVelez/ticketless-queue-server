@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "migrate": "ts-node --transpile-only --project tsconfig.json ./src/seeder/seedAdmin.ts",
+    "migrate": "ts-node --transpile-only --project tsconfig.json ./src/migration/migrate.ts",
+    "seed:admin": "ts-node --transpile-only --project tsconfig.json ./src/seeder/seedAdmin.ts",
+    "seed": "npm run seed:admin",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
