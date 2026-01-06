@@ -20,9 +20,12 @@ router.get("/windows", adminController.listWindows)
 router.post("/windows", adminController.createWindow)
 router.put("/windows/:id", adminController.updateWindow)
 
-// Staff
+// Staff / Accounts
 router.get("/staff", adminController.listStaff)
 router.post("/staff", adminController.createStaff)
 router.put("/staff/:id", adminController.updateStaff)
+
+// ✅ NEW: delete account (used by accounts.tsx)
+router.delete("/staff/:id", adminController.deleteStaff)
 
 export default router

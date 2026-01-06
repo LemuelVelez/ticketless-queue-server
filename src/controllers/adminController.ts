@@ -1,14 +1,48 @@
 import type { Request, Response } from "express"
+import { Types } from "mongoose"
+
 import { DepartmentModel } from "../models/Department"
 import { ServiceWindowModel } from "../models/ServiceWindow"
 import { SettingModel } from "../models/Setting"
-import { UserModel } from "../models/User"
+import { UserModel, type UserRole } from "../models/User"
 import { AuditLogModel } from "../models/AuditLog"
 import { hashPassword } from "./security"
 
 function actor(req: Request) {
     const u = (req as any).user
     return { actor: u?.id, actorRole: u?.role }
+}
+
+function normalizeEmail(email: unknown) {
+    return String(email ?? "").toLowerCase().trim()
+}
+
+function isRole(value: unknown): value is UserRole {
+    return value === "ADMIN" || value === "STAFF"
+}
+
+/**
+ * Turns "null"/"undefined"/"" into null, otherwise trims to string.
+ */
+function cleanId(v: unknown): string | null {
+    if (v === null || v === undefined) return null
+    const s = String(v).trim()
+    if (!s || s === "null" || s === "undefined") return null
+    return s
+}
+
+/**
+ * Parse an incoming id (string/null/undefined) to ObjectId or undefined (meaning "unset").
+ * Returns { error } when invalid.
+ */
+function parseObjectId(
+    v: unknown,
+    fieldName: string,
+): { value?: Types.ObjectId; error?: string } {
+    const s = cleanId(v)
+    if (!s) return { value: undefined }
+    if (!Types.ObjectId.isValid(s)) return { error: `${fieldName} must be a valid ObjectId` }
+    return { value: new Types.ObjectId(s) }
 }
 
 export const adminController = {
@@ -52,7 +86,10 @@ export const adminController = {
         const { name, code } = req.body || {}
         if (!name) return res.status(400).json({ message: "name is required" })
 
-        const department = await DepartmentModel.create({ name: String(name).trim(), code: code ? String(code).trim() : undefined })
+        const department = await DepartmentModel.create({
+            name: String(name).trim(),
+            code: code ? String(code).trim() : undefined,
+        })
 
         await AuditLogModel.create({
             ...actor(req),
@@ -91,8 +128,13 @@ export const adminController = {
     // WINDOWS
     listWindows: async (req: Request, res: Response) => {
         const { departmentId } = req.query
+
         const filter: any = {}
-        if (departmentId) filter.department = departmentId
+        if (departmentId) {
+            const parsed = parseObjectId(departmentId, "departmentId")
+            if (parsed.error) return res.status(400).json({ message: parsed.error })
+            if (parsed.value) filter.department = parsed.value
+        }
 
         const windows = await ServiceWindowModel.find(filter).sort({ department: 1, number: 1 })
         return res.json({ windows })
@@ -104,8 +146,12 @@ export const adminController = {
             return res.status(400).json({ message: "departmentId, name, number are required" })
         }
 
+        const deptParsed = parseObjectId(departmentId, "departmentId")
+        if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
+        if (!deptParsed.value) return res.status(400).json({ message: "departmentId is required" })
+
         const win = await ServiceWindowModel.create({
-            department: departmentId,
+            department: deptParsed.value,
             name: String(name).trim(),
             number: Number(number),
         })
@@ -144,21 +190,44 @@ export const adminController = {
         return res.json({ window: win })
     },
 
-    // STAFF ACCOUNTS
+    // ACCOUNTS (kept names listStaff/createStaff/updateStaff for frontend compatibility)
     listStaff: async (_req: Request, res: Response) => {
-        const staff = await UserModel.find({ role: "STAFF" })
+        const staff = await UserModel.find({})
             .select("-passwordHash -passwordSalt -passwordIterations -passwordAlgo")
             .sort({ createdAt: -1 })
+
         return res.json({ staff })
     },
 
     createStaff: async (req: Request, res: Response) => {
-        const { name, email, password, departmentId, windowId } = req.body || {}
-        if (!name || !email || !password || !departmentId || !windowId) {
-            return res.status(400).json({ message: "name, email, password, departmentId, windowId are required" })
+        const { name, email, password } = req.body || {}
+        const roleRaw = (req.body || {}).role
+        const role: UserRole = isRole(roleRaw) ? roleRaw : "STAFF"
+
+        const departmentIdRaw = (req.body || {}).departmentId
+        const windowIdRaw = (req.body || {}).windowId
+
+        if (!name || !email || !password) {
+            return res.status(400).json({ message: "name, email, password are required" })
         }
 
-        const normalizedEmail = String(email).toLowerCase().trim()
+        if (role === "STAFF") {
+            if (!cleanId(departmentIdRaw) || !cleanId(windowIdRaw)) {
+                return res.status(400).json({ message: "departmentId and windowId are required for STAFF" })
+            }
+        }
+
+        const deptParsed = parseObjectId(departmentIdRaw, "departmentId")
+        if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
+
+        const winParsed = parseObjectId(windowIdRaw, "windowId")
+        if (winParsed.error) return res.status(400).json({ message: winParsed.error })
+
+        if (winParsed.value && !deptParsed.value) {
+            return res.status(400).json({ message: "departmentId is required when windowId is provided" })
+        }
+
+        const normalizedEmail = normalizeEmail(email)
         const existing = await UserModel.findOne({ email: normalizedEmail })
         if (existing) return res.status(409).json({ message: "Email already exists" })
 
@@ -167,21 +236,24 @@ export const adminController = {
         const user = await UserModel.create({
             name: String(name).trim(),
             email: normalizedEmail,
-            role: "STAFF",
+            role,
             active: true,
+
             passwordSalt: salt,
             passwordHash: hash,
             passwordAlgo: algo,
             passwordIterations: iterations,
-            assignedDepartment: departmentId,
-            assignedWindow: windowId,
+
+            assignedDepartment: role === "STAFF" ? deptParsed.value : undefined,
+            assignedWindow: role === "STAFF" ? winParsed.value : undefined,
         })
 
         await AuditLogModel.create({
             ...actor(req),
-            action: "ADMIN_CREATE_STAFF",
+            action: "ADMIN_CREATE_USER",
             entityType: "User",
             entityId: user._id as any,
+            meta: { role },
         })
 
         return res.status(201).json({
@@ -199,15 +271,48 @@ export const adminController = {
 
     updateStaff: async (req: Request, res: Response) => {
         const { id } = req.params
-        const { name, active, departmentId, windowId, password } = req.body || {}
+        const { name, active, password } = req.body || {}
+
+        const roleRaw = (req.body || {}).role
+        const nextRole: UserRole | undefined = isRole(roleRaw) ? roleRaw : undefined
+
+        const departmentIdRaw = (req.body || {}).departmentId
+        const windowIdRaw = (req.body || {}).windowId
 
         const user = await UserModel.findById(id)
-        if (!user || user.role !== "STAFF") return res.status(404).json({ message: "Staff not found" })
+        if (!user) return res.status(404).json({ message: "User not found" })
 
         if (name !== undefined) user.name = String(name).trim()
         if (active !== undefined) user.active = Boolean(active)
-        if (departmentId !== undefined) user.assignedDepartment = departmentId
-        if (windowId !== undefined) user.assignedWindow = windowId
+
+        if (nextRole) {
+            user.role = nextRole
+            if (nextRole === "ADMIN") {
+                user.assignedDepartment = undefined
+                user.assignedWindow = undefined
+            }
+        }
+
+        if (user.role === "STAFF") {
+            if (departmentIdRaw !== undefined) {
+                const deptParsed = parseObjectId(departmentIdRaw, "departmentId")
+                if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
+                user.assignedDepartment = deptParsed.value
+            }
+
+            if (windowIdRaw !== undefined) {
+                const winParsed = parseObjectId(windowIdRaw, "windowId")
+                if (winParsed.error) return res.status(400).json({ message: winParsed.error })
+                user.assignedWindow = winParsed.value
+            }
+
+            if (user.assignedWindow && !user.assignedDepartment) {
+                return res.status(400).json({ message: "assignedDepartment is required when assignedWindow is set" })
+            }
+        } else {
+            user.assignedDepartment = undefined
+            user.assignedWindow = undefined
+        }
 
         if (password) {
             const { salt, hash, algo, iterations } = await hashPassword(String(password))
@@ -221,10 +326,17 @@ export const adminController = {
 
         await AuditLogModel.create({
             ...actor(req),
-            action: "ADMIN_UPDATE_STAFF",
+            action: "ADMIN_UPDATE_USER",
             entityType: "User",
             entityId: user._id as any,
-            meta: { name, active, departmentId, windowId, passwordChanged: Boolean(password) },
+            meta: {
+                name,
+                active,
+                role: nextRole,
+                departmentId: departmentIdRaw !== undefined ? cleanId(departmentIdRaw) : undefined,
+                windowId: windowIdRaw !== undefined ? cleanId(windowIdRaw) : undefined,
+                passwordChanged: Boolean(password),
+            },
         })
 
         return res.json({
@@ -238,5 +350,39 @@ export const adminController = {
                 assignedWindow: user.assignedWindow ? String(user.assignedWindow) : null,
             },
         })
+    },
+
+    deleteStaff: async (req: Request, res: Response) => {
+        const { id } = req.params
+        const u = (req as any).user
+        const currentUserId = String(u?.id ?? "")
+
+        if (!id) return res.status(400).json({ message: "id is required" })
+
+        if (currentUserId && String(id) === currentUserId) {
+            return res.status(400).json({ message: "You cannot delete your own account." })
+        }
+
+        const user = await UserModel.findById(id)
+        if (!user) return res.status(404).json({ message: "User not found" })
+
+        if (user.role === "ADMIN" && user.active) {
+            const activeAdminCount = await UserModel.countDocuments({ role: "ADMIN", active: true })
+            if (activeAdminCount <= 1) {
+                return res.status(400).json({ message: "Cannot delete the last active admin account." })
+            }
+        }
+
+        await UserModel.deleteOne({ _id: user._id })
+
+        await AuditLogModel.create({
+            ...actor(req),
+            action: "ADMIN_DELETE_USER",
+            entityType: "User",
+            entityId: user._id as any,
+            meta: { deletedRole: user.role, deletedEmail: user.email },
+        })
+
+        return res.json({ ok: true })
     },
 }
