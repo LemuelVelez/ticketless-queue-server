@@ -16,6 +16,10 @@ export type UserDoc = {
     assignedDepartment?: Types.ObjectId
     assignedWindow?: Types.ObjectId
 
+    // ✅ Avatar fields
+    avatarKey?: string
+    avatarUrl?: string
+
     // ✅ Password reset fields
     passwordResetTokenHash?: string
     passwordResetExpiresAt?: Date
@@ -38,6 +42,10 @@ const UserSchema = new Schema<UserDoc>(
 
         assignedDepartment: { type: Schema.Types.ObjectId, ref: "Department" },
         assignedWindow: { type: Schema.Types.ObjectId, ref: "ServiceWindow" },
+
+        // ✅ Avatar fields
+        avatarKey: { type: String },
+        avatarUrl: { type: String },
 
         // ✅ Password reset fields
         passwordResetTokenHash: { type: String },
