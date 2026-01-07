@@ -52,4 +52,8 @@ const TicketSchema = new Schema<TicketDoc>(
 // Unique queue number per department per day
 TicketSchema.index({ department: 1, dateKey: 1, queueNumber: 1 }, { unique: true })
 
+// ✅ Reports-friendly indexes
+TicketSchema.index({ dateKey: 1, department: 1, status: 1 })
+TicketSchema.index({ dateKey: 1, status: 1 })
+
 export const TicketModel = mongoose.model<TicketDoc>("Ticket", TicketSchema)

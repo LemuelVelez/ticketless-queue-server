@@ -25,7 +25,14 @@ router.get("/staff", adminController.listStaff)
 router.post("/staff", adminController.createStaff)
 router.put("/staff/:id", adminController.updateStaff)
 
-// ✅ NEW: delete account (used by accounts.tsx)
+// ✅ delete account (used by accounts.tsx)
 router.delete("/staff/:id", adminController.deleteStaff)
+
+// ✅ Reports
+router.get("/reports/summary", adminController.reportsSummary)
+router.get("/reports/timeseries", adminController.reportsTimeseries)
+
+// ✅ Audit logs
+router.get("/audit-logs", adminController.listAuditLogs)
 
 export default router

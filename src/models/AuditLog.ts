@@ -26,4 +26,9 @@ const AuditLogSchema = new Schema<AuditLogDoc>(
 
 AuditLogSchema.index({ createdAt: -1 })
 
+// ✅ Helpful for audit log filtering in UI
+AuditLogSchema.index({ action: 1, createdAt: -1 })
+AuditLogSchema.index({ actor: 1, createdAt: -1 })
+AuditLogSchema.index({ entityType: 1, createdAt: -1 })
+
 export const AuditLogModel = mongoose.model<AuditLogDoc>("AuditLog", AuditLogSchema)

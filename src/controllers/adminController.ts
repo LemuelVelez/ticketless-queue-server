@@ -6,6 +6,7 @@ import { ServiceWindowModel } from "../models/ServiceWindow"
 import { SettingModel } from "../models/Setting"
 import { UserModel, type UserRole } from "../models/User"
 import { AuditLogModel } from "../models/AuditLog"
+import { TicketModel, type TicketStatus } from "../models/Ticket"
 import { hashPassword } from "./security"
 
 function actor(req: Request) {
@@ -35,14 +36,61 @@ function cleanId(v: unknown): string | null {
  * Parse an incoming id (string/null/undefined) to ObjectId or undefined (meaning "unset").
  * Returns { error } when invalid.
  */
-function parseObjectId(
-    v: unknown,
-    fieldName: string,
-): { value?: Types.ObjectId; error?: string } {
+function parseObjectId(v: unknown, fieldName: string): { value?: Types.ObjectId; error?: string } {
     const s = cleanId(v)
     if (!s) return { value: undefined }
     if (!Types.ObjectId.isValid(s)) return { error: `${fieldName} must be a valid ObjectId` }
     return { value: new Types.ObjectId(s) }
+}
+
+/** =================
+ * REPORTS HELPERS
+ * ================= */
+
+const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/ // YYYY-MM-DD
+
+function isDateKey(v: unknown): v is string {
+    return typeof v === "string" && DATE_KEY_RE.test(v)
+}
+
+function todayDateKeyUTC(): string {
+    // Using UTC keeps formatting stable regardless of server locale.
+    return new Date().toISOString().slice(0, 10)
+}
+
+function normalizeDateRange(fromRaw: unknown, toRaw: unknown): { from: string; to: string } {
+    const from = isDateKey(fromRaw) ? fromRaw : undefined
+    const to = isDateKey(toRaw) ? toRaw : undefined
+
+    if (from && to) {
+        return from <= to ? { from, to } : { from: to, to: from }
+    }
+
+    if (from && !to) return { from, to: from }
+    if (!from && to) return { from: to, to }
+    const today = todayDateKeyUTC()
+    return { from: today, to: today }
+}
+
+function parseDateBoundary(v: unknown, mode: "start" | "end"): Date | null {
+    if (typeof v !== "string" || !v.trim()) return null
+    const s = v.trim()
+
+    // Accept YYYY-MM-DD as whole-day range in UTC
+    if (isDateKey(s)) {
+        if (mode === "start") return new Date(`${s}T00:00:00.000Z`)
+        return new Date(`${s}T23:59:59.999Z`)
+    }
+
+    // Otherwise try Date parse (ISO etc)
+    const d = new Date(s)
+    if (Number.isNaN(d.getTime())) return null
+    return d
+}
+
+function toInt(v: unknown, fallback: number) {
+    const n = Number(v)
+    return Number.isFinite(n) ? n : fallback
 }
 
 export const adminController = {
@@ -384,5 +432,268 @@ export const adminController = {
         })
 
         return res.json({ ok: true })
+    },
+
+    /** =================
+     * REPORTS
+     * ================= */
+
+    reportsSummary: async (req: Request, res: Response) => {
+        const { from, to } = normalizeDateRange(req.query.from, req.query.to)
+
+        const match: any = {
+            dateKey: { $gte: from, $lte: to },
+        }
+
+        if (req.query.departmentId) {
+            const parsed = parseObjectId(req.query.departmentId, "departmentId")
+            if (parsed.error) return res.status(400).json({ message: parsed.error })
+            if (parsed.value) match.department = parsed.value
+        }
+
+        const waitMsExpr = {
+            $cond: [
+                {
+                    $and: [
+                        { $ne: ["$calledAt", null] },
+                        { $ne: ["$waitingSince", null] },
+                    ],
+                },
+                { $subtract: ["$calledAt", "$waitingSince"] },
+                null,
+            ],
+        }
+
+        const serviceMsExpr = {
+            $cond: [
+                {
+                    $and: [
+                        { $ne: ["$servedAt", null] },
+                        { $ne: ["$calledAt", null] },
+                    ],
+                },
+                { $subtract: ["$servedAt", "$calledAt"] },
+                null,
+            ],
+        }
+
+        const [agg] = await TicketModel.aggregate([
+            { $match: match },
+            {
+                $facet: {
+                    total: [{ $count: "count" }],
+                    byStatus: [
+                        { $group: { _id: "$status", count: { $sum: 1 } } },
+                        { $sort: { _id: 1 } },
+                    ],
+                    timings: [
+                        { $project: { waitMs: waitMsExpr, serviceMs: serviceMsExpr } },
+                        {
+                            $group: {
+                                _id: null,
+                                avgWaitMs: { $avg: "$waitMs" },
+                                avgServiceMs: { $avg: "$serviceMs" },
+                            },
+                        },
+                    ],
+                    byDepartment: [
+                        {
+                            $group: {
+                                _id: "$department",
+                                total: { $sum: 1 },
+                                waiting: { $sum: { $cond: [{ $eq: ["$status", "WAITING"] }, 1, 0] } },
+                                called: { $sum: { $cond: [{ $eq: ["$status", "CALLED"] }, 1, 0] } },
+                                hold: { $sum: { $cond: [{ $eq: ["$status", "HOLD"] }, 1, 0] } },
+                                out: { $sum: { $cond: [{ $eq: ["$status", "OUT"] }, 1, 0] } },
+                                served: { $sum: { $cond: [{ $eq: ["$status", "SERVED"] }, 1, 0] } },
+                                avgWaitMs: { $avg: waitMsExpr },
+                                avgServiceMs: { $avg: serviceMsExpr },
+                            },
+                        },
+                        {
+                            $lookup: {
+                                from: "departments",
+                                localField: "_id",
+                                foreignField: "_id",
+                                as: "department",
+                            },
+                        },
+                        { $unwind: { path: "$department", preserveNullAndEmptyArrays: true } },
+                        {
+                            $project: {
+                                _id: 1,
+                                name: "$department.name",
+                                code: "$department.code",
+                                total: 1,
+                                waiting: 1,
+                                called: 1,
+                                hold: 1,
+                                out: 1,
+                                served: 1,
+                                avgWaitMs: 1,
+                                avgServiceMs: 1,
+                            },
+                        },
+                        { $sort: { name: 1 } },
+                    ],
+                },
+            },
+        ])
+
+        const total = agg?.total?.[0]?.count ?? 0
+
+        const byStatusArr: Array<{ _id: TicketStatus; count: number }> = agg?.byStatus ?? []
+        const byStatus: Record<string, number> = {}
+        for (const row of byStatusArr) byStatus[row._id] = row.count
+
+        const timingRow = agg?.timings?.[0] ?? null
+        const avgWaitMs = timingRow?.avgWaitMs ?? null
+        const avgServiceMs = timingRow?.avgServiceMs ?? null
+
+        const departmentsRaw = agg?.byDepartment ?? []
+        const departments = departmentsRaw.map((d: any) => ({
+            departmentId: d._id ? String(d._id) : "",
+            name: d.name,
+            code: d.code,
+            total: d.total ?? 0,
+            waiting: d.waiting ?? 0,
+            called: d.called ?? 0,
+            hold: d.hold ?? 0,
+            out: d.out ?? 0,
+            served: d.served ?? 0,
+            avgWaitMs: d.avgWaitMs ?? null,
+            avgServiceMs: d.avgServiceMs ?? null,
+        }))
+
+        return res.json({
+            range: { from, to },
+            totals: {
+                total,
+                byStatus,
+                avgWaitMs,
+                avgServiceMs,
+            },
+            departments,
+        })
+    },
+
+    reportsTimeseries: async (req: Request, res: Response) => {
+        const { from, to } = normalizeDateRange(req.query.from, req.query.to)
+
+        const match: any = {
+            dateKey: { $gte: from, $lte: to },
+        }
+
+        if (req.query.departmentId) {
+            const parsed = parseObjectId(req.query.departmentId, "departmentId")
+            if (parsed.error) return res.status(400).json({ message: parsed.error })
+            if (parsed.value) match.department = parsed.value
+        }
+
+        const rows: Array<{ _id: { dateKey: string; status: TicketStatus }; count: number }> =
+            await TicketModel.aggregate([
+                { $match: match },
+                {
+                    $group: {
+                        _id: { dateKey: "$dateKey", status: "$status" },
+                        count: { $sum: 1 },
+                    },
+                },
+                { $sort: { "_id.dateKey": 1 } },
+            ])
+
+        const map = new Map<
+            string,
+            { dateKey: string; total: number; waiting: number; called: number; hold: number; out: number; served: number }
+        >()
+
+        const ensure = (dateKey: string) => {
+            const existing = map.get(dateKey)
+            if (existing) return existing
+            const init = { dateKey, total: 0, waiting: 0, called: 0, hold: 0, out: 0, served: 0 }
+            map.set(dateKey, init)
+            return init
+        }
+
+        for (const r of rows) {
+            const dateKey = r._id.dateKey
+            const status = r._id.status
+            const count = r.count ?? 0
+
+            const point = ensure(dateKey)
+            point.total += count
+
+            if (status === "WAITING") point.waiting += count
+            else if (status === "CALLED") point.called += count
+            else if (status === "HOLD") point.hold += count
+            else if (status === "OUT") point.out += count
+            else if (status === "SERVED") point.served += count
+        }
+
+        const series = Array.from(map.values()).sort((a, b) => a.dateKey.localeCompare(b.dateKey))
+
+        return res.json({
+            range: { from, to },
+            series,
+        })
+    },
+
+    /** =================
+     * AUDIT LOGS
+     * ================= */
+
+    listAuditLogs: async (req: Request, res: Response) => {
+        const page = Math.max(1, toInt(req.query.page, 1))
+        const limit = Math.min(200, Math.max(1, toInt(req.query.limit, 50)))
+        const skip = (page - 1) * limit
+
+        const filter: any = {}
+
+        if (typeof req.query.action === "string" && req.query.action.trim()) {
+            filter.action = req.query.action.trim()
+        }
+
+        if (typeof req.query.entityType === "string" && req.query.entityType.trim()) {
+            filter.entityType = req.query.entityType.trim()
+        }
+
+        if (req.query.actorRole) {
+            if (!isRole(req.query.actorRole)) {
+                return res.status(400).json({ message: "actorRole must be ADMIN or STAFF" })
+            }
+            filter.actorRole = req.query.actorRole
+        }
+
+        const fromD = parseDateBoundary(req.query.from, "start")
+        const toD = parseDateBoundary(req.query.to, "end")
+        if (fromD || toD) {
+            filter.createdAt = {}
+            if (fromD) filter.createdAt.$gte = fromD
+            if (toD) filter.createdAt.$lte = toD
+        }
+
+        const total = await AuditLogModel.countDocuments(filter)
+
+        const logsRaw = await AuditLogModel.find(filter)
+            .sort({ createdAt: -1, _id: -1 })
+            .skip(skip)
+            .limit(limit)
+            .populate("actor", "name email role")
+            .lean()
+
+        const logs = logsRaw.map((l: any) => ({
+            id: String(l._id),
+            actorId: l.actor?._id ? String(l.actor._id) : (l.actor ? String(l.actor) : null),
+            actorRole: l.actorRole ?? null,
+            actorName: l.actor?.name ?? null,
+            actorEmail: l.actor?.email ?? null,
+            action: String(l.action),
+            entityType: l.entityType ? String(l.entityType) : undefined,
+            entityId: l.entityId ? String(l.entityId) : null,
+            meta: l.meta ?? undefined,
+            createdAt: l.createdAt ? new Date(l.createdAt).toISOString() : new Date().toISOString(),
+        }))
+
+        return res.json({ page, limit, total, logs })
     },
 }
