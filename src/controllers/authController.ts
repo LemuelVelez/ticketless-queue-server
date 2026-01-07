@@ -60,6 +60,17 @@ export const authController = {
         return res.json({ user: u || null })
     },
 
+    // ✅ POST /auth/email-exists
+    emailExists: async (req: Request, res: Response) => {
+        const { email } = req.body || {}
+        const cleanEmail = normalizeEmail(email)
+        if (!cleanEmail) return res.status(400).json({ message: "email is required" })
+
+        // Only consider ACTIVE accounts
+        const user = await UserModel.findOne({ email: cleanEmail, active: true }).select("_id").lean()
+        return res.json({ exists: Boolean(user) })
+    },
+
     // ✅ POST /auth/password/forgot
     forgotPassword: async (req: Request, res: Response) => {
         const { email } = req.body || {}
@@ -67,11 +78,12 @@ export const authController = {
 
         if (!cleanEmail) return res.status(400).json({ message: "email is required" })
 
-        // Security: do not reveal if email exists
         const user = await UserModel.findOne({ email: cleanEmail, active: true })
-        if (!user) return res.json({ ok: true })
+        if (!user) {
+            // Keep API stable; frontend now checks existence before calling this.
+            return res.status(404).json({ message: "Email not found" })
+        }
 
-        // Generate token (sent to email), store only hash in DB
         const token = crypto.randomBytes(32).toString("hex")
         const tokenHash = sha256Hex(token)
 
@@ -82,20 +94,9 @@ export const authController = {
         user.passwordResetExpiresAt = expiresAt
         await user.save()
 
-        // Build reset link (optional but recommended)
-        const frontendUrl =
-            process.env.FRONTEND_URL || process.env.CLIENT_URL || process.env.APP_URL || ""
-
-        const base = frontendUrl ? frontendUrl.replace(/\/$/, "") : ""
-        const resetLink = base
-            ? `${base}/reset-password?token=${encodeURIComponent(token)}`
-            : undefined
-
-        // Send email using Gmail env vars
         await sendPasswordResetEmail({
             to: user.email,
             name: user.name,
-            resetLink,
             token,
             expiresMinutes,
         })
@@ -134,7 +135,6 @@ export const authController = {
         user.passwordAlgo = algo
         user.passwordIterations = iterations
 
-        // Clear reset fields
         user.passwordResetTokenHash = undefined
         user.passwordResetExpiresAt = undefined
 

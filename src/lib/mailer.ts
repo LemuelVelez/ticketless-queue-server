@@ -1,4 +1,6 @@
 import nodemailer from "nodemailer"
+import * as fs from "fs"
+import * as path from "path"
 
 function getTransporter() {
     const user = process.env.GMAIL_USER
@@ -13,7 +15,6 @@ function getTransporter() {
 }
 
 function escapeHtml(input: string) {
-    // Avoid String.prototype.replaceAll (TS target < ES2021)
     return input
         .split("&").join("&amp;")
         .split("<").join("&lt;")
@@ -26,22 +27,12 @@ function buildResetLinkFromClientOrigin(token: string) {
     const originRaw = process.env.CLIENT_ORIGIN
     if (!originRaw) return null
 
-    // Remove trailing slash safely without replaceAll
     const origin = originRaw.replace(/\/$/, "")
     return `${origin}/reset-password?token=${encodeURIComponent(token)}`
 }
 
 /**
  * Theme conversion from src/index.css (OKLCH -> HEX) approximations:
- * - background: #FFFFFF
- * - foreground: #0C0A09
- * - primary: #008D87
- * - primary-foreground: #FAFAF9
- * - secondary: #E5F8F6
- * - muted: #EFF7F6
- * - muted-foreground: #576766
- * - border/input: #E7E5E4
- * - ring: #18A7A1
  */
 const THEME = {
     background: "#FFFFFF",
@@ -55,10 +46,52 @@ const THEME = {
     ring: "#18A7A1",
 }
 
+// ✅ Gmail tends to be more reliable when CID includes "@"
+const LOGO_PNG_CID = "queuepass-logo@queuepass.local"
+
+function findLogoPngPath(): string | null {
+    const candidates = [
+        path.join(process.cwd(), "src", "images", "logo.png"),
+        path.join(process.cwd(), "dist", "images", "logo.png"),
+        path.join(process.cwd(), "build", "images", "logo.png"),
+        path.join(__dirname, "..", "images", "logo.png"),
+        path.join(__dirname, "..", "..", "images", "logo.png"),
+        path.join(__dirname, "..", "..", "..", "images", "logo.png"),
+    ]
+
+    for (const p of candidates) {
+        try {
+            if (fs.existsSync(p)) return p
+        } catch {
+            // ignore
+        }
+    }
+    return null
+}
+
+function getInlineLogoAttachment(): { filename: string; content: Buffer; cid: string; contentType: string } | null {
+    const logoPngPath = findLogoPngPath()
+    if (!logoPngPath) return null
+
+    try {
+        const content = fs.readFileSync(logoPngPath)
+        if (!content || content.length === 0) return null
+
+        return {
+            filename: "logo.png",
+            content,
+            cid: LOGO_PNG_CID,
+            contentType: "image/png",
+        }
+    } catch {
+        return null
+    }
+}
+
 export async function sendPasswordResetEmail(opts: {
     to: string
     name?: string
-    resetLink?: string // backward-compat; used only if CLIENT_ORIGIN is missing
+    resetLink?: string
     token: string
     expiresMinutes: number
 }) {
@@ -73,25 +106,39 @@ export async function sendPasswordResetEmail(opts: {
     const safeName = opts.name ? escapeHtml(opts.name.trim()) : ""
     const greeting = safeName ? `Hi ${safeName},` : "Hi,"
 
-    // ✅ Prefer CLIENT_ORIGIN, fallback to opts.resetLink if needed
     const resetLink = buildResetLinkFromClientOrigin(opts.token) ?? opts.resetLink ?? null
 
-    // Plain text fallback
     const text = [
         opts.name ? `Hi ${opts.name.trim()},` : "Hi,",
         "",
         "We received a request to reset your QueuePass password.",
         "",
         resetLink ? `Reset link: ${resetLink}` : "Reset link: (CLIENT_ORIGIN not configured)",
-        `Reset token: ${opts.token}`,
         "",
-        `This token expires in ${opts.expiresMinutes} minutes.`,
+        `This link expires in ${opts.expiresMinutes} minutes.`,
         "If you did not request this, you can ignore this email.",
         "",
         "— QueuePass",
     ].join("\n")
 
     const year = new Date().getFullYear()
+    const logoAttachment = getInlineLogoAttachment()
+
+    /**
+     * ✅ Fix “cramped / not balanced” logo:
+     * - Give the logo container padding
+     * - Make the image fill the padded area with object-fit: cover
+     * - Center the crop using object-position: center
+     */
+    const logoInnerHtml = logoAttachment
+        ? `<img src="cid:${LOGO_PNG_CID}" alt="QueuePass logo"
+              style="display:block;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:10px;" />`
+        : `<div
+              style="width:100%;height:100%;border-radius:10px;border:1px solid ${THEME.border};background:${THEME.background};
+                     font-family:Arial, sans-serif;font-weight:800;font-size:12px;color:${THEME.foreground};
+                     display:block;line-height:36px;text-align:center;">
+              QP
+           </div>`
 
     const html = `
 <div style="margin:0;padding:0;background:${THEME.muted};width:100%;">
@@ -105,7 +152,7 @@ export async function sendPasswordResetEmail(opts: {
       <td align="center">
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:560px;">
 
-          <!-- Header / Brand -->
+          <!-- Header -->
           <tr>
             <td style="padding:0 0 14px 0;">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
@@ -115,13 +162,16 @@ export async function sendPasswordResetEmail(opts: {
                     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
                       <tr>
                         <td width="46" valign="middle" style="padding-right:12px;">
-                          <div
-                            style="width:46px;height:46px;border-radius:14px;border:1px solid ${THEME.border};background:${THEME.background};
-                                   font-family:Arial, sans-serif;font-weight:800;font-size:14px;color:${THEME.foreground};
-                                   display:block;line-height:46px;text-align:center;">
-                            QP
+                          <!-- ✅ Outer logo container -->
+                          <div style="width:46px;height:46px;border-radius:14px;border:1px solid ${THEME.border};
+                                      background:${THEME.background};overflow:hidden;padding:4px;box-sizing:border-box;">
+                            <!-- ✅ Inner area (46 - 8 padding = 38px square) -->
+                            <div style="width:38px;height:38px;">
+                              ${logoInnerHtml}
+                            </div>
                           </div>
                         </td>
+
                         <td valign="middle" style="font-family:Arial, sans-serif;">
                           <div style="font-size:14px;font-weight:800;color:${THEME.foreground};line-height:1.2;">
                             QueuePass
@@ -130,6 +180,7 @@ export async function sendPasswordResetEmail(opts: {
                             Ticketless QR Queue
                           </div>
                         </td>
+
                         <td align="right" valign="middle" style="font-family:Arial, sans-serif;">
                           <div style="font-size:12px;color:${THEME.mutedForeground};">
                             Password Reset
@@ -162,7 +213,6 @@ export async function sendPasswordResetEmail(opts: {
                       ${greeting}
                     </div>
 
-                    <!-- CTA -->
                     ${resetLink
             ? `
                     <div style="margin:0 0 14px 0;">
@@ -191,20 +241,8 @@ export async function sendPasswordResetEmail(opts: {
                             `
         }
 
-                    <!-- Token -->
-                    <div style="font-size:12px;color:${THEME.mutedForeground};margin:0 0 8px 0;">
-                      Or use this reset token:
-                    </div>
-
-                    <div style="margin:0 0 14px 0;padding:12px 12px;border-radius:14px;background:${THEME.secondary};
-                                border:1px solid ${THEME.border};word-break:break-all;
-                                font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace;
-                                font-size:13px;color:${THEME.foreground};">
-                      ${escapeHtml(opts.token)}
-                    </div>
-
                     <div style="font-size:12px;color:${THEME.mutedForeground};line-height:1.5;margin:0 0 6px 0;">
-                      This token expires in <b style="color:${THEME.foreground};">${opts.expiresMinutes} minutes</b>.
+                      This link expires in <b style="color:${THEME.foreground};">${opts.expiresMinutes} minutes</b>.
                     </div>
 
                     <div style="font-size:12px;color:${THEME.mutedForeground};line-height:1.5;margin:0;">
@@ -214,11 +252,10 @@ export async function sendPasswordResetEmail(opts: {
                   </td>
                 </tr>
 
-                <!-- Footer inside card -->
                 <tr>
                   <td style="padding:14px 18px;border-top:1px solid ${THEME.border};background:${THEME.background};border-radius:0 0 18px 18px;">
                     <div style="font-family:Arial, sans-serif;font-size:12px;color:${THEME.mutedForeground};line-height:1.5;">
-                      For security reasons, please do not share this token with anyone.
+                      For security reasons, please do not share your password with anyone.
                     </div>
                   </td>
                 </tr>
@@ -226,7 +263,6 @@ export async function sendPasswordResetEmail(opts: {
             </td>
           </tr>
 
-          <!-- Outer footer -->
           <tr>
             <td style="padding:14px 6px 0 6px;">
               <div style="font-family:Arial, sans-serif;font-size:12px;color:${THEME.mutedForeground};line-height:1.4;">
@@ -248,5 +284,6 @@ export async function sendPasswordResetEmail(opts: {
         subject,
         text,
         html,
+        attachments: logoAttachment ? [logoAttachment] : undefined,
     })
 }
