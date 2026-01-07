@@ -19,11 +19,117 @@ function staffCtx(req: Request) {
     }
 }
 
+function parseLimit(req: Request, fallback = 25) {
+    const raw = req.query.limit
+    const n = typeof raw === "string" ? Number(raw) : Array.isArray(raw) ? Number(raw[0]) : NaN
+    if (!Number.isFinite(n)) return fallback
+    return Math.max(1, Math.min(100, Math.floor(n)))
+}
+
+function parseBool(v: unknown): boolean {
+    if (typeof v === "boolean") return v
+    if (typeof v !== "string") return false
+    const s = v.trim().toLowerCase()
+    return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on"
+}
+
 export const staffController = {
     myAssignment: async (req: Request, res: Response) => {
         const { departmentId, windowId } = staffCtx(req)
         const window = windowId ? await ServiceWindowModel.findById(windowId) : null
         return res.json({ departmentId: departmentId || null, window })
+    },
+
+    /**
+     * GET /staff/queue/waiting?limit=25
+     */
+    listWaiting: async (req: Request, res: Response) => {
+        const { departmentId } = staffCtx(req)
+        if (!departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const limit = parseLimit(req, 25)
+        const dateKey = todayKey()
+
+        const tickets = await TicketModel.find({
+            department: departmentId,
+            dateKey,
+            status: "WAITING",
+        })
+            .sort({ waitingSince: 1 })
+            .limit(limit)
+            .exec()
+
+        return res.json({ tickets })
+    },
+
+    /**
+     * GET /staff/queue/hold?limit=25
+     */
+    listHold: async (req: Request, res: Response) => {
+        const { departmentId } = staffCtx(req)
+        if (!departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const limit = parseLimit(req, 25)
+        const dateKey = todayKey()
+
+        const tickets = await TicketModel.find({
+            department: departmentId,
+            dateKey,
+            status: "HOLD",
+        })
+            .sort({ updatedAt: -1 })
+            .limit(limit)
+            .exec()
+
+        return res.json({ tickets })
+    },
+
+    /**
+     * GET /staff/queue/out?limit=25
+     */
+    listOut: async (req: Request, res: Response) => {
+        const { departmentId } = staffCtx(req)
+        if (!departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const limit = parseLimit(req, 25)
+        const dateKey = todayKey()
+
+        const tickets = await TicketModel.find({
+            department: departmentId,
+            dateKey,
+            status: "OUT",
+        })
+            .sort({ outAt: -1, updatedAt: -1 })
+            .limit(limit)
+            .exec()
+
+        return res.json({ tickets })
+    },
+
+    /**
+     * GET /staff/queue/history?limit=25&mine=1
+     * - mine=1 filters to tickets called to the staff's assigned window
+     */
+    listHistory: async (req: Request, res: Response) => {
+        const { departmentId, windowId } = staffCtx(req)
+        if (!departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const mine = parseBool(req.query.mine)
+        if (mine && !windowId) return res.status(400).json({ message: "Staff not assigned to a window" })
+
+        const limit = parseLimit(req, 25)
+        const dateKey = todayKey()
+
+        const query: any = {
+            department: departmentId,
+            dateKey,
+            status: { $in: ["CALLED", "SERVED", "OUT"] },
+        }
+
+        if (mine) query.window = windowId
+
+        const tickets = await TicketModel.find(query).sort({ updatedAt: -1 }).limit(limit).exec()
+        return res.json({ tickets })
     },
 
     callNext: async (req: Request, res: Response) => {
@@ -35,7 +141,6 @@ export const staffController = {
 
         const dateKey = todayKey()
 
-        // Oldest WAITING by waitingSince (HOLD returns go to end because waitingSince is refreshed)
         const next = await TicketModel.findOne({ department: departmentId, dateKey, status: "WAITING" })
             .sort({ waitingSince: 1 })
             .exec()
@@ -146,7 +251,7 @@ export const staffController = {
         if (ticket.status !== "HOLD") return res.status(400).json({ message: "Ticket is not on HOLD" })
 
         ticket.status = "WAITING"
-        ticket.waitingSince = new Date() // goes to end of WAITING line
+        ticket.waitingSince = new Date()
         ticket.window = undefined
         ticket.windowNumber = undefined
         await ticket.save()

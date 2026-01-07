@@ -9,6 +9,12 @@ router.use(requireAuth, requireRole("STAFF"))
 // Assignment
 router.get("/me/assignment", staffController.myAssignment)
 
+// Queue lists
+router.get("/queue/waiting", staffController.listWaiting)
+router.get("/queue/hold", staffController.listHold)
+router.get("/queue/out", staffController.listOut)
+router.get("/queue/history", staffController.listHistory)
+
 // Queue operations
 router.post("/queue/call-next", staffController.callNext)
 router.get("/queue/current-called", staffController.currentCalledForWindow)
