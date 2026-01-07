@@ -16,6 +16,10 @@ export type UserDoc = {
     assignedDepartment?: Types.ObjectId
     assignedWindow?: Types.ObjectId
 
+    // ✅ Password reset fields
+    passwordResetTokenHash?: string
+    passwordResetExpiresAt?: Date
+
     createdAt: Date
     updatedAt: Date
 }
@@ -34,6 +38,10 @@ const UserSchema = new Schema<UserDoc>(
 
         assignedDepartment: { type: Schema.Types.ObjectId, ref: "Department" },
         assignedWindow: { type: Schema.Types.ObjectId, ref: "ServiceWindow" },
+
+        // ✅ Password reset fields
+        passwordResetTokenHash: { type: String },
+        passwordResetExpiresAt: { type: Date },
     },
     { timestamps: true }
 )

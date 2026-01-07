@@ -6,11 +6,9 @@
     "dev": "nodemon --watch src --ext ts --exec ts-node src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-
     "migrate": "ts-node --transpile-only --project tsconfig.json ./src/migration/migrate.ts",
     "seed:admin": "ts-node --transpile-only --project tsconfig.json ./src/seeder/seedAdmin.ts",
     "seed": "npm run seed:admin",
-
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -20,7 +18,8 @@
   "dependencies": {
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
-    "mongoose": "^8.17.0"
+    "mongoose": "^8.17.0",
+    "nodemailer": "^7.0.12"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
