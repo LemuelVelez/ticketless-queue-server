@@ -22,4 +22,8 @@ router.post("/tickets/:id/served", staffController.markServed)
 router.post("/tickets/:id/hold", staffController.holdNoShow)
 router.post("/tickets/:id/return", staffController.returnFromHold)
 
+// ✅ Staff reports (scoped to assigned department)
+router.get("/reports/summary", staffController.reportsSummary)
+router.get("/reports/timeseries", staffController.reportsTimeseries)
+
 export default router

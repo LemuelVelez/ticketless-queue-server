@@ -1,8 +1,10 @@
 import type { Request, Response } from "express"
+import { Types } from "mongoose"
 import { TicketModel } from "../models/Ticket"
 import { SettingModel } from "../models/Setting"
 import { ServiceWindowModel } from "../models/ServiceWindow"
 import { AuditLogModel } from "../models/AuditLog"
+import { DepartmentModel } from "../models/Department"
 
 function todayKey() {
     return new Date().toISOString().slice(0, 10)
@@ -31,6 +33,21 @@ function parseBool(v: unknown): boolean {
     if (typeof v !== "string") return false
     const s = v.trim().toLowerCase()
     return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on"
+}
+
+function parseYmd(v: unknown, fallback: string) {
+    const raw = typeof v === "string" ? v : Array.isArray(v) ? String(v[0] ?? "") : ""
+    const s = raw.trim()
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s
+    return fallback
+}
+
+function asObjectIdOrString(id: string) {
+    try {
+        return new Types.ObjectId(id)
+    } catch {
+        return id
+    }
 }
 
 export const staffController = {
@@ -265,5 +282,164 @@ export const staffController = {
         })
 
         return res.json({ ticket })
+    },
+
+    /**
+     * GET /staff/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+     * - Always scoped to staff's assigned department.
+     */
+    reportsSummary: async (req: Request, res: Response) => {
+        const { departmentId } = staffCtx(req)
+        if (!departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const fallback = todayKey()
+        const from = parseYmd(req.query.from, fallback)
+        const to = parseYmd(req.query.to, fallback)
+        if (from > to) return res.status(400).json({ message: "Invalid date range" })
+
+        const deptMatch = asObjectIdOrString(departmentId)
+
+        const match: any = {
+            department: deptMatch,
+            dateKey: { $gte: from, $lte: to },
+        }
+
+        const [agg] = await TicketModel.aggregate([
+            { $match: match },
+            {
+                $group: {
+                    _id: null,
+                    total: { $sum: 1 },
+                    waiting: { $sum: { $cond: [{ $eq: ["$status", "WAITING"] }, 1, 0] } },
+                    called: { $sum: { $cond: [{ $eq: ["$status", "CALLED"] }, 1, 0] } },
+                    hold: { $sum: { $cond: [{ $eq: ["$status", "HOLD"] }, 1, 0] } },
+                    out: { $sum: { $cond: [{ $eq: ["$status", "OUT"] }, 1, 0] } },
+                    served: { $sum: { $cond: [{ $eq: ["$status", "SERVED"] }, 1, 0] } },
+                    avgWaitMs: {
+                        $avg: {
+                            $cond: [
+                                { $and: [{ $ne: ["$calledAt", null] }, { $ne: ["$waitingSince", null] }] },
+                                { $subtract: ["$calledAt", "$waitingSince"] },
+                                null,
+                            ],
+                        },
+                    },
+                    avgServiceMs: {
+                        $avg: {
+                            $cond: [
+                                { $and: [{ $ne: ["$servedAt", null] }, { $ne: ["$calledAt", null] }] },
+                                { $subtract: ["$servedAt", "$calledAt"] },
+                                null,
+                            ],
+                        },
+                    },
+                },
+            },
+        ]).exec()
+
+        const totals = {
+            total: Number(agg?.total ?? 0),
+            byStatus: {
+                WAITING: Number(agg?.waiting ?? 0),
+                CALLED: Number(agg?.called ?? 0),
+                HOLD: Number(agg?.hold ?? 0),
+                OUT: Number(agg?.out ?? 0),
+                SERVED: Number(agg?.served ?? 0),
+            },
+            avgWaitMs: typeof agg?.avgWaitMs === "number" ? agg.avgWaitMs : null,
+            avgServiceMs: typeof agg?.avgServiceMs === "number" ? agg.avgServiceMs : null,
+        }
+
+        const dept = await DepartmentModel.findById(departmentId).select("_id name code").lean().exec()
+
+        const deptRow = {
+            departmentId: String(departmentId),
+            name: dept?.name,
+            code: (dept as any)?.code,
+            total: totals.total,
+            waiting: totals.byStatus.WAITING ?? 0,
+            called: totals.byStatus.CALLED ?? 0,
+            hold: totals.byStatus.HOLD ?? 0,
+            out: totals.byStatus.OUT ?? 0,
+            served: totals.byStatus.SERVED ?? 0,
+            avgWaitMs: totals.avgWaitMs,
+            avgServiceMs: totals.avgServiceMs,
+        }
+
+        return res.json({
+            range: { from, to },
+            totals,
+            departments: [deptRow],
+        })
+    },
+
+    /**
+     * GET /staff/reports/timeseries?from=YYYY-MM-DD&to=YYYY-MM-DD
+     * - Always scoped to staff's assigned department.
+     */
+    reportsTimeseries: async (req: Request, res: Response) => {
+        const { departmentId } = staffCtx(req)
+        if (!departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const fallback = todayKey()
+        const from = parseYmd(req.query.from, fallback)
+        const to = parseYmd(req.query.to, fallback)
+        if (from > to) return res.status(400).json({ message: "Invalid date range" })
+
+        const deptMatch = asObjectIdOrString(departmentId)
+
+        const match: any = {
+            department: deptMatch,
+            dateKey: { $gte: from, $lte: to },
+        }
+
+        const rows = await TicketModel.aggregate([
+            { $match: match },
+            {
+                $group: {
+                    _id: { dateKey: "$dateKey", status: "$status" },
+                    count: { $sum: 1 },
+                },
+            },
+            { $sort: { "_id.dateKey": 1 } },
+        ]).exec()
+
+        const byDate = new Map<string, any>()
+
+        for (const r of rows) {
+            const dateKey = String(r?._id?.dateKey ?? "")
+            const status = String(r?._id?.status ?? "").toUpperCase()
+            const count = Number(r?.count ?? 0)
+
+            if (!dateKey) continue
+
+            if (!byDate.has(dateKey)) {
+                byDate.set(dateKey, {
+                    dateKey,
+                    total: 0,
+                    waiting: 0,
+                    called: 0,
+                    hold: 0,
+                    out: 0,
+                    served: 0,
+                })
+            }
+
+            const obj = byDate.get(dateKey)
+            obj.total += count
+
+            if (status === "WAITING") obj.waiting += count
+            else if (status === "CALLED") obj.called += count
+            else if (status === "HOLD") obj.hold += count
+            else if (status === "OUT") obj.out += count
+            else if (status === "SERVED") obj.served += count
+        }
+
+        const series = Array.from(byDate.values()).sort((a, b) => String(a.dateKey).localeCompare(String(b.dateKey)))
+
+        return res.json({
+            range: { from, to },
+            series,
+        })
     },
 }
