@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express"
 
 import { verifyToken } from "./security"
 import type { UserRole } from "../models/User"
+import { verifyParticipantSession } from "../services/participantAuth.service"
 
 export type AuthUser = {
     id: string
@@ -14,7 +15,7 @@ export type AuthUser = {
     assignedWindow?: string
 }
 
-export type ParticipantType = "STUDENT" | "GUEST"
+export type ParticipantType = "STUDENT" | "ALUMNI_VISITOR" | "GUEST"
 
 export type ParticipantAuthUser = {
     id: string
@@ -41,12 +42,47 @@ function normalizeParticipantType(raw: unknown): ParticipantType | null {
     const t = String(raw ?? "").trim().toUpperCase()
 
     if (t === "STUDENT") return "STUDENT"
-    if (t === "GUEST") return "GUEST"
-
-    // Backward compatibility with existing participant type/role names.
-    if (t === "ALUMNI_VISITOR" || t === "ALUMNI-VISITOR" || t === "VISITOR") return "GUEST"
+    if (t === "ALUMNI_VISITOR" || t === "ALUMNI-VISITOR") return "ALUMNI_VISITOR"
+    if (t === "GUEST" || t === "VISITOR") return "GUEST"
 
     return null
+}
+
+function fromJwtPayload(payload: Record<string, unknown>): ParticipantAuthUser | null {
+    const participantId = String(payload.sub ?? payload.participantId ?? payload.id ?? "").trim()
+    const participantType = normalizeParticipantType(payload.participantType ?? payload.type ?? payload.role)
+
+    if (!participantId || !participantType) return null
+
+    const tcNumber =
+        typeof payload.tcNumber === "string"
+            ? payload.tcNumber
+            : typeof payload.studentId === "string"
+                ? payload.studentId
+                : undefined
+
+    const mobileNumber =
+        typeof payload.mobileNumber === "string"
+            ? payload.mobileNumber
+            : typeof payload.phone === "string"
+                ? payload.phone
+                : undefined
+
+    return {
+        id: participantId,
+        type: participantType,
+        name: typeof payload.name === "string" ? payload.name : undefined,
+        email: typeof payload.email === "string" ? payload.email : undefined,
+
+        // backward-compatible
+        studentId: typeof payload.studentId === "string" ? payload.studentId : tcNumber,
+
+        // new fields
+        tcNumber,
+        mobileNumber,
+        departmentId: typeof payload.departmentId === "string" ? payload.departmentId : undefined,
+        departmentCode: typeof payload.departmentCode === "string" ? payload.departmentCode : undefined,
+    }
 }
 
 export function corsMiddleware(req: Request, res: Response, next: NextFunction) {
@@ -92,55 +128,46 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     }
 }
 
-export function requireParticipantAuth(req: Request, res: Response, next: NextFunction) {
+export async function requireParticipantAuth(req: Request, res: Response, next: NextFunction) {
     try {
         const token = readBearerToken(req)
         if (!token) return res.status(401).json({ message: "Missing participant token" })
 
+        let participant: ParticipantAuthUser | null = null
+
+        // 1) Try JWT participant token (legacy/alternate flow)
         const secret = process.env.JWT_SECRET
-        if (!secret) return res.status(500).json({ message: "JWT_SECRET missing" })
-
-        const payload = verifyToken(token, secret) as Record<string, unknown>
-
-        const participantId = String(payload.sub ?? payload.participantId ?? payload.id ?? "").trim()
-        const participantType = normalizeParticipantType(
-            payload.participantType ?? payload.type ?? payload.role
-        )
-
-        if (!participantId || !participantType) {
-            return res.status(401).json({ message: "Invalid participant token" })
+        if (secret) {
+            try {
+                const payload = verifyToken(token, secret) as Record<string, unknown>
+                participant = fromJwtPayload(payload)
+            } catch {
+                // continue to session-token check
+            }
         }
 
-        const tcNumber =
-            typeof payload.tcNumber === "string"
-                ? payload.tcNumber
-                : typeof payload.studentId === "string"
-                    ? payload.studentId
-                    : undefined
+        // 2) Try participant session token (current flow)
+        if (!participant) {
+            const state = await verifyParticipantSession(token)
+            if (state) {
+                const p = state.participant
+                participant = {
+                    id: p._id.toString(),
+                    type: p.type === "ALUMNI_VISITOR" ? "ALUMNI_VISITOR" : "STUDENT",
+                    name: [p.firstName, p.middleName, p.lastName].filter(Boolean).join(" ").trim() || undefined,
+                    studentId: p.tcNumber,
+                    tcNumber: p.tcNumber,
+                    mobileNumber: p.mobileNumber,
+                    departmentId: p.department ? String(p.department) : undefined,
+                }
+            }
+        }
 
-        const mobileNumber =
-            typeof payload.mobileNumber === "string"
-                ? payload.mobileNumber
-                : typeof payload.phone === "string"
-                    ? payload.phone
-                    : undefined
+        if (!participant) {
+            return res.status(401).json({ message: "Invalid/expired participant token" })
+        }
 
-            ; (req as any).participant = {
-                id: participantId,
-                type: participantType,
-                name: typeof payload.name === "string" ? payload.name : undefined,
-                email: typeof payload.email === "string" ? payload.email : undefined,
-
-                // backward-compatible
-                studentId: typeof payload.studentId === "string" ? payload.studentId : tcNumber,
-
-                // new fields
-                tcNumber,
-                mobileNumber,
-                departmentId: typeof payload.departmentId === "string" ? payload.departmentId : undefined,
-                departmentCode: typeof payload.departmentCode === "string" ? payload.departmentCode : undefined,
-            } satisfies ParticipantAuthUser
-
+        ; (req as any).participant = participant satisfies ParticipantAuthUser
         next()
     } catch {
         return res.status(401).json({ message: "Invalid/expired participant token" })

@@ -40,6 +40,26 @@ function asBoolean(v: unknown) {
     return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on"
 }
 
+/**
+ * Safely converts unknown input into a deduplicated string[].
+ * Fixes TS2322 when passing transactionKeys into joinQueueService.
+ */
+function asStringArray(v: unknown): string[] {
+    if (!Array.isArray(v)) return []
+
+    const out: string[] = []
+    const seen = new Set<string>()
+
+    for (const item of v) {
+        const s = String(item ?? "").trim()
+        if (!s || seen.has(s)) continue
+        seen.add(s)
+        out.push(s)
+    }
+
+    return out
+}
+
 function knownErrorStatus(message: string) {
     const m = message.toLowerCase()
     if (m.includes("invalid credentials") || m.includes("please login")) return 401
@@ -107,7 +127,7 @@ export const publicController = {
             const tcNumber = asString(body.tcNumber || body.studentId)
             const pin = asString(body.pin || body.password)
             const mobileNumber = asString(body.mobileNumber || body.phone)
-            const departmentId = asString(body.departmentId)
+            const departmentId = asString(body.departmentId || body.department)
 
             const fullName = composeName(firstName, middleName, lastName)
 
@@ -122,6 +142,7 @@ export const publicController = {
                 pin: optional(pin),
                 mobileNumber: optional(mobileNumber),
                 departmentId: optional(departmentId),
+                department: optional(asString(body.department || departmentId)),
 
                 // compatibility aliases (old/new services)
                 name: optional(asString(body.name)) || optional(fullName),
@@ -130,7 +151,7 @@ export const publicController = {
                 phone: optional(asString(body.phone || mobileNumber)),
             }
 
-            const result = await signupStudent(payload)
+            const result = await signupStudent(payload as any)
             return res.status(201).json(result)
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to signup student"
@@ -148,7 +169,7 @@ export const publicController = {
 
             const mobileNumber = asString(body.mobileNumber || body.phone)
             const pin = asString(body.pin || body.password)
-            const departmentId = asString(body.departmentId)
+            const departmentId = asString(body.departmentId || body.department)
 
             const fullName = composeName(firstName, middleName, lastName)
 
@@ -162,6 +183,7 @@ export const publicController = {
                 mobileNumber: optional(mobileNumber),
                 pin: optional(pin),
                 departmentId: optional(departmentId),
+                department: optional(asString(body.department || departmentId)),
 
                 // compatibility aliases (old/new services)
                 name: optional(asString(body.name)) || optional(fullName),
@@ -169,7 +191,7 @@ export const publicController = {
                 phone: optional(asString(body.phone || mobileNumber)),
             }
 
-            const result = await signupAlumniVisitor(payload)
+            const result = await signupAlumniVisitor(payload as any)
             return res.status(201).json(result)
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to signup alumni/visitor"
@@ -239,23 +261,40 @@ export const publicController = {
         const body = req.body || {}
         const sessionToken = getSessionToken(req)
 
+        const hasModernPayload =
+            Array.isArray(body.transactionKeys) ||
+            body.presentDirectlyToDisplayMonitor !== undefined ||
+            body.shouldDisplayImmediately !== undefined
+
         // New participant-session based flow
-        if (sessionToken) {
+        if (sessionToken && hasModernPayload) {
             try {
-                const transactionKeys = Array.isArray(body.transactionKeys)
-                    ? body.transactionKeys.map((x: unknown) => String(x).trim()).filter(Boolean)
-                    : []
+                const transactionKeys: string[] = asStringArray(body.transactionKeys)
 
                 const displayImmediately =
                     Boolean(body.presentDirectlyToDisplayMonitor) || asBoolean(body.shouldDisplayImmediately)
 
-                const ticket = await joinQueueService({
+                const joined = await joinQueueService({
                     sessionToken,
                     transactionKeys,
                     presentDirectlyToDisplayMonitor: displayImmediately,
                 })
 
-                return res.status(201).json({ ticket })
+                // Backward-compatible response shape expected by existing frontend (ticket object).
+                const ticketDoc = await TicketModel.findById(joined.ticketId).populate("department", "name enabled")
+
+                const fallbackTicket = {
+                    _id: joined.ticketId,
+                    queueNumber: joined.queueNumber,
+                    dateKey: joined.dateKey,
+                    status: joined.status,
+                    windowNumber: joined.windowNumber ?? null,
+                }
+
+                return res.status(201).json({
+                    ticket: ticketDoc ?? fallbackTicket,
+                    join: joined,
+                })
             } catch (err) {
                 const message = err instanceof Error ? err.message : "Unable to join queue"
                 return res.status(knownErrorStatus(message)).json({ message })
@@ -263,7 +302,10 @@ export const publicController = {
         }
 
         // Legacy flow fallback (departmentId + studentId)
-        const { departmentId, studentId, phone } = body
+        const departmentId = asString(body.departmentId)
+        const studentId = asString(body.studentId)
+        const phone = asString(body.phone)
+
         if (!departmentId || !studentId) {
             return res.status(400).json({ message: "departmentId and studentId are required" })
         }

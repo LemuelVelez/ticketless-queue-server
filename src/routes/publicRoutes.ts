@@ -20,15 +20,15 @@ router.get("/auth/session", publicController.participantSession)
 router.post("/auth/session", publicController.participantSession)
 router.post("/auth/logout", publicController.logoutParticipant)
 
-// Queue (participant-auth required)
-router.post("/tickets/join", requireParticipantAuth, publicController.joinQueue)
+// Queue
+// join/find/getTicket are intentionally open for legacy public kiosk flow;
+// controller still supports session-token flow when Authorization/sessionToken is provided.
+router.post("/tickets/join", publicController.joinQueue)
+router.get("/tickets", publicController.findActiveByStudent)
+router.get("/tickets/:id", publicController.getTicket)
+
+// Display-monitor actions remain participant-protected.
 router.post("/tickets/present", requireParticipantAuth, publicController.presentToDisplayMonitor)
 router.post("/tickets/present-to-display-monitor", requireParticipantAuth, publicController.presentToDisplayMonitor)
-
-// Optional helper
-router.get("/tickets", requireParticipantAuth, publicController.findActiveByStudent)
-
-// Ticket details (keep dynamic route last among /tickets/* paths)
-router.get("/tickets/:id", requireParticipantAuth, publicController.getTicket)
 
 export default router
