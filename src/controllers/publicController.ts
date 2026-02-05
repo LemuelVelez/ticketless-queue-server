@@ -1,14 +1,71 @@
 import type { Request, Response } from "express"
-import { DepartmentModel } from "../models/Department"
-import { TicketModel } from "../models/Ticket"
-import { SettingModel } from "../models/Setting"
-import { QueueCounterModel } from "../models/QueueCounter"
 
-function todayKey() {
-    return new Date().toISOString().slice(0, 10)
-}
+import { DepartmentModel } from "../models/Department"
+import { QueueCounterModel } from "../models/QueueCounter"
+import { SettingModel } from "../models/Setting"
+import { TicketModel } from "../models/Ticket"
+
+import {
+    loginAlumniVisitor,
+    loginStudent,
+    logoutParticipantSession,
+    signupAlumniVisitor,
+    signupStudent,
+    verifyParticipantSession,
+} from "../services/participantAuth.service"
+import {
+    getDateKeyManila,
+    joinQueue as joinQueueService,
+    presentDirectlyToDisplayMonitor,
+    TicketTransactionSelectionModel,
+} from "../services/queue.service"
+import { getTransactionsForParticipant } from "../services/registrarTransactions.service"
 
 const ACTIVE_STATUSES = ["WAITING", "CALLED", "HOLD"] as const
+
+function todayKey() {
+    return getDateKeyManila()
+}
+
+function asString(v: unknown) {
+    if (typeof v === "string") return v.trim()
+    if (Array.isArray(v) && v.length) return String(v[0] ?? "").trim()
+    return ""
+}
+
+function asBoolean(v: unknown) {
+    if (typeof v === "boolean") return v
+    if (typeof v !== "string") return false
+    const s = v.trim().toLowerCase()
+    return s === "1" || s === "true" || s === "yes" || s === "y" || s === "on"
+}
+
+function knownErrorStatus(message: string) {
+    const m = message.toLowerCase()
+    if (m.includes("invalid credentials") || m.includes("please login")) return 401
+    if (m.includes("not found")) return 404
+    if (m.includes("already") || m.includes("duplicate")) return 409
+    return 400
+}
+
+function getSessionToken(req: Request) {
+    const auth = String(req.headers.authorization || "")
+    if (auth.startsWith("Bearer ")) {
+        const token = auth.slice(7).trim()
+        if (token) return token
+    }
+
+    const headerToken = asString(req.headers["x-session-token"])
+    if (headerToken) return headerToken
+
+    const bodyToken = asString((req.body || {}).sessionToken)
+    if (bodyToken) return bodyToken
+
+    const queryToken = asString((req.query || {}).sessionToken)
+    if (queryToken) return queryToken
+
+    return ""
+}
 
 async function nextQueueNumber(departmentId: string, dateKey: string) {
     const counter = await QueueCounterModel.findOneAndUpdate(
@@ -25,8 +82,101 @@ export const publicController = {
         return res.json({ departments })
     },
 
+    signupStudent: async (req: Request, res: Response) => {
+        try {
+            const result = await signupStudent(req.body || {})
+            return res.status(201).json(result)
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to signup student"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
+    signupAlumniVisitor: async (req: Request, res: Response) => {
+        try {
+            const result = await signupAlumniVisitor(req.body || {})
+            return res.status(201).json(result)
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to signup alumni/visitor"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
+    loginStudent: async (req: Request, res: Response) => {
+        try {
+            const { tcNumber, pin } = req.body || {}
+            const result = await loginStudent(String(tcNumber || ""), String(pin || ""))
+            return res.json(result)
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to login"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
+    loginAlumniVisitor: async (req: Request, res: Response) => {
+        try {
+            const { mobileNumber, pin } = req.body || {}
+            const result = await loginAlumniVisitor(String(mobileNumber || ""), String(pin || ""))
+            return res.json(result)
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to login"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
+    participantSession: async (req: Request, res: Response) => {
+        const sessionToken = getSessionToken(req)
+        if (!sessionToken) return res.status(400).json({ message: "sessionToken is required" })
+
+        const state = await verifyParticipantSession(sessionToken)
+        if (!state) return res.status(401).json({ message: "Invalid or expired session" })
+
+        return res.json({
+            session: {
+                expiresAt: state.session.expiresAt,
+            },
+            participant: state.profile,
+            availableTransactions: getTransactionsForParticipant(state.participant.type),
+        })
+    },
+
+    logoutParticipant: async (req: Request, res: Response) => {
+        const sessionToken = getSessionToken(req)
+        if (!sessionToken) return res.status(400).json({ message: "sessionToken is required" })
+
+        await logoutParticipantSession(sessionToken)
+        return res.json({ ok: true })
+    },
+
     joinQueue: async (req: Request, res: Response) => {
-        const { departmentId, studentId, phone } = req.body || {}
+        const body = req.body || {}
+        const sessionToken = asString(body.sessionToken)
+
+        // New participant-session based flow
+        if (sessionToken) {
+            try {
+                const transactionKeys = Array.isArray(body.transactionKeys)
+                    ? body.transactionKeys.map((x: unknown) => String(x).trim()).filter(Boolean)
+                    : []
+
+                const presentDirectlyToDisplayMonitor =
+                    Boolean(body.presentDirectlyToDisplayMonitor) || asBoolean(body.shouldDisplayImmediately)
+
+                const ticket = await joinQueueService({
+                    sessionToken,
+                    transactionKeys,
+                    presentDirectlyToDisplayMonitor,
+                })
+
+                return res.status(201).json({ ticket })
+            } catch (err) {
+                const message = err instanceof Error ? err.message : "Unable to join queue"
+                return res.status(knownErrorStatus(message)).json({ message })
+            }
+        }
+
+        // Legacy flow fallback (departmentId + studentId)
+        const { departmentId, studentId, phone } = body
         if (!departmentId || !studentId) {
             return res.status(400).json({ message: "departmentId and studentId are required" })
         }
@@ -72,11 +222,39 @@ export const publicController = {
         return res.status(201).json({ ticket })
     },
 
+    presentToDisplayMonitor: async (req: Request, res: Response) => {
+        const ticketId = asString((req.body || {}).ticketId)
+        if (!ticketId) return res.status(400).json({ message: "ticketId is required" })
+
+        try {
+            const ticket = await presentDirectlyToDisplayMonitor(ticketId)
+            return res.json({ ticket })
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to present ticket"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
     getTicket: async (req: Request, res: Response) => {
         const { id } = req.params
+
         const ticket = await TicketModel.findById(id).populate("department", "name enabled")
         if (!ticket) return res.status(404).json({ message: "Ticket not found" })
-        return res.json({ ticket })
+
+        const transactions = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id })
+            .select("transactionKeys transactionLabels participantType")
+            .lean()
+
+        return res.json({
+            ticket,
+            transactions: transactions
+                ? {
+                    transactionKeys: transactions.transactionKeys,
+                    transactionLabels: transactions.transactionLabels,
+                    participantType: transactions.participantType,
+                }
+                : null,
+        })
     },
 
     // Handy lookup for student side (optional)

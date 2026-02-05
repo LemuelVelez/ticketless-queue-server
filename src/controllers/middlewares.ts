@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from "express"
+
 import { verifyToken } from "./security"
 import type { UserRole } from "../models/User"
 
@@ -6,6 +7,9 @@ export type AuthUser = {
     id: string
     role: UserRole
     name?: string
+    email?: string
+    avatarKey?: string
+    avatarUrl?: string
     assignedDepartment?: string
     assignedWindow?: string
 }
@@ -40,6 +44,9 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
                 id: String(payload.sub || ""),
                 role: payload.role as UserRole,
                 name: payload.name as string | undefined,
+                email: payload.email as string | undefined,
+                avatarKey: payload.avatarKey as string | undefined,
+                avatarUrl: payload.avatarUrl as string | undefined,
                 assignedDepartment: payload.assignedDepartment as string | undefined,
                 assignedWindow: payload.assignedWindow as string | undefined,
             } satisfies AuthUser
