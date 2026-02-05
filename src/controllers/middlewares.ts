@@ -14,6 +14,41 @@ export type AuthUser = {
     assignedWindow?: string
 }
 
+export type ParticipantType = "STUDENT" | "GUEST"
+
+export type ParticipantAuthUser = {
+    id: string
+    type: ParticipantType
+    name?: string
+    email?: string
+
+    // Backward-compatible alias
+    studentId?: string
+
+    // New participant identity fields
+    tcNumber?: string
+    mobileNumber?: string
+    departmentId?: string
+    departmentCode?: string
+}
+
+function readBearerToken(req: Request) {
+    const auth = req.header("authorization") || req.header("Authorization") || ""
+    return auth.startsWith("Bearer ") ? auth.slice(7).trim() : ""
+}
+
+function normalizeParticipantType(raw: unknown): ParticipantType | null {
+    const t = String(raw ?? "").trim().toUpperCase()
+
+    if (t === "STUDENT") return "STUDENT"
+    if (t === "GUEST") return "GUEST"
+
+    // Backward compatibility with existing participant type/role names.
+    if (t === "ALUMNI_VISITOR" || t === "ALUMNI-VISITOR" || t === "VISITOR") return "GUEST"
+
+    return null
+}
+
 export function corsMiddleware(req: Request, res: Response, next: NextFunction) {
     const origin = process.env.CLIENT_ORIGIN || "*"
 
@@ -30,9 +65,7 @@ export function corsMiddleware(req: Request, res: Response, next: NextFunction) 
 
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
     try {
-        const auth = req.header("authorization") || ""
-        const token = auth.startsWith("Bearer ") ? auth.slice(7) : ""
-
+        const token = readBearerToken(req)
         if (!token) return res.status(401).json({ message: "Missing token" })
 
         const secret = process.env.JWT_SECRET
@@ -56,6 +89,61 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
         next()
     } catch {
         return res.status(401).json({ message: "Invalid/expired token" })
+    }
+}
+
+export function requireParticipantAuth(req: Request, res: Response, next: NextFunction) {
+    try {
+        const token = readBearerToken(req)
+        if (!token) return res.status(401).json({ message: "Missing participant token" })
+
+        const secret = process.env.JWT_SECRET
+        if (!secret) return res.status(500).json({ message: "JWT_SECRET missing" })
+
+        const payload = verifyToken(token, secret) as Record<string, unknown>
+
+        const participantId = String(payload.sub ?? payload.participantId ?? payload.id ?? "").trim()
+        const participantType = normalizeParticipantType(
+            payload.participantType ?? payload.type ?? payload.role
+        )
+
+        if (!participantId || !participantType) {
+            return res.status(401).json({ message: "Invalid participant token" })
+        }
+
+        const tcNumber =
+            typeof payload.tcNumber === "string"
+                ? payload.tcNumber
+                : typeof payload.studentId === "string"
+                    ? payload.studentId
+                    : undefined
+
+        const mobileNumber =
+            typeof payload.mobileNumber === "string"
+                ? payload.mobileNumber
+                : typeof payload.phone === "string"
+                    ? payload.phone
+                    : undefined
+
+            ; (req as any).participant = {
+                id: participantId,
+                type: participantType,
+                name: typeof payload.name === "string" ? payload.name : undefined,
+                email: typeof payload.email === "string" ? payload.email : undefined,
+
+                // backward-compatible
+                studentId: typeof payload.studentId === "string" ? payload.studentId : tcNumber,
+
+                // new fields
+                tcNumber,
+                mobileNumber,
+                departmentId: typeof payload.departmentId === "string" ? payload.departmentId : undefined,
+                departmentCode: typeof payload.departmentCode === "string" ? payload.departmentCode : undefined,
+            } satisfies ParticipantAuthUser
+
+        next()
+    } catch {
+        return res.status(401).json({ message: "Invalid/expired participant token" })
     }
 }
 

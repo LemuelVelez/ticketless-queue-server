@@ -67,6 +67,20 @@ function getSessionToken(req: Request) {
     return ""
 }
 
+function composeName(firstName: string, middleName: string, lastName: string) {
+    return [firstName, middleName, lastName]
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim()
+}
+
+function optional(value: string) {
+    const v = value.trim()
+    return v ? v : undefined
+}
+
 async function nextQueueNumber(departmentId: string, dateKey: string) {
     const counter = await QueueCounterModel.findOneAndUpdate(
         { department: departmentId, dateKey },
@@ -84,7 +98,39 @@ export const publicController = {
 
     signupStudent: async (req: Request, res: Response) => {
         try {
-            const result = await signupStudent(req.body || {})
+            const body = req.body || {}
+
+            const firstName = asString(body.firstName)
+            const middleName = asString(body.middleName)
+            const lastName = asString(body.lastName)
+
+            const tcNumber = asString(body.tcNumber || body.studentId)
+            const pin = asString(body.pin || body.password)
+            const mobileNumber = asString(body.mobileNumber || body.phone)
+            const departmentId = asString(body.departmentId)
+
+            const fullName = composeName(firstName, middleName, lastName)
+
+            const payload = {
+                ...body,
+
+                // canonical (new)
+                firstName: optional(firstName),
+                middleName: optional(middleName),
+                lastName: optional(lastName),
+                tcNumber: optional(tcNumber),
+                pin: optional(pin),
+                mobileNumber: optional(mobileNumber),
+                departmentId: optional(departmentId),
+
+                // compatibility aliases (old/new services)
+                name: optional(asString(body.name)) || optional(fullName),
+                studentId: optional(asString(body.studentId || tcNumber)),
+                password: optional(asString(body.password || pin)),
+                phone: optional(asString(body.phone || mobileNumber)),
+            }
+
+            const result = await signupStudent(payload)
             return res.status(201).json(result)
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to signup student"
@@ -94,7 +140,36 @@ export const publicController = {
 
     signupAlumniVisitor: async (req: Request, res: Response) => {
         try {
-            const result = await signupAlumniVisitor(req.body || {})
+            const body = req.body || {}
+
+            const firstName = asString(body.firstName)
+            const middleName = asString(body.middleName)
+            const lastName = asString(body.lastName)
+
+            const mobileNumber = asString(body.mobileNumber || body.phone)
+            const pin = asString(body.pin || body.password)
+            const departmentId = asString(body.departmentId)
+
+            const fullName = composeName(firstName, middleName, lastName)
+
+            const payload = {
+                ...body,
+
+                // canonical (new)
+                firstName: optional(firstName),
+                middleName: optional(middleName),
+                lastName: optional(lastName),
+                mobileNumber: optional(mobileNumber),
+                pin: optional(pin),
+                departmentId: optional(departmentId),
+
+                // compatibility aliases (old/new services)
+                name: optional(asString(body.name)) || optional(fullName),
+                password: optional(asString(body.password || pin)),
+                phone: optional(asString(body.phone || mobileNumber)),
+            }
+
+            const result = await signupAlumniVisitor(payload)
             return res.status(201).json(result)
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to signup alumni/visitor"
@@ -104,8 +179,14 @@ export const publicController = {
 
     loginStudent: async (req: Request, res: Response) => {
         try {
-            const { tcNumber, pin } = req.body || {}
-            const result = await loginStudent(String(tcNumber || ""), String(pin || ""))
+            const tcNumber = asString((req.body || {}).tcNumber || (req.body || {}).studentId)
+            const pin = asString((req.body || {}).pin || (req.body || {}).password)
+
+            if (!tcNumber || !pin) {
+                return res.status(400).json({ message: "tcNumber and pin are required" })
+            }
+
+            const result = await loginStudent(tcNumber, pin)
             return res.json(result)
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to login"
@@ -115,8 +196,14 @@ export const publicController = {
 
     loginAlumniVisitor: async (req: Request, res: Response) => {
         try {
-            const { mobileNumber, pin } = req.body || {}
-            const result = await loginAlumniVisitor(String(mobileNumber || ""), String(pin || ""))
+            const mobileNumber = asString((req.body || {}).mobileNumber || (req.body || {}).phone)
+            const pin = asString((req.body || {}).pin || (req.body || {}).password)
+
+            if (!mobileNumber || !pin) {
+                return res.status(400).json({ message: "mobileNumber and pin are required" })
+            }
+
+            const result = await loginAlumniVisitor(mobileNumber, pin)
             return res.json(result)
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to login"
@@ -150,7 +237,7 @@ export const publicController = {
 
     joinQueue: async (req: Request, res: Response) => {
         const body = req.body || {}
-        const sessionToken = asString(body.sessionToken)
+        const sessionToken = getSessionToken(req)
 
         // New participant-session based flow
         if (sessionToken) {
@@ -159,13 +246,13 @@ export const publicController = {
                     ? body.transactionKeys.map((x: unknown) => String(x).trim()).filter(Boolean)
                     : []
 
-                const presentDirectlyToDisplayMonitor =
+                const displayImmediately =
                     Boolean(body.presentDirectlyToDisplayMonitor) || asBoolean(body.shouldDisplayImmediately)
 
                 const ticket = await joinQueueService({
                     sessionToken,
                     transactionKeys,
-                    presentDirectlyToDisplayMonitor,
+                    presentDirectlyToDisplayMonitor: displayImmediately,
                 })
 
                 return res.status(201).json({ ticket })
