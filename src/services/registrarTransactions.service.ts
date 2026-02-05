@@ -1,3 +1,20 @@
+import {
+    createTransaction as createCatalogTransaction,
+    deleteTransaction as deleteCatalogTransaction,
+    deleteTransactionByKey as deleteCatalogTransactionByKey,
+    getTransactionById as getCatalogTransactionById,
+    getTransactionByKey as getCatalogTransactionByKey,
+    listTransactions as listCatalogTransactions,
+    seedTransactions,
+    type CreateTransactionInput,
+    type ListTransactionsFilter,
+    type SeedTransactionInput,
+    type TransactionRecord,
+    type UpdateTransactionInput,
+    updateTransaction as updateCatalogTransaction,
+    upsertTransactionByKey as upsertCatalogTransactionByKey,
+} from "./transactions.service"
+
 export type ParticipantQueueType = "STUDENT" | "ALUMNI_VISITOR"
 export type TransactionScope = "INTERNAL" | "EXTERNAL"
 
@@ -7,7 +24,9 @@ export type RegistrarTransaction = {
     scopes: TransactionScope[]
 }
 
-const REGISTRAR_TRANSACTIONS: RegistrarTransaction[] = [
+const REGISTRAR_CATEGORY = "REGISTRAR"
+
+const DEFAULT_REGISTRAR_TRANSACTIONS: RegistrarTransaction[] = [
     // Internal
     {
         key: "correction-grade-entry",
@@ -83,22 +102,116 @@ const REGISTRAR_TRANSACTIONS: RegistrarTransaction[] = [
     },
 ]
 
-export function getTransactionsByScope(scope: TransactionScope): RegistrarTransaction[] {
-    return REGISTRAR_TRANSACTIONS.filter((t) => t.scopes.includes(scope))
+let registrarCache: RegistrarTransaction[] = DEFAULT_REGISTRAR_TRANSACTIONS.map((t) => ({ ...t, scopes: [...t.scopes] }))
+let bootstrapPromise: Promise<void> | null = null
+let bootstrapReady = false
+
+function toScope(scope: string): TransactionScope | null {
+    const v = scope.trim().toUpperCase()
+    if (v === "INTERNAL" || v === "EXTERNAL") return v
+    return null
 }
 
+function toRegistrarTransaction(record: TransactionRecord): RegistrarTransaction {
+    const scopes = record.scopes
+        .map((s) => toScope(s))
+        .filter((s): s is TransactionScope => !!s)
+
+    return {
+        key: record.key,
+        label: record.label,
+        scopes,
+    }
+}
+
+async function reloadRegistrarCache() {
+    const records = await listCatalogTransactions({
+        category: REGISTRAR_CATEGORY,
+        enabledOnly: true,
+        includeDisabled: false,
+    })
+
+    registrarCache = records.map(toRegistrarTransaction)
+}
+
+function defaultSeeds(): SeedTransactionInput[] {
+    return DEFAULT_REGISTRAR_TRANSACTIONS.map((t, index) => ({
+        key: t.key,
+        label: t.label,
+        scopes: t.scopes,
+        enabled: true,
+        sortOrder: index + 1,
+        meta: { module: "registrar" },
+    }))
+}
+
+/**
+ * Auto-creates default registrar transactions if missing.
+ * It does NOT overwrite existing records (so CRUD updates are preserved).
+ */
+export async function ensureDefaultRegistrarTransactions() {
+    if (bootstrapReady) return
+    if (bootstrapPromise) return bootstrapPromise
+
+    bootstrapPromise = (async () => {
+        await seedTransactions(REGISTRAR_CATEGORY, defaultSeeds(), { updateExisting: false })
+        await reloadRegistrarCache()
+        bootstrapReady = true
+    })()
+        .catch((err) => {
+            bootstrapReady = false
+            throw err
+        })
+        .finally(() => {
+            bootstrapPromise = null
+        })
+
+    return bootstrapPromise
+}
+
+function warmupDefaultsNonBlocking() {
+    void ensureDefaultRegistrarTransactions().catch(() => {
+        // intentionally silent for non-blocking warmup
+    })
+}
+
+/**
+ * Legacy sync getter (kept for compatibility with existing code).
+ * Uses cache and triggers non-blocking DB bootstrap.
+ */
+export function getTransactionsByScope(scope: TransactionScope): RegistrarTransaction[] {
+    warmupDefaultsNonBlocking()
+    return registrarCache
+        .filter((t) => t.scopes.includes(scope))
+        .map((t) => ({ ...t, scopes: [...t.scopes] }))
+}
+
+/**
+ * Legacy sync getter (kept for compatibility with existing code).
+ */
 export function getTransactionsForParticipant(type: ParticipantQueueType): RegistrarTransaction[] {
     return type === "STUDENT" ? getTransactionsByScope("INTERNAL") : getTransactionsByScope("EXTERNAL")
 }
 
+/**
+ * Legacy sync getter (kept for compatibility with existing code).
+ */
 export function getAllRegistrarTransactions(): RegistrarTransaction[] {
-    return [...REGISTRAR_TRANSACTIONS]
+    warmupDefaultsNonBlocking()
+    return registrarCache.map((t) => ({ ...t, scopes: [...t.scopes] }))
 }
 
+/**
+ * Legacy sync getter (kept for compatibility with existing code).
+ */
 export function getTransactionLabelMap(): Map<string, string> {
-    return new Map(REGISTRAR_TRANSACTIONS.map((t) => [t.key, t.label]))
+    warmupDefaultsNonBlocking()
+    return new Map(registrarCache.map((t) => [t.key, t.label]))
 }
 
+/**
+ * Legacy sync validator (kept for compatibility with existing code).
+ */
 export function validateTransactionsForParticipant(type: ParticipantQueueType, keys: string[]) {
     const allowed = new Set(getTransactionsForParticipant(type).map((t) => t.key))
     const invalidKeys = keys.filter((k) => !allowed.has(k))
@@ -108,5 +221,93 @@ export function validateTransactionsForParticipant(type: ParticipantQueueType, k
     }
 }
 
+function isRegistrarCategory(category: string) {
+    return category.trim().toUpperCase() === REGISTRAR_CATEGORY
+}
 
+/* -------------------------------------------------------------------------- */
+/*                    Flexible CRUD for ALL transaction kinds                  */
+/* -------------------------------------------------------------------------- */
 
+export async function createTransactionDefinition(input: CreateTransactionInput) {
+    await ensureDefaultRegistrarTransactions()
+    const created = await createCatalogTransaction(input)
+
+    if (isRegistrarCategory(created.category)) {
+        await reloadRegistrarCache()
+    }
+
+    return created
+}
+
+export async function listTransactionDefinitions(filter: ListTransactionsFilter = {}) {
+    await ensureDefaultRegistrarTransactions()
+    return listCatalogTransactions(filter)
+}
+
+export async function getTransactionDefinitionById(id: string) {
+    await ensureDefaultRegistrarTransactions()
+    return getCatalogTransactionById(id)
+}
+
+export async function getTransactionDefinitionByKey(category: string, key: string) {
+    await ensureDefaultRegistrarTransactions()
+    return getCatalogTransactionByKey(category, key)
+}
+
+export async function updateTransactionDefinition(id: string, patch: UpdateTransactionInput) {
+    await ensureDefaultRegistrarTransactions()
+    const updated = await updateCatalogTransaction(id, patch)
+
+    if (isRegistrarCategory(updated.category)) {
+        await reloadRegistrarCache()
+    }
+
+    return updated
+}
+
+export async function upsertTransactionDefinitionByKey(
+    category: string,
+    key: string,
+    patch: Partial<{
+        label: string
+        scopes: string[]
+        enabled: boolean
+        sortOrder: number
+        meta: Record<string, unknown>
+    }>
+) {
+    await ensureDefaultRegistrarTransactions()
+    const upserted = await upsertCatalogTransactionByKey(category, key, patch)
+
+    if (isRegistrarCategory(upserted.category)) {
+        await reloadRegistrarCache()
+    }
+
+    return upserted
+}
+
+export async function deleteTransactionDefinition(id: string) {
+    await ensureDefaultRegistrarTransactions()
+
+    const before = await getCatalogTransactionById(id)
+    const deleted = await deleteCatalogTransaction(id)
+
+    if (deleted && before?.category && isRegistrarCategory(before.category)) {
+        await reloadRegistrarCache()
+    }
+
+    return deleted
+}
+
+export async function deleteTransactionDefinitionByKey(category: string, key: string) {
+    await ensureDefaultRegistrarTransactions()
+
+    const deleted = await deleteCatalogTransactionByKey(category, key)
+
+    if (deleted && isRegistrarCategory(category)) {
+        await reloadRegistrarCache()
+    }
+
+    return deleted
+}
