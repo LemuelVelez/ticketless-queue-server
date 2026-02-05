@@ -9,6 +9,9 @@ router.use(requireAuth, requireRole("STAFF"))
 // Assignment
 router.get("/me/assignment", staffController.myAssignment)
 
+// ✅ Staff display snapshot (backend-integrated source for presenter/monitor UI)
+router.get("/display/snapshot", staffController.displaySnapshot)
+
 // Queue lists
 router.get("/queue/waiting", staffController.listWaiting)
 router.get("/queue/hold", staffController.listHold)

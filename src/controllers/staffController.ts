@@ -118,6 +118,91 @@ export const staffController = {
     },
 
     /**
+     * GET /staff/display/snapshot
+     * - Backend-integrated snapshot for the staff display page and presentation windows.
+     */
+    displaySnapshot: async (req: Request, res: Response) => {
+        const scope = await resolveStaffScope(req)
+        if (!scope.departmentId) return res.status(400).json({ message: "Staff not assigned" })
+
+        const dateKey = todayKey()
+
+        const settings = await SettingModel.findOne({}).lean()
+        const upNextCountRaw = Number((settings as any)?.upNextCount ?? 5)
+        const upNextCount = Number.isFinite(upNextCountRaw)
+            ? Math.max(1, Math.min(20, Math.floor(upNextCountRaw)))
+            : 5
+
+        const departmentDoc = await DepartmentModel.findById(scope.departmentId).select("_id name").lean()
+
+        const nowServingQuery: any = {
+            department: { $in: scope.handledDepartmentIds },
+            dateKey,
+            status: "CALLED",
+        }
+
+        const windowOr: any[] = []
+        if (scope.windowId) windowOr.push({ window: asObjectIdOrString(scope.windowId) })
+        if (typeof scope.windowNumber === "number") windowOr.push({ windowNumber: scope.windowNumber })
+        if (windowOr.length) nowServingQuery.$or = windowOr
+
+        const nowServingDoc = await TicketModel.findOne(nowServingQuery)
+            .sort({ calledAt: -1, updatedAt: -1 })
+            .select("_id queueNumber windowNumber calledAt")
+            .lean()
+
+        const upNextDocs = await TicketModel.find({
+            department: { $in: scope.handledDepartmentIds },
+            dateKey,
+            status: "WAITING",
+        })
+            .sort({ queueNumber: 1, waitingSince: 1 })
+            .limit(upNextCount)
+            .select("_id queueNumber")
+            .lean()
+
+        return res.json({
+            department: {
+                id: String(departmentDoc?._id || scope.departmentId),
+                name: String(departmentDoc?.name || "—"),
+                handledDepartmentIds: scope.handledDepartmentIds.map((id) => String(id)),
+            },
+            window: scope.window
+                ? {
+                    id: String((scope.window as any)?._id || scope.windowId),
+                    name: String((scope.window as any)?.name || "Window"),
+                    number:
+                        typeof scope.windowNumber === "number"
+                            ? scope.windowNumber
+                            : Number((scope.window as any)?.number || 0),
+                }
+                : null,
+            nowServing: nowServingDoc
+                ? {
+                    id: String((nowServingDoc as any)._id),
+                    queueNumber: Number((nowServingDoc as any).queueNumber || 0),
+                    windowNumber:
+                        typeof (nowServingDoc as any).windowNumber === "number"
+                            ? Number((nowServingDoc as any).windowNumber)
+                            : null,
+                    calledAt: (nowServingDoc as any).calledAt
+                        ? new Date((nowServingDoc as any).calledAt).toISOString()
+                        : null,
+                }
+                : null,
+            upNext: upNextDocs.map((row: any) => ({
+                id: String(row._id),
+                queueNumber: Number(row.queueNumber || 0),
+            })),
+            meta: {
+                generatedAt: new Date().toISOString(),
+                refreshMs: 5000,
+                upNextCount,
+            },
+        })
+    },
+
+    /**
      * GET /staff/queue/waiting?limit=25
      */
     listWaiting: async (req: Request, res: Response) => {
