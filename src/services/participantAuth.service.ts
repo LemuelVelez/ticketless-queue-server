@@ -41,8 +41,8 @@ const ParticipantSchema = new Schema<ParticipantDoc>(
         middleName: { type: String, trim: true },
         lastName: { type: String, required: true, trim: true },
 
-        tcNumber: { type: String, trim: true, uppercase: true, sparse: true, index: true },
-        mobileNumber: { type: String, required: true, trim: true, index: true },
+        tcNumber: { type: String, trim: true, uppercase: true, sparse: true },
+        mobileNumber: { type: String, required: true, trim: true },
 
         department: { type: Schema.Types.ObjectId, ref: "Department", required: true, index: true },
         active: { type: Boolean, default: true },
@@ -62,7 +62,7 @@ const ParticipantSessionSchema = new Schema<ParticipantSessionDoc>(
     {
         participant: { type: Schema.Types.ObjectId, ref: "QueueParticipant", required: true, index: true },
         tokenHash: { type: String, required: true, unique: true, index: true },
-        expiresAt: { type: Date, required: true, index: true },
+        expiresAt: { type: Date, required: true },
         createdAt: { type: Date, default: () => new Date() },
     },
     { versionKey: false }
