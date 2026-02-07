@@ -278,6 +278,9 @@ export const publicController = {
                     sessionToken,
                     transactionKeys,
                     presentDirectlyToDisplayMonitor: displayImmediately,
+                    departmentId: optional(asString(body.departmentId)),
+                    studentId: optional(asString(body.studentId)),
+                    phone: optional(asString(body.phone)),
                 })
 
                 // Backward-compatible response shape expected by existing frontend (ticket object).

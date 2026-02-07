@@ -1,11 +1,15 @@
 import { Router } from "express"
 import { publicController } from "../controllers/publicController"
+import { homeController } from "../controllers/HomeController"
 import { requireParticipantAuth } from "../controllers/middlewares"
 
 const router = Router()
 
 // Departments
 router.get("/departments", publicController.listDepartments)
+
+// Home overview charts
+router.get("/home/overview", homeController.overview)
 
 // Participant auth/session
 router.post("/auth/signup/student", publicController.signupStudent)

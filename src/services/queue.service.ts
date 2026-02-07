@@ -192,6 +192,12 @@ export type JoinQueueInput = {
     sessionToken: string
     transactionKeys: string[]
     presentDirectlyToDisplayMonitor?: boolean
+
+    // Optional user-editable overrides from join page.
+    // Department override also updates participant profile for next sessions.
+    departmentId?: string
+    studentId?: string
+    phone?: string
 }
 
 export type JoinQueueResult = {
@@ -205,6 +211,31 @@ export type JoinQueueResult = {
     nameOfPersonInCharge?: string
     canPresentDirectlyToDisplayMonitor: boolean
     voiceAnnouncement?: string
+}
+
+async function resolveJoinDepartment(
+    participant: mongoose.HydratedDocument<ParticipantDoc>,
+    departmentIdInput?: string
+): Promise<Types.ObjectId> {
+    const raw = String(departmentIdInput || "").trim()
+    if (!raw) return participant.department as Types.ObjectId
+
+    if (!Types.ObjectId.isValid(raw)) {
+        throw new Error("Invalid department.")
+    }
+
+    const requested = await DepartmentModel.findById(raw)
+    if (!requested || !requested.enabled) {
+        throw new Error("Department is invalid or disabled.")
+    }
+
+    const current = participant.department as Types.ObjectId
+    if (!current.equals(requested._id)) {
+        participant.department = requested._id
+        await participant.save()
+    }
+
+    return requested._id
 }
 
 export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult> {
@@ -228,10 +259,20 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         throw new Error(`Invalid transaction selection: ${validation.invalidKeys.join(", ")}`)
     }
 
-    const studentIdentifier = identifierOfParticipant(participant)
+    const selectedDepartmentId = await resolveJoinDepartment(participant, input.departmentId)
+    const providedStudentId = String(input.studentId || "").trim()
+    const providedPhone = String(input.phone || "").trim()
+
+    const studentIdentifier = providedStudentId || identifierOfParticipant(participant)
+    if (!studentIdentifier) {
+        throw new Error("Student ID / identifier is required.")
+    }
+
+    const phoneNumber = providedPhone || participant.mobileNumber || undefined
 
     if (blockDuplicate) {
         const duplicate = await TicketModel.findOne({
+            department: selectedDepartmentId,
             dateKey,
             studentId: studentIdentifier,
             status: { $in: ACTIVE_TICKET_STATUSES },
@@ -242,15 +283,15 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         }
     }
 
-    const queueNumber = await getNextQueueNumber(participant.department, dateKey)
-    const routing = await resolveWindowAndStaff(participant.department)
+    const queueNumber = await getNextQueueNumber(selectedDepartmentId, dateKey)
+    const routing = await resolveWindowAndStaff(selectedDepartmentId)
 
     const ticket = await TicketModel.create({
-        department: participant.department,
+        department: selectedDepartmentId,
         dateKey,
         queueNumber,
         studentId: studentIdentifier,
-        phone: participant.mobileNumber,
+        phone: phoneNumber,
         status: "WAITING",
         holdAttempts: 0,
         waitingSince: new Date(),
@@ -277,8 +318,10 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
             participantId: participant._id.toString(),
             participantType: participant.type,
             accountName,
-            departmentId: participant.department.toString(),
+            departmentId: selectedDepartmentId.toString(),
             transactionKeys: input.transactionKeys,
+            studentId: studentIdentifier,
+            phone: phoneNumber,
             windowId: routing.window?._id?.toString(),
             windowNumber: routing.window?.number,
             staffId: routing.staff?._id?.toString(),
