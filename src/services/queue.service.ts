@@ -14,7 +14,10 @@ import {
     type ParticipantDoc,
     type ParticipantType,
 } from "./participantAuth.service"
-import { getTransactionLabelMap, validateTransactionsForParticipant } from "./registrarTransactions.service"
+import {
+    getTransactionLabelMapForDepartment,
+    validateTransactionsForParticipantInDepartment,
+} from "./registrarTransactions.service"
 
 type TicketTransactionSelectionDoc = {
     ticket: Types.ObjectId
@@ -251,15 +254,21 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     const settings = await SettingModel.findOne({})
     const blockDuplicate = settings?.disallowDuplicateActiveTickets ?? true
 
-    const validation = validateTransactionsForParticipant(participant.type, input.transactionKeys || [])
     if (!input.transactionKeys?.length) {
         throw new Error("Please select at least one transaction.")
     }
+
+    const selectedDepartmentId = await resolveJoinDepartment(participant, input.departmentId)
+
+    const validation = await validateTransactionsForParticipantInDepartment(
+        participant.type,
+        selectedDepartmentId,
+        input.transactionKeys || []
+    )
     if (!validation.isValid) {
         throw new Error(`Invalid transaction selection: ${validation.invalidKeys.join(", ")}`)
     }
 
-    const selectedDepartmentId = await resolveJoinDepartment(participant, input.departmentId)
     const providedStudentId = String(input.studentId || "").trim()
     const providedPhone = String(input.phone || "").trim()
 
@@ -299,7 +308,9 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         windowNumber: routing.window?.number,
     })
 
-    const txLabelMap = getTransactionLabelMap()
+    const txLabelMap = await getTransactionLabelMapForDepartment(selectedDepartmentId, {
+        participantType: participant.type,
+    })
     const selectedTransactionLabels = input.transactionKeys.map((key) => txLabelMap.get(key) || key)
 
     await TicketTransactionSelectionModel.create({

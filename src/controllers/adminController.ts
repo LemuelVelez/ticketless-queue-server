@@ -8,6 +8,13 @@ import { UserModel, type UserRole } from "../models/User"
 import { AuditLogModel } from "../models/AuditLog"
 import { TicketModel, type TicketStatus } from "../models/Ticket"
 import { hashPassword } from "./security"
+import {
+    createTransactionDefinition,
+    deleteTransactionDefinition,
+    getTransactionDefinitionById,
+    listTransactionDefinitions,
+    updateTransactionDefinition,
+} from "../services/registrarTransactions.service"
 
 function actor(req: Request) {
     const u = (req as any).user
@@ -20,6 +27,38 @@ function normalizeEmail(email: unknown) {
 
 function isRole(value: unknown): value is UserRole {
     return value === "ADMIN" || value === "STAFF"
+}
+
+function normalizeManagerKey(value: unknown, fallback = "REGISTRAR") {
+    const v = String(value ?? "").trim().toUpperCase()
+    return v || fallback
+}
+
+function normalizeScopes(input: unknown): string[] | undefined {
+    if (input === undefined) return undefined
+    if (!Array.isArray(input)) return []
+
+    const allowed = new Set(["INTERNAL", "EXTERNAL"])
+    const seen = new Set<string>()
+    const out: string[] = []
+
+    for (const raw of input) {
+        const s = String(raw ?? "").trim().toUpperCase()
+        if (!s || !allowed.has(s) || seen.has(s)) continue
+        seen.add(s)
+        out.push(s)
+    }
+
+    return out
+}
+
+function toBoolean(value: unknown, fallback = false) {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === "boolean") return value
+    const s = String(value).trim().toLowerCase()
+    if (s === "true" || s === "1" || s === "yes") return true
+    if (s === "false" || s === "0" || s === "no") return false
+    return fallback
 }
 
 /**
@@ -41,6 +80,25 @@ function parseObjectId(v: unknown, fieldName: string): { value?: Types.ObjectId;
     if (!s) return { value: undefined }
     if (!Types.ObjectId.isValid(s)) return { error: `${fieldName} must be a valid ObjectId` }
     return { value: new Types.ObjectId(s) }
+}
+
+function parseDepartmentIdArray(value: unknown, fieldName: string): { value: string[]; error?: string } {
+    if (value === undefined || value === null) return { value: [] }
+    if (!Array.isArray(value)) return { value: [], error: `${fieldName} must be an array of ObjectId strings` }
+
+    const seen = new Set<string>()
+    const out: string[] = []
+
+    for (const raw of value) {
+        const id = String(raw ?? "").trim()
+        if (!id) continue
+        if (!Types.ObjectId.isValid(id)) return { value: [], error: `${fieldName} contains invalid ObjectId: ${id}` }
+        if (seen.has(id)) continue
+        seen.add(id)
+        out.push(id)
+    }
+
+    return { value: out }
 }
 
 /** =================
@@ -126,17 +184,18 @@ export const adminController = {
 
     // DEPARTMENTS
     listDepartments: async (_req: Request, res: Response) => {
-        const departments = await DepartmentModel.find({}).sort({ name: 1 })
+        const departments = await DepartmentModel.find({}).sort({ transactionManager: 1, name: 1 })
         return res.json({ departments })
     },
 
     createDepartment: async (req: Request, res: Response) => {
-        const { name, code } = req.body || {}
+        const { name, code, transactionManager } = req.body || {}
         if (!name) return res.status(400).json({ message: "name is required" })
 
         const department = await DepartmentModel.create({
             name: String(name).trim(),
             code: code ? String(code).trim() : undefined,
+            transactionManager: normalizeManagerKey(transactionManager, "REGISTRAR"),
         })
 
         await AuditLogModel.create({
@@ -144,6 +203,7 @@ export const adminController = {
             action: "ADMIN_CREATE_DEPARTMENT",
             entityType: "Department",
             entityId: department._id as any,
+            meta: { transactionManager: department.transactionManager },
         })
 
         return res.status(201).json({ department })
@@ -151,7 +211,7 @@ export const adminController = {
 
     updateDepartment: async (req: Request, res: Response) => {
         const { id } = req.params
-        const { name, code, enabled } = req.body || {}
+        const { name, code, enabled, transactionManager } = req.body || {}
 
         const department = await DepartmentModel.findById(id)
         if (!department) return res.status(404).json({ message: "Department not found" })
@@ -159,6 +219,9 @@ export const adminController = {
         if (name !== undefined) department.name = String(name).trim()
         if (code !== undefined) department.code = code ? String(code).trim() : undefined
         if (enabled !== undefined) department.enabled = Boolean(enabled)
+        if (transactionManager !== undefined) {
+            department.transactionManager = normalizeManagerKey(transactionManager, department.transactionManager || "REGISTRAR")
+        }
 
         await department.save()
 
@@ -167,10 +230,170 @@ export const adminController = {
             action: "ADMIN_UPDATE_DEPARTMENT",
             entityType: "Department",
             entityId: department._id as any,
-            meta: { name, code, enabled },
+            meta: { name, code, enabled, transactionManager },
         })
 
         return res.json({ department })
+    },
+
+    /* ---------------------------------------------------------------------- */
+    /* TRANSACTION PURPOSES (CRUD)                                            */
+    /* ---------------------------------------------------------------------- */
+
+    listTransactionPurposes: async (req: Request, res: Response) => {
+        const filter = {
+            category: typeof req.query.category === "string" ? req.query.category : undefined,
+            key: typeof req.query.key === "string" ? req.query.key : undefined,
+            scope: typeof req.query.scope === "string" ? req.query.scope : undefined,
+            departmentId: typeof req.query.departmentId === "string" ? req.query.departmentId : undefined,
+            enabledOnly: toBoolean(req.query.enabledOnly, false),
+            includeDisabled: toBoolean(req.query.includeDisabled, false),
+            matchDepartmentOrGlobal: toBoolean(req.query.matchDepartmentOrGlobal, true),
+        }
+
+        const transactions = await listTransactionDefinitions(filter)
+        return res.json({ transactions })
+    },
+
+    createTransactionPurpose: async (req: Request, res: Response) => {
+        const body = req.body || {}
+
+        const key = String(body.key || "").trim()
+        const label = String(body.label || "").trim()
+        if (!key || !label) {
+            return res.status(400).json({ message: "key and label are required" })
+        }
+
+        const departmentIdRaw = cleanId(body.departmentId)
+        const applyToAllDepartments = Boolean(body.applyToAllDepartments)
+
+        const depArrayParsed = parseDepartmentIdArray(body.departmentIds, "departmentIds")
+        if (depArrayParsed.error) return res.status(400).json({ message: depArrayParsed.error })
+
+        let category = normalizeManagerKey(body.category, "")
+        if (!category && departmentIdRaw) {
+            const dept = await DepartmentModel.findById(departmentIdRaw)
+            if (!dept || !dept.enabled) {
+                return res.status(400).json({ message: "departmentId is invalid or disabled" })
+            }
+            category = normalizeManagerKey(dept.transactionManager, "REGISTRAR")
+        }
+        if (!category) category = "REGISTRAR"
+
+        let departmentIds: string[] = []
+        if (applyToAllDepartments) {
+            departmentIds = []
+        } else if (depArrayParsed.value.length) {
+            departmentIds = depArrayParsed.value
+        } else if (departmentIdRaw) {
+            if (!Types.ObjectId.isValid(departmentIdRaw)) {
+                return res.status(400).json({ message: "departmentId must be a valid ObjectId" })
+            }
+            departmentIds = [departmentIdRaw]
+        }
+
+        const scopes = normalizeScopes(body.scopes) ?? ["INTERNAL", "EXTERNAL"]
+
+        const created = await createTransactionDefinition({
+            category,
+            key,
+            label,
+            scopes,
+            departmentIds,
+            enabled: body.enabled !== undefined ? Boolean(body.enabled) : true,
+            sortOrder: body.sortOrder !== undefined ? Number(body.sortOrder) : undefined,
+            meta: body.meta,
+        })
+
+        await AuditLogModel.create({
+            ...actor(req),
+            action: "ADMIN_CREATE_TRANSACTION_PURPOSE",
+            entityType: "TransactionCatalog",
+            entityId: created.id as any,
+            meta: {
+                category: created.category,
+                key: created.key,
+                departmentIds: created.departmentIds,
+            },
+        })
+
+        return res.status(201).json({ transaction: created })
+    },
+
+    updateTransactionPurpose: async (req: Request, res: Response) => {
+        const { id } = req.params
+        if (!id) return res.status(400).json({ message: "id is required" })
+
+        const existing = await getTransactionDefinitionById(id)
+        if (!existing) return res.status(404).json({ message: "Transaction purpose not found" })
+
+        const body = req.body || {}
+        const patch: any = {}
+
+        if (body.category !== undefined) patch.category = normalizeManagerKey(body.category, existing.category)
+        if (body.key !== undefined) patch.key = String(body.key).trim()
+        if (body.label !== undefined) patch.label = String(body.label).trim()
+        if (body.scopes !== undefined) patch.scopes = normalizeScopes(body.scopes) ?? []
+        if (body.enabled !== undefined) patch.enabled = Boolean(body.enabled)
+        if (body.sortOrder !== undefined) patch.sortOrder = Number(body.sortOrder)
+        if (body.meta !== undefined) patch.meta = body.meta
+
+        const departmentIdRaw = cleanId(body.departmentId)
+        const applyToAllDepartments = body.applyToAllDepartments === true
+
+        if (applyToAllDepartments) {
+            patch.departmentIds = []
+        } else if (body.departmentIds !== undefined) {
+            const depArrayParsed = parseDepartmentIdArray(body.departmentIds, "departmentIds")
+            if (depArrayParsed.error) return res.status(400).json({ message: depArrayParsed.error })
+            patch.departmentIds = depArrayParsed.value
+        } else if (departmentIdRaw !== null) {
+            if (!Types.ObjectId.isValid(departmentIdRaw)) {
+                return res.status(400).json({ message: "departmentId must be a valid ObjectId" })
+            }
+            patch.departmentIds = [departmentIdRaw]
+        }
+
+        const updated = await updateTransactionDefinition(id, patch)
+
+        await AuditLogModel.create({
+            ...actor(req),
+            action: "ADMIN_UPDATE_TRANSACTION_PURPOSE",
+            entityType: "TransactionCatalog",
+            entityId: updated.id as any,
+            meta: {
+                key: updated.key,
+                category: updated.category,
+                departmentIds: updated.departmentIds,
+                enabled: updated.enabled,
+            },
+        })
+
+        return res.json({ transaction: updated })
+    },
+
+    deleteTransactionPurpose: async (req: Request, res: Response) => {
+        const { id } = req.params
+        if (!id) return res.status(400).json({ message: "id is required" })
+
+        const existing = await getTransactionDefinitionById(id)
+        if (!existing) return res.status(404).json({ message: "Transaction purpose not found" })
+
+        const deleted = await deleteTransactionDefinition(id)
+        if (!deleted) return res.status(404).json({ message: "Transaction purpose not found" })
+
+        await AuditLogModel.create({
+            ...actor(req),
+            action: "ADMIN_DELETE_TRANSACTION_PURPOSE",
+            entityType: "TransactionCatalog",
+            entityId: id as any,
+            meta: {
+                key: existing.key,
+                category: existing.category,
+            },
+        })
+
+        return res.json({ ok: true })
     },
 
     // WINDOWS

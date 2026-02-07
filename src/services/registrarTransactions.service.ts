@@ -1,3 +1,6 @@
+import { Types } from "mongoose"
+
+import { DepartmentModel } from "../models/Department"
 import {
     createTransaction as createCatalogTransaction,
     deleteTransaction as deleteCatalogTransaction,
@@ -24,25 +27,14 @@ export type RegistrarTransaction = {
     scopes: TransactionScope[]
 }
 
-const REGISTRAR_CATEGORY = "REGISTRAR"
+const DEFAULT_TRANSACTION_MANAGER = "REGISTRAR"
+const REGISTRAR_CATEGORY = DEFAULT_TRANSACTION_MANAGER
 
 const DEFAULT_REGISTRAR_TRANSACTIONS: RegistrarTransaction[] = [
     // Internal
-    {
-        key: "correction-grade-entry",
-        label: "Correction of Grade Entry",
-        scopes: ["INTERNAL"],
-    },
-    {
-        key: "correction-personal-record",
-        label: "Correction of Personal Record",
-        scopes: ["INTERNAL", "EXTERNAL"],
-    },
-    {
-        key: "enrollment-validation-enrollment",
-        label: "Enrollment / Validation of Enrollment",
-        scopes: ["INTERNAL"],
-    },
+    { key: "correction-grade-entry", label: "Correction of Grade Entry", scopes: ["INTERNAL"] },
+    { key: "correction-personal-record", label: "Correction of Personal Record", scopes: ["INTERNAL", "EXTERNAL"] },
+    { key: "enrollment-validation-enrollment", label: "Enrollment / Validation of Enrollment", scopes: ["INTERNAL"] },
     {
         key: "followup-request-submission-evaluation-documents-application-graduation",
         label: "Follow-up / Request / Submission / Evaluation of Documents / Application for Graduation",
@@ -53,31 +45,15 @@ const DEFAULT_REGISTRAR_TRANSACTIONS: RegistrarTransaction[] = [
         label: "Issuance of Certificates / Forms / Authentication",
         scopes: ["INTERNAL", "EXTERNAL"],
     },
-    {
-        key: "issuance-transcript-of-records-tor",
-        label: "Issuance of Transcript of Records (TOR)",
-        scopes: ["INTERNAL", "EXTERNAL"],
-    },
-    {
-        key: "processing-faculty-clearance",
-        label: "Processing Faculty Clearance",
-        scopes: ["INTERNAL", "EXTERNAL"],
-    },
+    { key: "issuance-transcript-of-records-tor", label: "Issuance of Transcript of Records (TOR)", scopes: ["INTERNAL", "EXTERNAL"] },
+    { key: "processing-faculty-clearance", label: "Processing Faculty Clearance", scopes: ["INTERNAL", "EXTERNAL"] },
     {
         key: "processing-inc-ng-adding-changing-dropping-subjects",
         label: "Processing of INC/NG; Adding, Changing, and Dropping of Subjects",
         scopes: ["INTERNAL"],
     },
-    {
-        key: "processing-student-clearance",
-        label: "Processing of Student Clearance",
-        scopes: ["INTERNAL", "EXTERNAL"],
-    },
-    {
-        key: "release-instructors-program",
-        label: "Release of Instructor’s Program",
-        scopes: ["INTERNAL"],
-    },
+    { key: "processing-student-clearance", label: "Processing of Student Clearance", scopes: ["INTERNAL", "EXTERNAL"] },
+    { key: "release-instructors-program", label: "Release of Instructor’s Program", scopes: ["INTERNAL"] },
     {
         key: "responding-to-requests-for-institutional-data",
         label: "Responding to Requests for Institutional Data",
@@ -85,26 +61,19 @@ const DEFAULT_REGISTRAR_TRANSACTIONS: RegistrarTransaction[] = [
     },
 
     // External-only
-    {
-        key: "issuance-cav",
-        label: "Issuance of Certification, Verification, and Authentication (CAV)",
-        scopes: ["EXTERNAL"],
-    },
-    {
-        key: "issuance-diploma",
-        label: "Issuance of Diploma",
-        scopes: ["EXTERNAL"],
-    },
-    {
-        key: "issuance-form-137-honorable-dismissal",
-        label: "Issuance of Form 137 / Honorable Dismissal",
-        scopes: ["EXTERNAL"],
-    },
+    { key: "issuance-cav", label: "Issuance of Certification, Verification, and Authentication (CAV)", scopes: ["EXTERNAL"] },
+    { key: "issuance-diploma", label: "Issuance of Diploma", scopes: ["EXTERNAL"] },
+    { key: "issuance-form-137-honorable-dismissal", label: "Issuance of Form 137 / Honorable Dismissal", scopes: ["EXTERNAL"] },
 ]
 
 let registrarCache: RegistrarTransaction[] = DEFAULT_REGISTRAR_TRANSACTIONS.map((t) => ({ ...t, scopes: [...t.scopes] }))
 let bootstrapPromise: Promise<void> | null = null
 let bootstrapReady = false
+
+function normalizeCategory(category: string) {
+    const value = String(category || "").trim().toUpperCase()
+    return value || DEFAULT_TRANSACTION_MANAGER
+}
 
 function toScope(scope: string): TransactionScope | null {
     const v = scope.trim().toUpperCase()
@@ -112,10 +81,12 @@ function toScope(scope: string): TransactionScope | null {
     return null
 }
 
+function scopeForParticipant(type: ParticipantQueueType): TransactionScope {
+    return type === "STUDENT" ? "INTERNAL" : "EXTERNAL"
+}
+
 function toRegistrarTransaction(record: TransactionRecord): RegistrarTransaction {
-    const scopes = record.scopes
-        .map((s) => toScope(s))
-        .filter((s): s is TransactionScope => !!s)
+    const scopes = record.scopes.map((s) => toScope(s)).filter((s): s is TransactionScope => !!s)
 
     return {
         key: record.key,
@@ -143,6 +114,16 @@ function defaultSeeds(): SeedTransactionInput[] {
         sortOrder: index + 1,
         meta: { module: "registrar" },
     }))
+}
+
+async function resolveDepartmentCategory(departmentId: string | Types.ObjectId): Promise<string> {
+    const id = String(departmentId || "").trim()
+    if (!Types.ObjectId.isValid(id)) return DEFAULT_TRANSACTION_MANAGER
+
+    const department = await DepartmentModel.findById(id).select("transactionManager").lean()
+    if (!department) return DEFAULT_TRANSACTION_MANAGER
+
+    return normalizeCategory(department.transactionManager || DEFAULT_TRANSACTION_MANAGER)
 }
 
 /**
@@ -194,6 +175,50 @@ export function getTransactionsForParticipant(type: ParticipantQueueType): Regis
 }
 
 /**
+ * Department-aware transaction list for queue participants.
+ * Uses department.transactionManager (top-level office) + department-specific transaction bindings.
+ */
+export async function getTransactionsForParticipantInDepartment(
+    type: ParticipantQueueType,
+    departmentId: string | Types.ObjectId
+): Promise<RegistrarTransaction[]> {
+    await ensureDefaultRegistrarTransactions()
+
+    const category = await resolveDepartmentCategory(departmentId)
+    const scope = scopeForParticipant(type)
+
+    const records = await listCatalogTransactions({
+        category,
+        scope,
+        enabledOnly: true,
+        includeDisabled: false,
+        departmentId: String(departmentId),
+        matchDepartmentOrGlobal: true,
+    })
+
+    return records.map(toRegistrarTransaction)
+}
+
+export async function getTransactionLabelMapForDepartment(
+    departmentId: string | Types.ObjectId,
+    opts?: { participantType?: ParticipantQueueType }
+): Promise<Map<string, string>> {
+    await ensureDefaultRegistrarTransactions()
+
+    const category = await resolveDepartmentCategory(departmentId)
+    const records = await listCatalogTransactions({
+        category,
+        scope: opts?.participantType ? scopeForParticipant(opts.participantType) : undefined,
+        enabledOnly: true,
+        includeDisabled: false,
+        departmentId: String(departmentId),
+        matchDepartmentOrGlobal: true,
+    })
+
+    return new Map(records.map((t) => [t.key, t.label]))
+}
+
+/**
  * Legacy sync getter (kept for compatibility with existing code).
  */
 export function getAllRegistrarTransactions(): RegistrarTransaction[] {
@@ -214,6 +239,19 @@ export function getTransactionLabelMap(): Map<string, string> {
  */
 export function validateTransactionsForParticipant(type: ParticipantQueueType, keys: string[]) {
     const allowed = new Set(getTransactionsForParticipant(type).map((t) => t.key))
+    const invalidKeys = keys.filter((k) => !allowed.has(k))
+    return {
+        isValid: invalidKeys.length === 0,
+        invalidKeys,
+    }
+}
+
+export async function validateTransactionsForParticipantInDepartment(
+    type: ParticipantQueueType,
+    departmentId: string | Types.ObjectId,
+    keys: string[]
+) {
+    const allowed = new Set((await getTransactionsForParticipantInDepartment(type, departmentId)).map((t) => t.key))
     const invalidKeys = keys.filter((k) => !allowed.has(k))
     return {
         isValid: invalidKeys.length === 0,
@@ -272,6 +310,7 @@ export async function upsertTransactionDefinitionByKey(
     patch: Partial<{
         label: string
         scopes: string[]
+        departmentIds: string[]
         enabled: boolean
         sortOrder: number
         meta: Record<string, unknown>

@@ -2,7 +2,7 @@ import mongoose, { Schema, Types } from "mongoose"
 import { createHash, pbkdf2Sync, randomBytes, timingSafeEqual } from "crypto"
 
 import { DepartmentModel } from "../models/Department"
-import { getTransactionsForParticipant, type ParticipantQueueType } from "./registrarTransactions.service"
+import { getTransactionsForParticipantInDepartment, type ParticipantQueueType } from "./registrarTransactions.service"
 
 export type ParticipantType = ParticipantQueueType
 
@@ -304,12 +304,13 @@ export async function loginStudent(tcNumberInput: string, pin: string) {
     }
 
     const session = await createParticipantSession(participant._id)
+    const availableTransactions = await getTransactionsForParticipantInDepartment("STUDENT", participant.department)
 
     return {
         sessionToken: session.token,
         sessionExpiresAt: session.expiresAt,
         participant: toPublicProfile(participant),
-        availableTransactions: getTransactionsForParticipant("STUDENT"),
+        availableTransactions,
     }
 }
 
@@ -334,12 +335,13 @@ export async function loginAlumniVisitor(mobileInput: string, pin: string) {
     }
 
     const session = await createParticipantSession(participant._id)
+    const availableTransactions = await getTransactionsForParticipantInDepartment("ALUMNI_VISITOR", participant.department)
 
     return {
         sessionToken: session.token,
         sessionExpiresAt: session.expiresAt,
         participant: toPublicProfile(participant),
-        availableTransactions: getTransactionsForParticipant("ALUMNI_VISITOR"),
+        availableTransactions,
     }
 }
 

@@ -5,6 +5,13 @@ export type TransactionCatalogDoc = {
     key: string
     label: string
     scopes: string[]
+
+    /**
+     * Empty = available to ALL departments under this category.
+     * Non-empty = only available to these departments.
+     */
+    departmentIds: mongoose.Types.ObjectId[]
+
     enabled: boolean
     sortOrder: number
     meta?: Record<string, unknown>
@@ -18,6 +25,7 @@ export type TransactionRecord = {
     key: string
     label: string
     scopes: string[]
+    departmentIds: string[]
     enabled: boolean
     sortOrder: number
     meta?: Record<string, unknown>
@@ -31,6 +39,9 @@ const TransactionCatalogSchema = new Schema<TransactionCatalogDoc>(
         key: { type: String, required: true, trim: true, lowercase: true, index: true },
         label: { type: String, required: true, trim: true },
         scopes: [{ type: String, trim: true, uppercase: true }],
+
+        departmentIds: [{ type: Schema.Types.ObjectId, ref: "Department", index: true }],
+
         enabled: { type: Boolean, default: true, index: true },
         sortOrder: { type: Number, default: 1000, index: true },
         meta: { type: Schema.Types.Mixed },
@@ -40,6 +51,7 @@ const TransactionCatalogSchema = new Schema<TransactionCatalogDoc>(
 
 TransactionCatalogSchema.index({ category: 1, key: 1 }, { unique: true })
 TransactionCatalogSchema.index({ category: 1, enabled: 1, sortOrder: 1, label: 1 })
+TransactionCatalogSchema.index({ category: 1, departmentIds: 1, enabled: 1, sortOrder: 1, label: 1 })
 
 export const TransactionCatalogModel =
     (mongoose.models.TransactionCatalog as mongoose.Model<TransactionCatalogDoc>) ||
@@ -82,11 +94,34 @@ function uniqueStrings(values: string[]) {
     const out: string[] = []
 
     for (const raw of values) {
-        const v = raw.trim().toUpperCase()
+        const v = String(raw ?? "").trim().toUpperCase()
         if (!v) continue
         if (seen.has(v)) continue
         seen.add(v)
         out.push(v)
+    }
+
+    return out
+}
+
+function uniqueObjectIds(values: string[]) {
+    const seen = new Set<string>()
+    const out: mongoose.Types.ObjectId[] = []
+
+    for (const raw of values) {
+        const v = String(raw ?? "").trim()
+        if (!v) continue
+
+        if (!mongoose.Types.ObjectId.isValid(v)) {
+            throw new Error(`Invalid department id: ${v}`)
+        }
+
+        const id = new mongoose.Types.ObjectId(v)
+        const hex = id.toHexString()
+        if (seen.has(hex)) continue
+
+        seen.add(hex)
+        out.push(id)
     }
 
     return out
@@ -98,7 +133,8 @@ function toRecord(doc: TransactionCatalogDoc & { _id: mongoose.Types.ObjectId })
         category: doc.category,
         key: doc.key,
         label: doc.label,
-        scopes: [...doc.scopes],
+        scopes: [...(doc.scopes || [])],
+        departmentIds: (doc.departmentIds || []).map((d) => d.toString()),
         enabled: doc.enabled,
         sortOrder: doc.sortOrder,
         meta: doc.meta,
@@ -112,6 +148,7 @@ export type CreateTransactionInput = {
     key: string
     label: string
     scopes?: string[]
+    departmentIds?: string[]
     enabled?: boolean
     sortOrder?: number
     meta?: Record<string, unknown>
@@ -133,6 +170,7 @@ export async function createTransaction(input: CreateTransactionInput): Promise<
         key,
         label,
         scopes: uniqueStrings(input.scopes || []),
+        departmentIds: uniqueObjectIds(input.departmentIds || []),
         enabled: input.enabled ?? true,
         sortOrder: input.sortOrder ?? 1000,
         meta: input.meta,
@@ -147,12 +185,19 @@ export type ListTransactionsFilter = {
     enabledOnly?: boolean
     includeDisabled?: boolean
     key?: string
+
+    /**
+     * If provided, filters transactions bound to this department.
+     * By default includes "global" records (empty departmentIds) too.
+     */
+    departmentId?: string
+    matchDepartmentOrGlobal?: boolean
 }
 
 export async function listTransactions(filter: ListTransactionsFilter = {}): Promise<TransactionRecord[]> {
     await ensureIndexes()
 
-    const query: Record<string, unknown> = {}
+    const query: any = {}
 
     if (filter.category) {
         query.category = normalizeCategory(filter.category)
@@ -171,6 +216,22 @@ export async function listTransactions(filter: ListTransactionsFilter = {}): Pro
 
     if (enabledOnly && !includeDisabled) {
         query.enabled = true
+    }
+
+    if (filter.departmentId) {
+        const raw = String(filter.departmentId).trim()
+        if (!mongoose.Types.ObjectId.isValid(raw)) {
+            throw new Error("Invalid department id.")
+        }
+
+        const departmentObjectId = new mongoose.Types.ObjectId(raw)
+        const matchDepartmentOrGlobal = filter.matchDepartmentOrGlobal ?? true
+
+        if (matchDepartmentOrGlobal) {
+            query.$or = [{ departmentIds: departmentObjectId }, { departmentIds: { $size: 0 } }]
+        } else {
+            query.departmentIds = departmentObjectId
+        }
     }
 
     const docs = await TransactionCatalogModel.find(query)
@@ -209,6 +270,7 @@ export type UpdateTransactionInput = Partial<{
     key: string
     label: string
     scopes: string[]
+    departmentIds: string[]
     enabled: boolean
     sortOrder: number
     meta: Record<string, unknown>
@@ -227,6 +289,7 @@ export async function updateTransaction(id: string, patch: UpdateTransactionInpu
     if (patch.key !== undefined) set.key = normalizeKey(patch.key)
     if (patch.label !== undefined) set.label = normalizeLabel(patch.label)
     if (patch.scopes !== undefined) set.scopes = uniqueStrings(patch.scopes)
+    if (patch.departmentIds !== undefined) set.departmentIds = uniqueObjectIds(patch.departmentIds)
     if (patch.enabled !== undefined) set.enabled = !!patch.enabled
     if (patch.sortOrder !== undefined) set.sortOrder = patch.sortOrder
     if (patch.meta !== undefined) set.meta = patch.meta
@@ -266,6 +329,7 @@ export async function deleteTransactionByKey(category: string, key: string): Pro
 export type UpsertTransactionByKeyInput = Partial<{
     label: string
     scopes: string[]
+    departmentIds: string[]
     enabled: boolean
     sortOrder: number
     meta: Record<string, unknown>
@@ -284,6 +348,7 @@ export async function upsertTransactionByKey(
     const set: Record<string, unknown> = {}
     if (patch.label !== undefined) set.label = normalizeLabel(patch.label)
     if (patch.scopes !== undefined) set.scopes = uniqueStrings(patch.scopes)
+    if (patch.departmentIds !== undefined) set.departmentIds = uniqueObjectIds(patch.departmentIds)
     if (patch.enabled !== undefined) set.enabled = !!patch.enabled
     if (patch.sortOrder !== undefined) set.sortOrder = patch.sortOrder
     if (patch.meta !== undefined) set.meta = patch.meta
@@ -297,6 +362,7 @@ export async function upsertTransactionByKey(
                 key: normalizedKey,
                 label: patch.label ? normalizeLabel(patch.label) : normalizedKey,
                 scopes: patch.scopes ? uniqueStrings(patch.scopes) : [],
+                departmentIds: patch.departmentIds ? uniqueObjectIds(patch.departmentIds) : [],
                 enabled: patch.enabled ?? true,
                 sortOrder: patch.sortOrder ?? 1000,
                 meta: patch.meta,
@@ -312,6 +378,7 @@ export type SeedTransactionInput = {
     key: string
     label: string
     scopes?: string[]
+    departmentIds?: string[]
     enabled?: boolean
     sortOrder?: number
     meta?: Record<string, unknown>
@@ -336,6 +403,7 @@ export async function seedTransactions(
             key: normalizedKey,
             label: normalizeLabel(item.label),
             scopes: uniqueStrings(item.scopes || []),
+            departmentIds: uniqueObjectIds(item.departmentIds || []),
             enabled: item.enabled ?? true,
             sortOrder: item.sortOrder ?? index + 1,
             meta: item.meta,
@@ -347,6 +415,7 @@ export async function seedTransactions(
                 $set: {
                     label: normalizeLabel(item.label),
                     scopes: uniqueStrings(item.scopes || []),
+                    departmentIds: uniqueObjectIds(item.departmentIds || []),
                     sortOrder: item.sortOrder ?? index + 1,
                     ...(item.enabled !== undefined ? { enabled: item.enabled } : {}),
                     ...(item.meta !== undefined ? { meta: item.meta } : {}),

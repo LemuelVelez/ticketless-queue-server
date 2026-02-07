@@ -15,6 +15,12 @@ router.get("/departments", adminController.listDepartments)
 router.post("/departments", adminController.createDepartment)
 router.put("/departments/:id", adminController.updateDepartment)
 
+// Transaction purposes (department-aware, manager/category-aware)
+router.get("/transaction-purposes", adminController.listTransactionPurposes)
+router.post("/transaction-purposes", adminController.createTransactionPurpose)
+router.put("/transaction-purposes/:id", adminController.updateTransactionPurpose)
+router.delete("/transaction-purposes/:id", adminController.deleteTransactionPurpose)
+
 // Windows
 router.get("/windows", adminController.listWindows)
 router.post("/windows", adminController.createWindow)
