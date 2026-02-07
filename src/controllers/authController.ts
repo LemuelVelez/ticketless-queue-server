@@ -17,6 +17,64 @@ function sha256Hex(input: string) {
     return crypto.createHash("sha256").update(input).digest("hex")
 }
 
+const USER_REGISTER_FIELDS = [
+    "firstName",
+    "middleName",
+    "lastName",
+    "tcNumber",
+    "departmentId",
+    "mobileNumber",
+    "pin",
+] as const
+
+type RegisterField = (typeof USER_REGISTER_FIELDS)[number]
+
+function getRegisterColumnCoverage() {
+    const schema = UserModel.schema
+    const has = (path: string) => Boolean(schema.path(path))
+    const missingFrom = (fields: Record<RegisterField, boolean>) =>
+        Object.entries(fields)
+            .filter(([, ok]) => !ok)
+            .map(([field]) => field)
+
+    // Strict = exact same field names as register form payload
+    const strictFields: Record<RegisterField, boolean> = {
+        firstName: has("firstName"),
+        middleName: has("middleName"),
+        lastName: has("lastName"),
+        tcNumber: has("tcNumber"),
+        departmentId: has("departmentId"),
+        mobileNumber: has("mobileNumber"),
+        pin: has("pin"),
+    }
+
+    // Compatible = accepts common backend equivalents
+    const compatibleFields: Record<RegisterField, boolean> = {
+        ...strictFields,
+        departmentId: strictFields.departmentId || has("assignedDepartment"),
+        pin: strictFields.pin || (has("passwordSalt") && has("passwordHash")),
+    }
+
+    const strictMissing = missingFrom(strictFields)
+    const compatibleMissing = missingFrom(compatibleFields)
+
+    return {
+        model: "User",
+        checkedAt: new Date().toISOString(),
+        registerFields: [...USER_REGISTER_FIELDS],
+        strict: {
+            allPresent: strictMissing.length === 0,
+            fields: strictFields,
+            missing: strictMissing,
+        },
+        compatible: {
+            allPresent: compatibleMissing.length === 0,
+            fields: compatibleFields,
+            missing: compatibleMissing,
+        },
+    }
+}
+
 function respondWithSession(res: Response, user: any) {
     const secret = process.env.JWT_SECRET
     if (!secret) return res.status(500).json({ message: "JWT_SECRET missing" })
@@ -67,6 +125,11 @@ async function login(req: Request, res: Response, role: "ADMIN" | "STAFF") {
 export const authController = {
     adminLogin: (req: Request, res: Response) => login(req, res, "ADMIN"),
     staffLogin: (req: Request, res: Response) => login(req, res, "STAFF"),
+
+    // GET /auth/register/columns
+    checkRegisterColumns: async (_req: Request, res: Response) => {
+        return res.json(getRegisterColumnCoverage())
+    },
 
     me: async (req: Request, res: Response) => {
         const u = (req as any).user
