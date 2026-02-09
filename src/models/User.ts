@@ -10,17 +10,17 @@ export type UserDoc = {
     role: UserRole
     active: boolean
 
+    // Staff assignment fields
+    assignedDepartment?: Types.ObjectId
+    assignedDepartments?: Types.ObjectId[]
+    assignedWindow?: Types.ObjectId
+    assignedTransactionManager?: string
+
     // Credentials (admin/staff password OR participant PIN-as-password)
     passwordSalt: string
     passwordHash: string
     passwordAlgo: "pbkdf2-sha256"
     passwordIterations: number
-
-    // Staff assignment
-    assignedTransactionManager?: string
-    assignedDepartment?: Types.ObjectId
-    assignedDepartments?: Types.ObjectId[]
-    assignedWindow?: Types.ObjectId
 
     // Participant registration fields (used by register page)
     type?: ParticipantType
@@ -56,20 +56,6 @@ function isStaffRole(role?: string) {
     return role === "ADMIN" || role === "STAFF"
 }
 
-function normalizeObjectIdList(values: Array<Types.ObjectId | string | null | undefined>) {
-    const seen = new Set<string>()
-    const out: Types.ObjectId[] = []
-
-    for (const raw of values) {
-        const s = String(raw ?? "").trim()
-        if (!s || !Types.ObjectId.isValid(s) || seen.has(s)) continue
-        seen.add(s)
-        out.push(new Types.ObjectId(s))
-    }
-
-    return out
-}
-
 const UserSchema = new Schema<UserDoc>(
     {
         name: { type: String, required: true, trim: true },
@@ -88,26 +74,20 @@ const UserSchema = new Schema<UserDoc>(
         role: { type: String, enum: userRoles, required: true },
         active: { type: Boolean, default: true },
 
+        // Staff assignment fields
+        assignedDepartment: { type: Schema.Types.ObjectId, ref: "Department", index: true },
+        assignedDepartments: {
+            type: [{ type: Schema.Types.ObjectId, ref: "Department" }],
+            default: [],
+            index: true,
+        },
+        assignedWindow: { type: Schema.Types.ObjectId, ref: "ServiceWindow", index: true },
+        assignedTransactionManager: { type: String, trim: true, uppercase: true, index: true },
+
         passwordSalt: { type: String, required: true },
         passwordHash: { type: String, required: true },
         passwordAlgo: { type: String, default: "pbkdf2-sha256" },
         passwordIterations: { type: Number, default: 150000 },
-
-        assignedTransactionManager: {
-            type: String,
-            trim: true,
-            uppercase: true,
-            index: true,
-        },
-
-        assignedDepartment: { type: Schema.Types.ObjectId, ref: "Department" },
-
-        assignedDepartments: {
-            type: [{ type: Schema.Types.ObjectId, ref: "Department" }],
-            default: undefined,
-        },
-
-        assignedWindow: { type: Schema.Types.ObjectId, ref: "ServiceWindow" },
 
         // Participant fields used by register/login flow
         type: { type: String, enum: participantTypes },
@@ -159,11 +139,6 @@ UserSchema.index({ email: 1 }, { unique: true, sparse: true })
 UserSchema.index({ tcNumber: 1 }, { unique: true, sparse: true })
 UserSchema.index({ studentId: 1 }, { unique: true, sparse: true })
 
-// Query/perf indexes for staff assignment lookups
-UserSchema.index({ role: 1, assignedDepartment: 1 })
-UserSchema.index({ role: 1, assignedDepartments: 1 })
-UserSchema.index({ role: 1, assignedWindow: 1 })
-
 // Keep compatibility aliases synchronized
 UserSchema.pre("validate", function (next) {
     const doc = this as UserDoc
@@ -185,6 +160,30 @@ UserSchema.pre("validate", function (next) {
         doc.mobileNumber = doc.phone
     }
 
+    // Keep staff assignment fields consistent.
+    if (isStaffRole(doc.role)) {
+        const merged = new Set<string>()
+
+        if (doc.assignedDepartment) merged.add(String(doc.assignedDepartment))
+        for (const dep of doc.assignedDepartments || []) {
+            if (dep) merged.add(String(dep))
+        }
+
+        doc.assignedDepartments = Array.from(merged)
+            .map((id) => {
+                try {
+                    return new Types.ObjectId(id)
+                } catch {
+                    return null
+                }
+            })
+            .filter((v): v is Types.ObjectId => Boolean(v))
+
+        if (!doc.assignedDepartment && doc.assignedDepartments.length) {
+            doc.assignedDepartment = doc.assignedDepartments[0]
+        }
+    }
+
     // Compose display name if not explicitly set
     if (!doc.name) {
         const composed = [doc.firstName, doc.middleName, doc.lastName]
@@ -192,27 +191,6 @@ UserSchema.pre("validate", function (next) {
             .filter(Boolean)
             .join(" ")
         doc.name = composed
-    }
-
-    // STAFF: keep single + multi department assignments in sync.
-    if (doc.role === "STAFF") {
-        const primary = doc.assignedDepartment ? String(doc.assignedDepartment) : ""
-        const arr = Array.isArray(doc.assignedDepartments) ? doc.assignedDepartments : []
-        const merged = normalizeObjectIdList([primary, ...arr.map((v) => String(v))])
-
-        if (merged.length > 0) {
-            doc.assignedDepartments = merged
-            doc.assignedDepartment = merged[0]
-        } else {
-            doc.assignedDepartments = undefined
-            doc.assignedDepartment = undefined
-        }
-    } else {
-        // Non-STAFF users should not carry staff assignment fields.
-        doc.assignedTransactionManager = undefined
-        doc.assignedDepartment = undefined
-        doc.assignedDepartments = undefined
-        doc.assignedWindow = undefined
     }
 
     next()

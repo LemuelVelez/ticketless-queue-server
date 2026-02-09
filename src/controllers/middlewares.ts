@@ -11,8 +11,12 @@ export type AuthUser = {
     email?: string
     avatarKey?: string
     avatarUrl?: string
+
+    // Optional assignment context from JWT (fallback when DB lookup is unavailable)
     assignedDepartment?: string
+    assignedDepartments?: string[]
     assignedWindow?: string
+    assignedTransactionManager?: string
 }
 
 export type ParticipantType = "STUDENT" | "ALUMNI_VISITOR" | "GUEST"
@@ -36,6 +40,28 @@ export type ParticipantAuthUser = {
 function readBearerToken(req: Request) {
     const auth = req.header("authorization") || req.header("Authorization") || ""
     return auth.startsWith("Bearer ") ? auth.slice(7).trim() : ""
+}
+
+function readOptionalString(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined
+    const s = value.trim()
+    return s || undefined
+}
+
+function readStringArray(value: unknown): string[] {
+    const source = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : []
+
+    const seen = new Set<string>()
+    const out: string[] = []
+
+    for (const v of source) {
+        const s = String(v ?? "").trim()
+        if (!s || seen.has(s)) continue
+        seen.add(s)
+        out.push(s)
+    }
+
+    return out
 }
 
 function normalizeParticipantType(raw: unknown): ParticipantType | null {
@@ -107,17 +133,52 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
         const secret = process.env.JWT_SECRET
         if (!secret) return res.status(500).json({ message: "JWT_SECRET missing" })
 
-        const payload = verifyToken(token, secret)
+        const payload = verifyToken(token, secret) as Record<string, unknown>
+
+        const id = String(payload.sub ?? payload.id ?? payload.userId ?? "").trim()
+        const role = String(payload.role ?? payload.userRole ?? "").trim().toUpperCase() as UserRole
+
+        const assignedDepartment =
+            readOptionalString(payload.assignedDepartment) ||
+            readOptionalString(payload.assignedDepartmentId) ||
+            readOptionalString(payload.departmentId) ||
+            readOptionalString(payload.department)
+
+        const assignedDepartmentsFromToken = readStringArray(
+            payload.assignedDepartments ??
+            payload.assignedDepartmentIds ??
+            payload.departmentIds ??
+            payload.departments,
+        )
+
+        const assignedDepartments = assignedDepartment
+            ? Array.from(new Set([assignedDepartment, ...assignedDepartmentsFromToken]))
+            : assignedDepartmentsFromToken
+
+        const assignedWindow =
+            readOptionalString(payload.assignedWindow) ||
+            readOptionalString(payload.assignedWindowId) ||
+            readOptionalString(payload.windowId) ||
+            readOptionalString(payload.window)
+
+        const assignedTransactionManager =
+            readOptionalString(payload.assignedTransactionManager) ||
+            readOptionalString(payload.transactionManager) ||
+            readOptionalString(payload.assignedManager) ||
+            readOptionalString(payload.manager)
 
             ; (req as any).user = {
-                id: String(payload.sub || ""),
-                role: payload.role as UserRole,
+                id,
+                role,
                 name: payload.name as string | undefined,
                 email: payload.email as string | undefined,
                 avatarKey: payload.avatarKey as string | undefined,
                 avatarUrl: payload.avatarUrl as string | undefined,
-                assignedDepartment: payload.assignedDepartment as string | undefined,
-                assignedWindow: payload.assignedWindow as string | undefined,
+
+                assignedDepartment,
+                assignedDepartments,
+                assignedWindow,
+                assignedTransactionManager,
             } satisfies AuthUser
 
         if (!(req as any).user.id) return res.status(401).json({ message: "Invalid token" })
