@@ -25,7 +25,6 @@ const DepartmentSchema = new Schema<DepartmentDoc>(
             required: true,
             trim: true,
             uppercase: true,
-            default: "REGISTRAR",
             index: true,
         },
 

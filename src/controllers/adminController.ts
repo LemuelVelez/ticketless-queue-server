@@ -30,7 +30,10 @@ function isRole(value: unknown): value is UserRole {
 }
 
 function normalizeManagerKey(value: unknown, fallback = "REGISTRAR") {
-    const v = String(value ?? "").trim().toUpperCase()
+    const v = String(value ?? "")
+        .trim()
+        .toUpperCase()
+        .replace(/\s+/g, "_")
     return v || fallback
 }
 
@@ -39,6 +42,15 @@ function cleanManager(value: unknown): string | null {
     const s = String(value).trim()
     if (!s || s === "null" || s === "undefined") return null
     return normalizeManagerKey(s, "")
+}
+
+function requireManagerKey(
+    value: unknown,
+    fieldName = "transactionManager",
+): { value?: string; error?: string } {
+    const manager = cleanManager(value)
+    if (!manager) return { error: `${fieldName} is required` }
+    return { value: manager }
 }
 
 function normalizeScopes(input: unknown): string[] | undefined {
@@ -199,10 +211,13 @@ export const adminController = {
         const { name, code, transactionManager } = req.body || {}
         if (!name) return res.status(400).json({ message: "name is required" })
 
+        const managerParsed = requireManagerKey(transactionManager, "transactionManager")
+        if (managerParsed.error) return res.status(400).json({ message: managerParsed.error })
+
         const department = await DepartmentModel.create({
             name: String(name).trim(),
             code: code ? String(code).trim() : undefined,
-            transactionManager: normalizeManagerKey(transactionManager, "REGISTRAR"),
+            transactionManager: managerParsed.value!,
         })
 
         await AuditLogModel.create({
@@ -227,7 +242,9 @@ export const adminController = {
         if (code !== undefined) department.code = code ? String(code).trim() : undefined
         if (enabled !== undefined) department.enabled = Boolean(enabled)
         if (transactionManager !== undefined) {
-            department.transactionManager = normalizeManagerKey(transactionManager, department.transactionManager || "REGISTRAR")
+            const managerParsed = requireManagerKey(transactionManager, "transactionManager")
+            if (managerParsed.error) return res.status(400).json({ message: managerParsed.error })
+            department.transactionManager = managerParsed.value!
         }
 
         await department.save()
@@ -277,15 +294,18 @@ export const adminController = {
         const depArrayParsed = parseDepartmentIdArray(body.departmentIds, "departmentIds")
         if (depArrayParsed.error) return res.status(400).json({ message: depArrayParsed.error })
 
-        let category = normalizeManagerKey(body.category, "")
+        let category = cleanManager(body.category)
         if (!category && departmentIdRaw) {
-            const dept = await DepartmentModel.findById(departmentIdRaw)
-            if (!dept || !dept.enabled) {
+            const dept = await DepartmentModel.findById(departmentIdRaw).select("_id transactionManager enabled").lean()
+            if (!dept || dept.enabled === false) {
                 return res.status(400).json({ message: "departmentId is invalid or disabled" })
             }
-            category = normalizeManagerKey(dept.transactionManager, "REGISTRAR")
+            category = cleanManager((dept as any).transactionManager)
         }
-        if (!category) category = "REGISTRAR"
+
+        if (!category) {
+            return res.status(400).json({ message: "category is required (transaction manager key)" })
+        }
 
         let departmentIds: string[] = []
         if (applyToAllDepartments) {
@@ -297,6 +317,38 @@ export const adminController = {
                 return res.status(400).json({ message: "departmentId must be a valid ObjectId" })
             }
             departmentIds = [departmentIdRaw]
+        }
+
+        if (departmentIds.length > 0) {
+            const depDocs = await DepartmentModel.find({ _id: { $in: departmentIds } })
+                .select("_id transactionManager enabled")
+                .lean()
+
+            const depById = new Map<string, any>()
+            for (const d of depDocs as any[]) depById.set(String(d._id), d)
+
+            if (depById.size !== departmentIds.length) {
+                return res.status(400).json({ message: "One or more departmentIds are invalid" })
+            }
+
+            for (const depId of departmentIds) {
+                const dep = depById.get(depId)
+                if (!dep) return res.status(400).json({ message: `Invalid departmentId: ${depId}` })
+                if (dep.enabled === false) {
+                    return res.status(400).json({ message: `Department is disabled: ${depId}` })
+                }
+
+                const depManager = cleanManager(dep.transactionManager)
+                if (!depManager) {
+                    return res.status(400).json({ message: `Department has no transactionManager: ${depId}` })
+                }
+
+                if (depManager !== category) {
+                    return res.status(400).json({
+                        message: `Department ${depId} belongs to manager ${depManager}, but category is ${category}`,
+                    })
+                }
+            }
         }
 
         const scopes = normalizeScopes(body.scopes) ?? ["INTERNAL", "EXTERNAL"]
@@ -337,7 +389,11 @@ export const adminController = {
         const body = req.body || {}
         const patch: any = {}
 
-        if (body.category !== undefined) patch.category = normalizeManagerKey(body.category, existing.category)
+        if (body.category !== undefined) {
+            const category = cleanManager(body.category)
+            if (!category) return res.status(400).json({ message: "category cannot be empty" })
+            patch.category = category
+        }
         if (body.key !== undefined) patch.key = String(body.key).trim()
         if (body.label !== undefined) patch.label = String(body.label).trim()
         if (body.scopes !== undefined) patch.scopes = normalizeScopes(body.scopes) ?? []
@@ -359,6 +415,48 @@ export const adminController = {
                 return res.status(400).json({ message: "departmentId must be a valid ObjectId" })
             }
             patch.departmentIds = [departmentIdRaw]
+        }
+
+        const nextCategory = cleanManager(patch.category ?? existing.category)
+        if (!nextCategory) {
+            return res.status(400).json({ message: "category is required (transaction manager key)" })
+        }
+        patch.category = nextCategory
+
+        const nextDepartmentIds: string[] = Array.isArray(patch.departmentIds)
+            ? patch.departmentIds
+            : [...(existing.departmentIds || [])]
+
+        if (nextDepartmentIds.length > 0) {
+            const depDocs = await DepartmentModel.find({ _id: { $in: nextDepartmentIds } })
+                .select("_id transactionManager enabled")
+                .lean()
+
+            const depById = new Map<string, any>()
+            for (const d of depDocs as any[]) depById.set(String(d._id), d)
+
+            if (depById.size !== nextDepartmentIds.length) {
+                return res.status(400).json({ message: "One or more departmentIds are invalid" })
+            }
+
+            for (const depId of nextDepartmentIds) {
+                const dep = depById.get(depId)
+                if (!dep) return res.status(400).json({ message: `Invalid departmentId: ${depId}` })
+                if (dep.enabled === false) {
+                    return res.status(400).json({ message: `Department is disabled: ${depId}` })
+                }
+
+                const depManager = cleanManager(dep.transactionManager)
+                if (!depManager) {
+                    return res.status(400).json({ message: `Department has no transactionManager: ${depId}` })
+                }
+
+                if (depManager !== nextCategory) {
+                    return res.status(400).json({
+                        message: `Department ${depId} belongs to manager ${depManager}, but category is ${nextCategory}`,
+                    })
+                }
+            }
         }
 
         const updated = await updateTransactionDefinition(id, patch)
@@ -492,7 +590,8 @@ export const adminController = {
                 .lean()
 
             for (const d of depts as any[]) {
-                deptManagerById.set(String(d._id), normalizeManagerKey(d.transactionManager, "REGISTRAR"))
+                const manager = cleanManager(d.transactionManager)
+                if (manager) deptManagerById.set(String(d._id), manager)
             }
         }
 
@@ -502,11 +601,7 @@ export const adminController = {
 
             const managerFromUser = cleanManager(u.assignedTransactionManager)
             const managerFromDepartment = assignedDepartment ? deptManagerById.get(assignedDepartment) || null : null
-            const assignedTransactionManager = managerFromUser
-                ? normalizeManagerKey(managerFromUser, "REGISTRAR")
-                : managerFromDepartment
-                    ? normalizeManagerKey(managerFromDepartment, "REGISTRAR")
-                    : null
+            const assignedTransactionManager = managerFromUser || managerFromDepartment || null
 
             return {
                 id: String(u._id),
@@ -572,10 +667,14 @@ export const adminController = {
         }
 
         const managerFromBody = cleanManager(transactionManagerRaw)
-        const deptManager = deptDoc ? normalizeManagerKey(deptDoc.transactionManager, "REGISTRAR") : undefined
-        const effectiveManager = normalizeManagerKey(managerFromBody || deptManager || "REGISTRAR", "REGISTRAR")
+        const deptManager = deptDoc ? cleanManager(deptDoc.transactionManager) : null
+        const effectiveManager = managerFromBody || deptManager || null
 
-        if (role === "STAFF" && deptManager && deptManager !== effectiveManager) {
+        if (role === "STAFF" && !effectiveManager) {
+            return res.status(400).json({ message: "transactionManager is required for STAFF" })
+        }
+
+        if (role === "STAFF" && deptManager && effectiveManager && deptManager !== effectiveManager) {
             return res.status(400).json({
                 message: `Selected department belongs to manager ${deptManager}, but received ${effectiveManager}`,
             })
@@ -598,7 +697,7 @@ export const adminController = {
             passwordAlgo: algo,
             passwordIterations: iterations,
 
-            assignedTransactionManager: role === "STAFF" ? effectiveManager : undefined,
+            assignedTransactionManager: role === "STAFF" ? effectiveManager || undefined : undefined,
             assignedDepartment: role === "STAFF" ? deptParsed.value : undefined,
             assignedWindow: role === "STAFF" ? winParsed.value : undefined,
         })
@@ -666,7 +765,7 @@ export const adminController = {
 
             if (hasTransactionManagerPatch) {
                 const cleaned = cleanManager(transactionManagerRaw)
-                user.assignedTransactionManager = cleaned ? normalizeManagerKey(cleaned, "REGISTRAR") : undefined
+                user.assignedTransactionManager = cleaned || undefined
             }
 
             let deptDoc: any = null
@@ -693,11 +792,13 @@ export const adminController = {
                 }
             }
 
-            const deptManager = deptDoc ? normalizeManagerKey(deptDoc.transactionManager, "REGISTRAR") : undefined
-            const effectiveManager = normalizeManagerKey(
-                user.assignedTransactionManager || deptManager || "REGISTRAR",
-                "REGISTRAR",
-            )
+            const deptManager = deptDoc ? cleanManager(deptDoc.transactionManager) : null
+            const currentManager = cleanManager(user.assignedTransactionManager)
+            const effectiveManager = currentManager || deptManager || null
+
+            if (!effectiveManager) {
+                return res.status(400).json({ message: "transactionManager is required for STAFF" })
+            }
 
             if (deptManager && deptManager !== effectiveManager) {
                 return res.status(400).json({
