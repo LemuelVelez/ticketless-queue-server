@@ -187,6 +187,17 @@ function mapWindowPayload(row: any) {
     }
 }
 
+function toWindowKeyById(windowId: unknown) {
+    const id = normalizeIdString(windowId)
+    return id ? `id:${id}` : null
+}
+
+function toWindowKeyByNumber(windowNumber: unknown) {
+    const n = typeof windowNumber === "number" ? windowNumber : Number(windowNumber)
+    if (!Number.isFinite(n)) return null
+    return `num:${Math.floor(n)}`
+}
+
 function hasHandledDepartments(scope: { handledDepartmentIds?: string[] }) {
     return Array.isArray(scope.handledDepartmentIds) && scope.handledDepartmentIds.length > 0
 }
@@ -418,6 +429,7 @@ export const staffController = {
     /**
      * GET /staff/display/snapshot
      * - Backend-integrated snapshot for the staff display page and presentation windows.
+     * - Includes multi-window board payload grouped by the current staff manager scope.
      */
     displaySnapshot: async (req: Request, res: Response) => {
         const scope = await resolveStaffScope(req)
@@ -460,6 +472,121 @@ export const staffController = {
         const [nowServingEnriched] = nowServingDoc ? await enrichTickets([nowServingDoc]) : [null]
         const upNextEnriched = await enrichTickets(upNextDocs as any[])
 
+        // ===== Multi-window board snapshot =====
+        const handledDepartmentIdSet = new Set(scope.handledDepartmentIds.map((id) => String(id)))
+        const handledDepartmentMap = new Map<string, any>()
+        for (const dep of scope.handledDepartments || []) {
+            if (!dep?.id) continue
+            handledDepartmentMap.set(String(dep.id), dep)
+        }
+
+        const boardWindowRowsRaw = await ServiceWindowModel.find({
+            enabled: true,
+            $or: [
+                { department: { $in: scope.handledDepartmentObjectIds } },
+                { departmentIds: { $in: scope.handledDepartmentObjectIds } },
+            ],
+        })
+            .select("_id name number enabled department departmentIds")
+            .sort({ number: 1, name: 1, _id: 1 })
+            .lean()
+
+        const boardWindowMap = new Map<string, any>()
+        for (const row of boardWindowRowsRaw as any[]) {
+            const id = normalizeIdString((row as any)?._id)
+            if (!id) continue
+            boardWindowMap.set(id, row)
+        }
+
+        // Ensure the assigned window is still included even if temporarily disabled or not matched by filter.
+        if (scope.window) {
+            const assignedWindowId = normalizeIdString((scope.window as any)?._id)
+            if (assignedWindowId && !boardWindowMap.has(assignedWindowId)) {
+                boardWindowMap.set(assignedWindowId, scope.window)
+            }
+        }
+
+        const boardWindowRows = Array.from(boardWindowMap.values()).sort((a: any, b: any) => {
+            const na = typeof a?.number === "number" ? a.number : Number(a?.number ?? 0)
+            const nb = typeof b?.number === "number" ? b.number : Number(b?.number ?? 0)
+            if (na !== nb) return na - nb
+            const sa = String(a?.name ?? "")
+            const sb = String(b?.name ?? "")
+            return sa.localeCompare(sb)
+        })
+
+        const boardCalledRows = await TicketModel.find({
+            department: { $in: scope.handledDepartmentObjectIds },
+            dateKey,
+            status: "CALLED",
+        })
+            .sort({ calledAt: -1, updatedAt: -1 })
+            .select("_id queueNumber department window windowNumber calledAt")
+            .lean()
+
+        const latestCalledByWindowKey = new Map<string, any>()
+        for (const row of boardCalledRows as any[]) {
+            const keyById = toWindowKeyById((row as any)?.window)
+            const keyByNumber = toWindowKeyByNumber((row as any)?.windowNumber)
+
+            if (keyById && !latestCalledByWindowKey.has(keyById)) {
+                latestCalledByWindowKey.set(keyById, row)
+            }
+            if (keyByNumber && !latestCalledByWindowKey.has(keyByNumber)) {
+                latestCalledByWindowKey.set(keyByNumber, row)
+            }
+        }
+
+        const boardWindows = boardWindowRows.map((row: any) => {
+            const win = mapWindowPayload(row)
+            const windowId = win?.id || ""
+            const windowNumber =
+                typeof win?.number === "number" && Number.isFinite(win.number) ? Number(win.number) : 0
+
+            const windowDepartmentIds = uniqueStringIds([
+                ...(Array.isArray(win?.departmentIds) ? win!.departmentIds : []),
+                win?.department || "",
+            ]).filter((id) => handledDepartmentIdSet.has(id))
+
+            const departments = windowDepartmentIds.map((id) => {
+                const dep = handledDepartmentMap.get(id)
+                return {
+                    id,
+                    name: dep?.name ? String(dep.name) : "—",
+                    code: dep?.code ? String(dep.code) : null,
+                }
+            })
+
+            const calledKeyById = toWindowKeyById(windowId)
+            const calledKeyByNumber = toWindowKeyByNumber(windowNumber)
+
+            const called =
+                (calledKeyById ? latestCalledByWindowKey.get(calledKeyById) : null) ||
+                (calledKeyByNumber ? latestCalledByWindowKey.get(calledKeyByNumber) : null) ||
+                null
+
+            const calledDepartmentId = normalizeIdString((called as any)?.department)
+            const calledDepartment = calledDepartmentId ? handledDepartmentMap.get(calledDepartmentId) : null
+
+            return {
+                id: windowId,
+                name: win?.name || "Window",
+                number: windowNumber,
+                departmentIds: windowDepartmentIds,
+                departments,
+                nowServing: called
+                    ? {
+                        id: String((called as any)?._id || ""),
+                        queueNumber: Number((called as any)?.queueNumber || 0),
+                        departmentId: calledDepartmentId || null,
+                        departmentName: calledDepartment?.name ? String(calledDepartment.name) : null,
+                        departmentCode: calledDepartment?.code ? String(calledDepartment.code) : null,
+                        calledAt: (called as any)?.calledAt ? new Date((called as any).calledAt).toISOString() : null,
+                    }
+                    : null,
+            }
+        })
+
         return res.json({
             department: {
                 id: scope.departmentId || null,
@@ -499,6 +626,12 @@ export const staffController = {
                 departmentName: row.departmentName || null,
                 departmentCode: row.departmentCode || null,
             })),
+            board: {
+                transactionManager: scope.assignedTransactionManager || null,
+                minimumPanels: 3,
+                recommendedPanels: Math.max(3, boardWindows.length || 0),
+                windows: boardWindows,
+            },
             meta: {
                 generatedAt: new Date().toISOString(),
                 refreshMs: 5000,
