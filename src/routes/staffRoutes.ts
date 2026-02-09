@@ -1,6 +1,7 @@
 import { Router } from "express"
 import { requireAuth, requireRole } from "../controllers/middlewares"
 import { staffController } from "../controllers/staffController"
+import { smsController } from "../controllers/smsController"
 
 const router = Router()
 
@@ -24,6 +25,10 @@ router.get("/queue/current-called", staffController.currentCalledForWindow)
 router.post("/tickets/:id/served", staffController.markServed)
 router.post("/tickets/:id/hold", staffController.holdNoShow)
 router.post("/tickets/:id/return", staffController.returnFromHold)
+
+// ✅ SMS operations (Semaphore)
+router.post("/sms/send", smsController.sendSms)
+router.post("/tickets/:id/sms-called", smsController.sendTicketCalled)
 
 // ✅ Staff reports (scoped to assigned department)
 router.get("/reports/summary", staffController.reportsSummary)
