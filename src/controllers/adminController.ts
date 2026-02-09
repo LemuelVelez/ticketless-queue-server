@@ -120,6 +120,38 @@ function parseDepartmentIdArray(value: unknown, fieldName: string): { value: str
     return { value: out }
 }
 
+function uniqueStringIds(values: Array<string | null | undefined>) {
+    const seen = new Set<string>()
+    const out: string[] = []
+
+    for (const raw of values) {
+        const s = String(raw ?? "").trim()
+        if (!s) continue
+        if (seen.has(s)) continue
+        seen.add(s)
+        out.push(s)
+    }
+
+    return out
+}
+
+function extractUserDepartmentIds(user: any): string[] {
+    const arr = Array.isArray(user?.assignedDepartments)
+        ? (user.assignedDepartments as any[]).map((v) => String(v))
+        : []
+    const single = user?.assignedDepartment ? [String(user.assignedDepartment)] : []
+    return uniqueStringIds([...arr, ...single])
+}
+
+function extractWindowDepartmentIds(windowDoc: any): string[] {
+    if (!windowDoc) return []
+    const arr = Array.isArray(windowDoc.departmentIds)
+        ? (windowDoc.departmentIds as any[]).map((v) => String(v))
+        : []
+    const single = windowDoc.department ? [String(windowDoc.department)] : []
+    return uniqueStringIds([...arr, ...single])
+}
+
 /** =================
  * REPORTS HELPERS
  * ================= */
@@ -260,6 +292,58 @@ export const adminController = {
         return res.json({ department })
     },
 
+    deleteDepartment: async (req: Request, res: Response) => {
+        const { id } = req.params
+        const parsed = parseObjectId(id, "id")
+        if (parsed.error || !parsed.value) return res.status(400).json({ message: parsed.error || "Invalid id" })
+
+        const department = await DepartmentModel.findById(parsed.value)
+        if (!department) return res.status(404).json({ message: "Department not found" })
+
+        const [windowCount, staffCount, purposeRows] = await Promise.all([
+            ServiceWindowModel.countDocuments({
+                $or: [{ department: parsed.value }, { departmentIds: parsed.value }],
+            } as any),
+            UserModel.countDocuments({
+                role: "STAFF",
+                $or: [{ assignedDepartment: parsed.value }, { assignedDepartments: parsed.value }],
+            } as any),
+            listTransactionDefinitions({
+                includeDisabled: true,
+                departmentId: String(parsed.value),
+                matchDepartmentOrGlobal: true,
+            }),
+        ])
+
+        const purposeCount = (purposeRows || []).filter((p: any) =>
+            Array.isArray(p?.departmentIds) ? p.departmentIds.includes(String(parsed.value)) : false,
+        ).length
+
+        if (windowCount > 0 || staffCount > 0 || purposeCount > 0) {
+            return res.status(409).json({
+                message:
+                    "Department cannot be deleted while it is referenced by windows, staff assignments, or transaction purposes.",
+                references: {
+                    windows: windowCount,
+                    staff: staffCount,
+                    purposes: purposeCount,
+                },
+            })
+        }
+
+        await DepartmentModel.deleteOne({ _id: parsed.value })
+
+        await AuditLogModel.create({
+            ...actor(req),
+            action: "ADMIN_DELETE_DEPARTMENT",
+            entityType: "Department",
+            entityId: parsed.value as any,
+            meta: { name: department.name, code: department.code, transactionManager: department.transactionManager },
+        })
+
+        return res.json({ ok: true })
+    },
+
     /* ---------------------------------------------------------------------- */
     /* TRANSACTION PURPOSES (CRUD)                                            */
     /* ---------------------------------------------------------------------- */
@@ -297,7 +381,7 @@ export const adminController = {
         let category = cleanManager(body.category)
         if (!category && departmentIdRaw) {
             const dept = await DepartmentModel.findById(departmentIdRaw).select("_id transactionManager enabled").lean()
-            if (!dept || dept.enabled === false) {
+            if (!dept || (dept as any).enabled === false) {
                 return res.status(400).json({ message: "departmentId is invalid or disabled" })
             }
             category = cleanManager((dept as any).transactionManager)
@@ -509,27 +593,79 @@ export const adminController = {
         if (departmentId) {
             const parsed = parseObjectId(departmentId, "departmentId")
             if (parsed.error) return res.status(400).json({ message: parsed.error })
-            if (parsed.value) filter.department = parsed.value
+            if (parsed.value) {
+                filter.$or = [{ department: parsed.value }, { departmentIds: parsed.value }]
+            }
         }
 
-        const windows = await ServiceWindowModel.find(filter).sort({ department: 1, number: 1 })
+        const windows = await ServiceWindowModel.find(filter).sort({ enabled: -1, number: 1, name: 1 })
         return res.json({ windows })
     },
 
     createWindow: async (req: Request, res: Response) => {
-        const { departmentId, name, number } = req.body || {}
-        if (!departmentId || !name || number === undefined) {
-            return res.status(400).json({ message: "departmentId, name, number are required" })
+        const { departmentId, departmentIds, name, number, enabled } = req.body || {}
+
+        const nameTrimmed = String(name ?? "").trim()
+        if (!nameTrimmed) {
+            return res.status(400).json({ message: "name is required" })
+        }
+
+        const numberParsed = Number(number)
+        if (!Number.isFinite(numberParsed) || numberParsed <= 0) {
+            return res.status(400).json({ message: "number must be a positive number" })
         }
 
         const deptParsed = parseObjectId(departmentId, "departmentId")
         if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
-        if (!deptParsed.value) return res.status(400).json({ message: "departmentId is required" })
+
+        const depArrayParsed = parseDepartmentIdArray(departmentIds, "departmentIds")
+        if (depArrayParsed.error) return res.status(400).json({ message: depArrayParsed.error })
+
+        const selectedDepartmentIds = uniqueStringIds([
+            ...depArrayParsed.value,
+            deptParsed.value ? String(deptParsed.value) : "",
+        ])
+
+        if (selectedDepartmentIds.length === 0) {
+            return res.status(400).json({ message: "departmentId or departmentIds is required" })
+        }
+
+        const depDocs = await DepartmentModel.find({ _id: { $in: selectedDepartmentIds } })
+            .select("_id transactionManager enabled")
+            .lean()
+
+        const depById = new Map<string, any>()
+        for (const d of depDocs as any[]) depById.set(String(d._id), d)
+
+        if (depById.size !== selectedDepartmentIds.length) {
+            return res.status(400).json({ message: "One or more departmentIds are invalid" })
+        }
+
+        const managers = new Set<string>()
+        for (const depId of selectedDepartmentIds) {
+            const dep = depById.get(depId)
+            if (!dep) return res.status(400).json({ message: `Invalid departmentId: ${depId}` })
+            if (dep.enabled === false) return res.status(400).json({ message: `Department is disabled: ${depId}` })
+
+            const manager = cleanManager(dep.transactionManager)
+            if (!manager) return res.status(400).json({ message: `Department has no transactionManager: ${depId}` })
+            managers.add(manager)
+        }
+
+        if (managers.size > 1) {
+            return res.status(400).json({
+                message: "All departments in one window must belong to the same transaction manager",
+            })
+        }
+
+        const selectedDepartmentObjectIds = selectedDepartmentIds.map((id) => new Types.ObjectId(id))
 
         const win = await ServiceWindowModel.create({
-            department: deptParsed.value,
-            name: String(name).trim(),
-            number: Number(number),
+            department: selectedDepartmentObjectIds[0],
+            departmentIds: selectedDepartmentObjectIds,
+            name: nameTrimmed,
+            number: numberParsed,
+            enabled: enabled !== undefined ? Boolean(enabled) : true,
         })
 
         await AuditLogModel.create({
@@ -537,6 +673,12 @@ export const adminController = {
             action: "ADMIN_CREATE_WINDOW",
             entityType: "ServiceWindow",
             entityId: win._id as any,
+            meta: {
+                name: win.name,
+                number: win.number,
+                departmentIds: selectedDepartmentIds,
+                enabled: win.enabled,
+            },
         })
 
         return res.status(201).json({ window: win })
@@ -544,13 +686,89 @@ export const adminController = {
 
     updateWindow: async (req: Request, res: Response) => {
         const { id } = req.params
-        const { name, number, enabled } = req.body || {}
+        const { name, number, enabled, departmentId, departmentIds } = req.body || {}
+
+        const hasDepartmentIdPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "departmentId")
+        const hasDepartmentIdsPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "departmentIds")
 
         const win = await ServiceWindowModel.findById(id)
         if (!win) return res.status(404).json({ message: "Window not found" })
 
-        if (name !== undefined) win.name = String(name).trim()
-        if (number !== undefined) win.number = Number(number)
+        if (hasDepartmentIdPatch || hasDepartmentIdsPatch) {
+            let nextDepartmentIds = extractWindowDepartmentIds(win)
+
+            if (hasDepartmentIdsPatch) {
+                const depArrayParsed = parseDepartmentIdArray(departmentIds, "departmentIds")
+                if (depArrayParsed.error) return res.status(400).json({ message: depArrayParsed.error })
+                nextDepartmentIds = depArrayParsed.value
+            }
+
+            if (hasDepartmentIdPatch) {
+                const deptParsed = parseObjectId(departmentId, "departmentId")
+                if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
+
+                if (deptParsed.value) {
+                    if (hasDepartmentIdsPatch) {
+                        nextDepartmentIds = uniqueStringIds([...nextDepartmentIds, String(deptParsed.value)])
+                    } else {
+                        nextDepartmentIds = [String(deptParsed.value)]
+                    }
+                } else if (!hasDepartmentIdsPatch) {
+                    nextDepartmentIds = []
+                }
+            }
+
+            if (nextDepartmentIds.length === 0) {
+                return res.status(400).json({ message: "A window must have at least one department" })
+            }
+
+            const depDocs = await DepartmentModel.find({ _id: { $in: nextDepartmentIds } })
+                .select("_id transactionManager enabled")
+                .lean()
+
+            const depById = new Map<string, any>()
+            for (const d of depDocs as any[]) depById.set(String(d._id), d)
+
+            if (depById.size !== nextDepartmentIds.length) {
+                return res.status(400).json({ message: "One or more departmentIds are invalid" })
+            }
+
+            const managers = new Set<string>()
+            for (const depId of nextDepartmentIds) {
+                const dep = depById.get(depId)
+                if (!dep) return res.status(400).json({ message: `Invalid departmentId: ${depId}` })
+                if (dep.enabled === false) return res.status(400).json({ message: `Department is disabled: ${depId}` })
+
+                const manager = cleanManager(dep.transactionManager)
+                if (!manager) return res.status(400).json({ message: `Department has no transactionManager: ${depId}` })
+                managers.add(manager)
+            }
+
+            if (managers.size > 1) {
+                return res.status(400).json({
+                    message: "All departments in one window must belong to the same transaction manager",
+                })
+            }
+
+            const nextDepartmentObjectIds = nextDepartmentIds.map((d) => new Types.ObjectId(d))
+            ;(win as any).departmentIds = nextDepartmentObjectIds
+            win.department = nextDepartmentObjectIds[0]
+        }
+
+        if (name !== undefined) {
+            const nameTrimmed = String(name).trim()
+            if (!nameTrimmed) return res.status(400).json({ message: "name cannot be empty" })
+            win.name = nameTrimmed
+        }
+
+        if (number !== undefined) {
+            const numberParsed = Number(number)
+            if (!Number.isFinite(numberParsed) || numberParsed <= 0) {
+                return res.status(400).json({ message: "number must be a positive number" })
+            }
+            win.number = numberParsed
+        }
+
         if (enabled !== undefined) win.enabled = Boolean(enabled)
 
         await win.save()
@@ -560,10 +778,58 @@ export const adminController = {
             action: "ADMIN_UPDATE_WINDOW",
             entityType: "ServiceWindow",
             entityId: win._id as any,
-            meta: { name, number, enabled },
+            meta: {
+                name,
+                number,
+                enabled,
+                departmentId: hasDepartmentIdPatch ? cleanId(departmentId) : undefined,
+                departmentIds: hasDepartmentIdsPatch
+                    ? parseDepartmentIdArray(departmentIds, "departmentIds").value
+                    : undefined,
+            },
         })
 
         return res.json({ window: win })
+    },
+
+    deleteWindow: async (req: Request, res: Response) => {
+        const { id } = req.params
+        const parsed = parseObjectId(id, "id")
+        if (parsed.error || !parsed.value) return res.status(400).json({ message: parsed.error || "Invalid id" })
+
+        const win = await ServiceWindowModel.findById(parsed.value)
+        if (!win) return res.status(404).json({ message: "Window not found" })
+
+        const staffCount = await UserModel.countDocuments({
+            role: "STAFF",
+            assignedWindow: win._id,
+        } as any)
+
+        if (staffCount > 0) {
+            return res.status(409).json({
+                message: "Window cannot be deleted while staff is assigned to it.",
+                references: {
+                    staff: staffCount,
+                },
+            })
+        }
+
+        await ServiceWindowModel.deleteOne({ _id: win._id })
+
+        await AuditLogModel.create({
+            ...actor(req),
+            action: "ADMIN_DELETE_WINDOW",
+            entityType: "ServiceWindow",
+            entityId: win._id as any,
+            meta: {
+                name: win.name,
+                number: win.number,
+                department: String(win.department),
+                departmentIds: extractWindowDepartmentIds(win),
+            },
+        })
+
+        return res.json({ ok: true })
     },
 
     // ACCOUNTS (kept names listStaff/createStaff/updateStaff for frontend compatibility)
@@ -578,7 +844,23 @@ export const adminController = {
         const departmentIds = Array.from(
             new Set(
                 users
-                    .map((u: any) => (u.assignedDepartment ? String(u.assignedDepartment) : ""))
+                    .flatMap((u: any) => {
+                        const ids: string[] = []
+
+                        if (Array.isArray(u.assignedDepartments)) {
+                            for (const did of u.assignedDepartments) {
+                                const s = String(did || "").trim()
+                                if (s) ids.push(s)
+                            }
+                        }
+
+                        if (u.assignedDepartment) {
+                            const s = String(u.assignedDepartment).trim()
+                            if (s) ids.push(s)
+                        }
+
+                        return ids
+                    })
                     .filter(Boolean),
             ),
         )
@@ -596,11 +878,23 @@ export const adminController = {
         }
 
         const staff = users.map((u: any) => {
-            const assignedDepartment = u.assignedDepartment ? String(u.assignedDepartment) : null
+            const assignedDepartments = uniqueStringIds([
+                ...(Array.isArray(u.assignedDepartments) ? u.assignedDepartments.map((x: any) => String(x)) : []),
+                u.assignedDepartment ? String(u.assignedDepartment) : "",
+            ])
+
+            const assignedDepartment =
+                u.assignedDepartment ? String(u.assignedDepartment) : assignedDepartments[0] ?? null
+
             const assignedWindow = u.assignedWindow ? String(u.assignedWindow) : null
 
             const managerFromUser = cleanManager(u.assignedTransactionManager)
-            const managerFromDepartment = assignedDepartment ? deptManagerById.get(assignedDepartment) || null : null
+            const managerFromDepartment = assignedDepartment
+                ? deptManagerById.get(assignedDepartment) || null
+                : assignedDepartments.length > 0
+                    ? deptManagerById.get(assignedDepartments[0]) || null
+                    : null
+
             const assignedTransactionManager = managerFromUser || managerFromDepartment || null
 
             return {
@@ -611,6 +905,7 @@ export const adminController = {
                 role: u.role,
                 active: Boolean(u.active),
                 assignedDepartment,
+                assignedDepartments,
                 assignedWindow,
                 assignedTransactionManager,
             }
@@ -625,6 +920,7 @@ export const adminController = {
         const role: UserRole = isRole(roleRaw) ? roleRaw : "STAFF"
 
         const departmentIdRaw = (req.body || {}).departmentId
+        const departmentIdsRaw = (req.body || {}).departmentIds
         const windowIdRaw = (req.body || {}).windowId
         const transactionManagerRaw = (req.body || {}).transactionManager
 
@@ -632,51 +928,111 @@ export const adminController = {
             return res.status(400).json({ message: "name, email, password are required" })
         }
 
-        if (role === "STAFF") {
-            if (!cleanId(departmentIdRaw) || !cleanId(windowIdRaw)) {
-                return res.status(400).json({ message: "departmentId and windowId are required for STAFF" })
-            }
-        }
-
         const deptParsed = parseObjectId(departmentIdRaw, "departmentId")
         if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
+
+        const deptArrayParsed = parseDepartmentIdArray(departmentIdsRaw, "departmentIds")
+        if (deptArrayParsed.error) return res.status(400).json({ message: deptArrayParsed.error })
 
         const winParsed = parseObjectId(windowIdRaw, "windowId")
         if (winParsed.error) return res.status(400).json({ message: winParsed.error })
 
-        if (winParsed.value && !deptParsed.value) {
-            return res.status(400).json({ message: "departmentId is required when windowId is provided" })
-        }
-
-        let deptDoc: any = null
-        if (deptParsed.value) {
-            deptDoc = await DepartmentModel.findById(deptParsed.value).select("_id transactionManager enabled").lean()
-            if (!deptDoc) return res.status(400).json({ message: "departmentId is invalid" })
-            if (deptDoc.enabled === false) return res.status(400).json({ message: "departmentId is disabled" })
-        }
+        let selectedDepartmentIds = uniqueStringIds([
+            ...deptArrayParsed.value,
+            deptParsed.value ? String(deptParsed.value) : "",
+        ])
 
         let winDoc: any = null
+        let winDepartmentIds: string[] = []
         if (winParsed.value) {
-            winDoc = await ServiceWindowModel.findById(winParsed.value).select("_id department enabled").lean()
+            winDoc = await ServiceWindowModel.findById(winParsed.value)
+                .select("_id department departmentIds enabled")
+                .lean()
+
             if (!winDoc) return res.status(400).json({ message: "windowId is invalid" })
             if (winDoc.enabled === false) return res.status(400).json({ message: "windowId is disabled" })
+
+            winDepartmentIds = extractWindowDepartmentIds(winDoc)
+            if (winDepartmentIds.length === 0) {
+                return res.status(400).json({ message: "windowId has no department bindings" })
+            }
+
+            // ensure selected departments include all window departments
+            selectedDepartmentIds = uniqueStringIds([...selectedDepartmentIds, ...winDepartmentIds])
         }
 
-        if (deptParsed.value && winDoc && String(winDoc.department) !== String(deptParsed.value)) {
-            return res.status(400).json({ message: "windowId does not belong to the selected departmentId" })
+        if (role === "STAFF") {
+            if (!winParsed.value) {
+                return res.status(400).json({ message: "windowId is required for STAFF" })
+            }
+            if (selectedDepartmentIds.length === 0) {
+                return res.status(400).json({ message: "departmentId or departmentIds is required for STAFF" })
+            }
+
+            // one staff per window
+            const existingAtWindow = await UserModel.findOne({
+                role: "STAFF",
+                assignedWindow: winParsed.value,
+            })
+                .select("_id name email")
+                .lean()
+
+            if (existingAtWindow) {
+                return res.status(409).json({
+                    message: "Selected window already has an assigned staff.",
+                    assignedTo: {
+                        id: String((existingAtWindow as any)._id),
+                        name: (existingAtWindow as any).name ?? null,
+                        email: (existingAtWindow as any).email ?? null,
+                    },
+                })
+            }
+        }
+
+        let departmentManager: string | null = null
+        if (selectedDepartmentIds.length > 0) {
+            const depDocs = await DepartmentModel.find({ _id: { $in: selectedDepartmentIds } })
+                .select("_id transactionManager enabled")
+                .lean()
+
+            const depById = new Map<string, any>()
+            for (const d of depDocs as any[]) depById.set(String(d._id), d)
+
+            if (depById.size !== selectedDepartmentIds.length) {
+                return res.status(400).json({ message: "One or more departmentIds are invalid" })
+            }
+
+            const managers = new Set<string>()
+
+            for (const depId of selectedDepartmentIds) {
+                const dep = depById.get(depId)
+                if (!dep) return res.status(400).json({ message: `Invalid departmentId: ${depId}` })
+                if (dep.enabled === false) return res.status(400).json({ message: `Department is disabled: ${depId}` })
+
+                const m = cleanManager(dep.transactionManager)
+                if (!m) return res.status(400).json({ message: `Department has no transactionManager: ${depId}` })
+                managers.add(m)
+            }
+
+            if (managers.size > 1) {
+                return res.status(400).json({
+                    message: "All assigned departments must belong to the same transaction manager",
+                })
+            }
+
+            departmentManager = Array.from(managers)[0] ?? null
         }
 
         const managerFromBody = cleanManager(transactionManagerRaw)
-        const deptManager = deptDoc ? cleanManager(deptDoc.transactionManager) : null
-        const effectiveManager = managerFromBody || deptManager || null
+        const effectiveManager = managerFromBody || departmentManager || null
 
         if (role === "STAFF" && !effectiveManager) {
             return res.status(400).json({ message: "transactionManager is required for STAFF" })
         }
 
-        if (role === "STAFF" && deptManager && effectiveManager && deptManager !== effectiveManager) {
+        if (role === "STAFF" && departmentManager && effectiveManager && departmentManager !== effectiveManager) {
             return res.status(400).json({
-                message: `Selected department belongs to manager ${deptManager}, but received ${effectiveManager}`,
+                message: `Selected departments belong to manager ${departmentManager}, but received ${effectiveManager}`,
             })
         }
 
@@ -686,7 +1042,12 @@ export const adminController = {
 
         const { salt, hash, algo, iterations } = await hashPassword(String(password))
 
-        const user = await UserModel.create({
+        const primaryDepartmentId =
+            role === "STAFF"
+                ? (winDepartmentIds[0] || selectedDepartmentIds[0] || null)
+                : null
+
+        const userPayload: any = {
             name: String(name).trim(),
             email: normalizedEmail,
             role,
@@ -698,17 +1059,29 @@ export const adminController = {
             passwordIterations: iterations,
 
             assignedTransactionManager: role === "STAFF" ? effectiveManager || undefined : undefined,
-            assignedDepartment: role === "STAFF" ? deptParsed.value : undefined,
+            assignedDepartment:
+                role === "STAFF" && primaryDepartmentId ? new Types.ObjectId(primaryDepartmentId) : undefined,
+            assignedDepartments:
+                role === "STAFF" ? selectedDepartmentIds.map((id) => new Types.ObjectId(id)) : undefined,
             assignedWindow: role === "STAFF" ? winParsed.value : undefined,
-        })
+        }
+
+        const user = await UserModel.create(userPayload)
 
         await AuditLogModel.create({
             ...actor(req),
             action: "ADMIN_CREATE_USER",
             entityType: "User",
             entityId: user._id as any,
-            meta: { role, transactionManager: role === "STAFF" ? effectiveManager : undefined },
+            meta: {
+                role,
+                transactionManager: role === "STAFF" ? effectiveManager : undefined,
+                departmentIds: role === "STAFF" ? selectedDepartmentIds : undefined,
+                windowId: role === "STAFF" ? cleanId(windowIdRaw) : undefined,
+            },
         })
+
+        const responseDepartmentIds = extractUserDepartmentIds(user)
 
         return res.status(201).json({
             staff: {
@@ -722,6 +1095,7 @@ export const adminController = {
                     ? String(user.assignedTransactionManager)
                     : null,
                 assignedDepartment: user.assignedDepartment ? String(user.assignedDepartment) : null,
+                assignedDepartments: responseDepartmentIds,
                 assignedWindow: user.assignedWindow ? String(user.assignedWindow) : null,
             },
         })
@@ -734,10 +1108,14 @@ export const adminController = {
         const roleRaw = (req.body || {}).role
         const nextRole: UserRole | undefined = isRole(roleRaw) ? roleRaw : undefined
 
-        const departmentIdRaw = (req.body || {}).departmentId
-        const windowIdRaw = (req.body || {}).windowId
-
+        const hasDepartmentIdPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "departmentId")
+        const hasDepartmentIdsPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "departmentIds")
+        const hasWindowIdPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "windowId")
         const hasTransactionManagerPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "transactionManager")
+
+        const departmentIdRaw = (req.body || {}).departmentId
+        const departmentIdsRaw = (req.body || {}).departmentIds
+        const windowIdRaw = (req.body || {}).windowId
         const transactionManagerRaw = (req.body || {}).transactionManager
 
         const user = await UserModel.findById(id)
@@ -751,65 +1129,131 @@ export const adminController = {
         }
 
         if (user.role === "STAFF") {
-            if (departmentIdRaw !== undefined) {
-                const deptParsed = parseObjectId(departmentIdRaw, "departmentId")
-                if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
-                user.assignedDepartment = deptParsed.value
+            let nextDepartmentIds = extractUserDepartmentIds(user)
+
+            if (hasDepartmentIdsPatch) {
+                const depArrayParsed = parseDepartmentIdArray(departmentIdsRaw, "departmentIds")
+                if (depArrayParsed.error) return res.status(400).json({ message: depArrayParsed.error })
+                nextDepartmentIds = depArrayParsed.value
             }
 
-            if (windowIdRaw !== undefined) {
+            if (hasDepartmentIdPatch) {
+                const deptParsed = parseObjectId(departmentIdRaw, "departmentId")
+                if (deptParsed.error) return res.status(400).json({ message: deptParsed.error })
+
+                if (deptParsed.value) {
+                    if (hasDepartmentIdsPatch) {
+                        nextDepartmentIds = uniqueStringIds([...nextDepartmentIds, String(deptParsed.value)])
+                    } else {
+                        nextDepartmentIds = [String(deptParsed.value)]
+                    }
+                } else if (!hasDepartmentIdsPatch) {
+                    nextDepartmentIds = []
+                }
+            }
+
+            if (hasWindowIdPatch) {
                 const winParsed = parseObjectId(windowIdRaw, "windowId")
                 if (winParsed.error) return res.status(400).json({ message: winParsed.error })
                 user.assignedWindow = winParsed.value
             }
 
-            if (hasTransactionManagerPatch) {
-                const cleaned = cleanManager(transactionManagerRaw)
-                user.assignedTransactionManager = cleaned || undefined
-            }
-
-            let deptDoc: any = null
-            if (user.assignedDepartment) {
-                deptDoc = await DepartmentModel.findById(user.assignedDepartment).select("_id transactionManager enabled").lean()
-                if (!deptDoc) return res.status(400).json({ message: "assignedDepartment is invalid" })
-                if (deptDoc.enabled === false) return res.status(400).json({ message: "assignedDepartment is disabled" })
-            }
-
             let winDoc: any = null
+            let winDepartmentIds: string[] = []
             if (user.assignedWindow) {
-                winDoc = await ServiceWindowModel.findById(user.assignedWindow).select("_id department enabled").lean()
+                winDoc = await ServiceWindowModel.findById(user.assignedWindow)
+                    .select("_id department departmentIds enabled")
+                    .lean()
+
                 if (!winDoc) return res.status(400).json({ message: "assignedWindow is invalid" })
                 if (winDoc.enabled === false) return res.status(400).json({ message: "assignedWindow is disabled" })
-            }
 
-            if (user.assignedWindow && !user.assignedDepartment) {
-                return res.status(400).json({ message: "assignedDepartment is required when assignedWindow is set" })
-            }
+                winDepartmentIds = extractWindowDepartmentIds(winDoc)
+                if (winDepartmentIds.length === 0) {
+                    return res.status(400).json({ message: "assignedWindow has no department bindings" })
+                }
 
-            if (user.assignedWindow && user.assignedDepartment && winDoc) {
-                if (String(winDoc.department) !== String(user.assignedDepartment)) {
-                    return res.status(400).json({ message: "assignedWindow does not belong to assignedDepartment" })
+                // enforce one-window + multi-department rule:
+                // if a window is assigned, all of its departments must be included.
+                nextDepartmentIds = uniqueStringIds([...nextDepartmentIds, ...winDepartmentIds])
+
+                // enforce one staff per window
+                const existingAtWindow = await UserModel.findOne({
+                    role: "STAFF",
+                    assignedWindow: user.assignedWindow,
+                    _id: { $ne: user._id },
+                })
+                    .select("_id name email")
+                    .lean()
+
+                if (existingAtWindow) {
+                    return res.status(409).json({
+                        message: "Selected window already has an assigned staff.",
+                        assignedTo: {
+                            id: String((existingAtWindow as any)._id),
+                            name: (existingAtWindow as any).name ?? null,
+                            email: (existingAtWindow as any).email ?? null,
+                        },
+                    })
                 }
             }
 
-            const deptManager = deptDoc ? cleanManager(deptDoc.transactionManager) : null
+            if (nextDepartmentIds.length === 0) {
+                return res.status(400).json({ message: "At least one assigned department is required for STAFF" })
+            }
+
+            const depDocs = await DepartmentModel.find({ _id: { $in: nextDepartmentIds } })
+                .select("_id transactionManager enabled")
+                .lean()
+
+            const depById = new Map<string, any>()
+            for (const d of depDocs as any[]) depById.set(String(d._id), d)
+
+            if (depById.size !== nextDepartmentIds.length) {
+                return res.status(400).json({ message: "One or more assigned departments are invalid" })
+            }
+
+            const managers = new Set<string>()
+            for (const depId of nextDepartmentIds) {
+                const dep = depById.get(depId)
+                if (!dep) return res.status(400).json({ message: `Invalid assignedDepartment: ${depId}` })
+                if (dep.enabled === false) return res.status(400).json({ message: `Department is disabled: ${depId}` })
+
+                const m = cleanManager(dep.transactionManager)
+                if (!m) return res.status(400).json({ message: `Department has no transactionManager: ${depId}` })
+                managers.add(m)
+            }
+
+            if (managers.size > 1) {
+                return res.status(400).json({
+                    message: "All assigned departments must belong to the same transaction manager",
+                })
+            }
+
+            const departmentsManager = Array.from(managers)[0] ?? null
             const currentManager = cleanManager(user.assignedTransactionManager)
-            const effectiveManager = currentManager || deptManager || null
+            const patchedManager = hasTransactionManagerPatch ? cleanManager(transactionManagerRaw) : null
+            const effectiveManager = patchedManager || currentManager || departmentsManager || null
 
             if (!effectiveManager) {
                 return res.status(400).json({ message: "transactionManager is required for STAFF" })
             }
 
-            if (deptManager && deptManager !== effectiveManager) {
+            if (departmentsManager && departmentsManager !== effectiveManager) {
                 return res.status(400).json({
-                    message: `Selected department belongs to manager ${deptManager}, but received ${effectiveManager}`,
+                    message: `Selected departments belong to manager ${departmentsManager}, but received ${effectiveManager}`,
                 })
             }
 
+            ;(user as any).assignedDepartments = nextDepartmentIds.map((did) => new Types.ObjectId(did))
+
+            const primaryDepartmentId = winDepartmentIds[0] || nextDepartmentIds[0]
+            user.assignedDepartment = primaryDepartmentId ? new Types.ObjectId(primaryDepartmentId) : undefined
             user.assignedTransactionManager = effectiveManager
         } else {
             user.assignedTransactionManager = undefined
             user.assignedDepartment = undefined
+            ;(user as any).assignedDepartments = undefined
             user.assignedWindow = undefined
         }
 
@@ -835,11 +1279,16 @@ export const adminController = {
                 transactionManager: hasTransactionManagerPatch
                     ? cleanManager(transactionManagerRaw) ?? null
                     : undefined,
-                departmentId: departmentIdRaw !== undefined ? cleanId(departmentIdRaw) : undefined,
-                windowId: windowIdRaw !== undefined ? cleanId(windowIdRaw) : undefined,
+                departmentId: hasDepartmentIdPatch ? cleanId(departmentIdRaw) : undefined,
+                departmentIds: hasDepartmentIdsPatch
+                    ? (parseDepartmentIdArray(departmentIdsRaw, "departmentIds").value ?? [])
+                    : undefined,
+                windowId: hasWindowIdPatch ? cleanId(windowIdRaw) : undefined,
                 passwordChanged: Boolean(password),
             },
         })
+
+        const responseDepartmentIds = extractUserDepartmentIds(user)
 
         return res.json({
             staff: {
@@ -853,6 +1302,7 @@ export const adminController = {
                     ? String(user.assignedTransactionManager)
                     : null,
                 assignedDepartment: user.assignedDepartment ? String(user.assignedDepartment) : null,
+                assignedDepartments: responseDepartmentIds,
                 assignedWindow: user.assignedWindow ? String(user.assignedWindow) : null,
             },
         })
