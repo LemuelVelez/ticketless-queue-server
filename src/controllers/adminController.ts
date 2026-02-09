@@ -152,6 +152,88 @@ function extractWindowDepartmentIds(windowDoc: any): string[] {
     return uniqueStringIds([...arr, ...single])
 }
 
+type DepartmentAssignmentConflict = {
+    departmentId: string
+    departmentName?: string
+    assignedTo: {
+        id: string
+        name: string | null
+        email: string | null
+    }
+}
+
+async function findDepartmentAssignmentConflicts(params: {
+    departmentIds: string[]
+    excludeUserId?: string | Types.ObjectId | null
+}): Promise<DepartmentAssignmentConflict[]> {
+    const requestedIds = uniqueStringIds(params.departmentIds || [])
+    if (requestedIds.length === 0) return []
+
+    const requestedObjectIds = requestedIds.map((id) => new Types.ObjectId(id))
+
+    const filter: any = {
+        role: "STAFF",
+        $or: [{ assignedDepartment: { $in: requestedObjectIds } }, { assignedDepartments: { $in: requestedObjectIds } }],
+    }
+
+    if (params.excludeUserId) {
+        const raw = String(params.excludeUserId).trim()
+        if (raw && Types.ObjectId.isValid(raw)) {
+            filter._id = { $ne: new Types.ObjectId(raw) }
+        } else if (raw) {
+            filter._id = { $ne: params.excludeUserId as any }
+        }
+    }
+
+    const rows = await UserModel.find(filter)
+        .select("_id name email assignedDepartment assignedDepartments")
+        .lean()
+
+    if (!rows.length) return []
+
+    const requestedSet = new Set(requestedIds)
+    const takenByDepartment = new Map<
+        string,
+        {
+            id: string
+            name: string | null
+            email: string | null
+        }
+    >()
+
+    for (const row of rows as any[]) {
+        const assignedIds = extractUserDepartmentIds(row)
+        for (const depId of assignedIds) {
+            if (!requestedSet.has(depId) || takenByDepartment.has(depId)) continue
+            takenByDepartment.set(depId, {
+                id: String(row._id),
+                name: row.name ? String(row.name) : null,
+                email: row.email ? String(row.email) : null,
+            })
+        }
+    }
+
+    if (takenByDepartment.size === 0) return []
+
+    const conflictDepartmentIds = Array.from(takenByDepartment.keys())
+    const depDocs = await DepartmentModel.find({ _id: { $in: conflictDepartmentIds } })
+        .select("_id name")
+        .lean()
+
+    const departmentNameById = new Map<string, string>()
+    for (const d of depDocs as any[]) {
+        departmentNameById.set(String(d._id), String(d.name ?? ""))
+    }
+
+    return requestedIds
+        .filter((depId) => takenByDepartment.has(depId))
+        .map((depId) => ({
+            departmentId: depId,
+            departmentName: departmentNameById.get(depId) || undefined,
+            assignedTo: takenByDepartment.get(depId)!,
+        }))
+}
+
 /** =================
  * REPORTS HELPERS
  * ================= */
@@ -1036,6 +1118,19 @@ export const adminController = {
             })
         }
 
+        if (role === "STAFF") {
+            const conflicts = await findDepartmentAssignmentConflicts({
+                departmentIds: selectedDepartmentIds,
+            })
+
+            if (conflicts.length > 0) {
+                return res.status(409).json({
+                    message: "One or more selected departments are already assigned to another staff.",
+                    conflicts,
+                })
+            }
+        }
+
         const normalizedEmail = normalizeEmail(email)
         const existing = await UserModel.findOne({ email: normalizedEmail })
         if (existing) return res.status(409).json({ message: "Email already exists" })
@@ -1242,6 +1337,18 @@ export const adminController = {
             if (departmentsManager && departmentsManager !== effectiveManager) {
                 return res.status(400).json({
                     message: `Selected departments belong to manager ${departmentsManager}, but received ${effectiveManager}`,
+                })
+            }
+
+            const conflicts = await findDepartmentAssignmentConflicts({
+                departmentIds: nextDepartmentIds,
+                excludeUserId: user._id,
+            })
+
+            if (conflicts.length > 0) {
+                return res.status(409).json({
+                    message: "One or more selected departments are already assigned to another staff.",
+                    conflicts,
                 })
             }
 

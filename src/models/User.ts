@@ -19,6 +19,7 @@ export type UserDoc = {
     // Staff assignment
     assignedTransactionManager?: string
     assignedDepartment?: Types.ObjectId
+    assignedDepartments?: Types.ObjectId[]
     assignedWindow?: Types.ObjectId
 
     // Participant registration fields (used by register page)
@@ -55,6 +56,20 @@ function isStaffRole(role?: string) {
     return role === "ADMIN" || role === "STAFF"
 }
 
+function normalizeObjectIdList(values: Array<Types.ObjectId | string | null | undefined>) {
+    const seen = new Set<string>()
+    const out: Types.ObjectId[] = []
+
+    for (const raw of values) {
+        const s = String(raw ?? "").trim()
+        if (!s || !Types.ObjectId.isValid(s) || seen.has(s)) continue
+        seen.add(s)
+        out.push(new Types.ObjectId(s))
+    }
+
+    return out
+}
+
 const UserSchema = new Schema<UserDoc>(
     {
         name: { type: String, required: true, trim: true },
@@ -86,6 +101,12 @@ const UserSchema = new Schema<UserDoc>(
         },
 
         assignedDepartment: { type: Schema.Types.ObjectId, ref: "Department" },
+
+        assignedDepartments: {
+            type: [{ type: Schema.Types.ObjectId, ref: "Department" }],
+            default: undefined,
+        },
+
         assignedWindow: { type: Schema.Types.ObjectId, ref: "ServiceWindow" },
 
         // Participant fields used by register/login flow
@@ -138,6 +159,11 @@ UserSchema.index({ email: 1 }, { unique: true, sparse: true })
 UserSchema.index({ tcNumber: 1 }, { unique: true, sparse: true })
 UserSchema.index({ studentId: 1 }, { unique: true, sparse: true })
 
+// Query/perf indexes for staff assignment lookups
+UserSchema.index({ role: 1, assignedDepartment: 1 })
+UserSchema.index({ role: 1, assignedDepartments: 1 })
+UserSchema.index({ role: 1, assignedWindow: 1 })
+
 // Keep compatibility aliases synchronized
 UserSchema.pre("validate", function (next) {
     const doc = this as UserDoc
@@ -166,6 +192,27 @@ UserSchema.pre("validate", function (next) {
             .filter(Boolean)
             .join(" ")
         doc.name = composed
+    }
+
+    // STAFF: keep single + multi department assignments in sync.
+    if (doc.role === "STAFF") {
+        const primary = doc.assignedDepartment ? String(doc.assignedDepartment) : ""
+        const arr = Array.isArray(doc.assignedDepartments) ? doc.assignedDepartments : []
+        const merged = normalizeObjectIdList([primary, ...arr.map((v) => String(v))])
+
+        if (merged.length > 0) {
+            doc.assignedDepartments = merged
+            doc.assignedDepartment = merged[0]
+        } else {
+            doc.assignedDepartments = undefined
+            doc.assignedDepartment = undefined
+        }
+    } else {
+        // Non-STAFF users should not carry staff assignment fields.
+        doc.assignedTransactionManager = undefined
+        doc.assignedDepartment = undefined
+        doc.assignedDepartments = undefined
+        doc.assignedWindow = undefined
     }
 
     next()
