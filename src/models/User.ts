@@ -17,6 +17,7 @@ export type UserDoc = {
     passwordIterations: number
 
     // Staff assignment
+    assignedTransactionManager?: string
     assignedDepartment?: Types.ObjectId
     assignedWindow?: Types.ObjectId
 
@@ -76,6 +77,13 @@ const UserSchema = new Schema<UserDoc>(
         passwordHash: { type: String, required: true },
         passwordAlgo: { type: String, default: "pbkdf2-sha256" },
         passwordIterations: { type: Number, default: 150000 },
+
+        assignedTransactionManager: {
+            type: String,
+            trim: true,
+            uppercase: true,
+            index: true,
+        },
 
         assignedDepartment: { type: Schema.Types.ObjectId, ref: "Department" },
         assignedWindow: { type: Schema.Types.ObjectId, ref: "ServiceWindow" },

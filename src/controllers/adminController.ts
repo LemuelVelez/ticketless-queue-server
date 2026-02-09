@@ -34,6 +34,13 @@ function normalizeManagerKey(value: unknown, fallback = "REGISTRAR") {
     return v || fallback
 }
 
+function cleanManager(value: unknown): string | null {
+    if (value === undefined || value === null) return null
+    const s = String(value).trim()
+    if (!s || s === "null" || s === "undefined") return null
+    return normalizeManagerKey(s, "")
+}
+
 function normalizeScopes(input: unknown): string[] | undefined {
     if (input === undefined) return undefined
     if (!Array.isArray(input)) return []
@@ -463,9 +470,56 @@ export const adminController = {
 
     // ACCOUNTS (kept names listStaff/createStaff/updateStaff for frontend compatibility)
     listStaff: async (_req: Request, res: Response) => {
-        const staff = await UserModel.find({})
+        const users = await UserModel.find({
+            role: { $in: ["ADMIN", "STAFF"] as UserRole[] },
+        })
             .select("-passwordHash -passwordSalt -passwordIterations -passwordAlgo")
             .sort({ createdAt: -1 })
+            .lean()
+
+        const departmentIds = Array.from(
+            new Set(
+                users
+                    .map((u: any) => (u.assignedDepartment ? String(u.assignedDepartment) : ""))
+                    .filter(Boolean),
+            ),
+        )
+
+        const deptManagerById = new Map<string, string>()
+        if (departmentIds.length > 0) {
+            const depts = await DepartmentModel.find({ _id: { $in: departmentIds } })
+                .select("_id transactionManager")
+                .lean()
+
+            for (const d of depts as any[]) {
+                deptManagerById.set(String(d._id), normalizeManagerKey(d.transactionManager, "REGISTRAR"))
+            }
+        }
+
+        const staff = users.map((u: any) => {
+            const assignedDepartment = u.assignedDepartment ? String(u.assignedDepartment) : null
+            const assignedWindow = u.assignedWindow ? String(u.assignedWindow) : null
+
+            const managerFromUser = cleanManager(u.assignedTransactionManager)
+            const managerFromDepartment = assignedDepartment ? deptManagerById.get(assignedDepartment) || null : null
+            const assignedTransactionManager = managerFromUser
+                ? normalizeManagerKey(managerFromUser, "REGISTRAR")
+                : managerFromDepartment
+                    ? normalizeManagerKey(managerFromDepartment, "REGISTRAR")
+                    : null
+
+            return {
+                id: String(u._id),
+                _id: String(u._id),
+                name: u.name,
+                email: u.email,
+                role: u.role,
+                active: Boolean(u.active),
+                assignedDepartment,
+                assignedWindow,
+                assignedTransactionManager,
+            }
+        })
 
         return res.json({ staff })
     },
@@ -477,6 +531,7 @@ export const adminController = {
 
         const departmentIdRaw = (req.body || {}).departmentId
         const windowIdRaw = (req.body || {}).windowId
+        const transactionManagerRaw = (req.body || {}).transactionManager
 
         if (!name || !email || !password) {
             return res.status(400).json({ message: "name, email, password are required" })
@@ -498,6 +553,34 @@ export const adminController = {
             return res.status(400).json({ message: "departmentId is required when windowId is provided" })
         }
 
+        let deptDoc: any = null
+        if (deptParsed.value) {
+            deptDoc = await DepartmentModel.findById(deptParsed.value).select("_id transactionManager enabled").lean()
+            if (!deptDoc) return res.status(400).json({ message: "departmentId is invalid" })
+            if (deptDoc.enabled === false) return res.status(400).json({ message: "departmentId is disabled" })
+        }
+
+        let winDoc: any = null
+        if (winParsed.value) {
+            winDoc = await ServiceWindowModel.findById(winParsed.value).select("_id department enabled").lean()
+            if (!winDoc) return res.status(400).json({ message: "windowId is invalid" })
+            if (winDoc.enabled === false) return res.status(400).json({ message: "windowId is disabled" })
+        }
+
+        if (deptParsed.value && winDoc && String(winDoc.department) !== String(deptParsed.value)) {
+            return res.status(400).json({ message: "windowId does not belong to the selected departmentId" })
+        }
+
+        const managerFromBody = cleanManager(transactionManagerRaw)
+        const deptManager = deptDoc ? normalizeManagerKey(deptDoc.transactionManager, "REGISTRAR") : undefined
+        const effectiveManager = normalizeManagerKey(managerFromBody || deptManager || "REGISTRAR", "REGISTRAR")
+
+        if (role === "STAFF" && deptManager && deptManager !== effectiveManager) {
+            return res.status(400).json({
+                message: `Selected department belongs to manager ${deptManager}, but received ${effectiveManager}`,
+            })
+        }
+
         const normalizedEmail = normalizeEmail(email)
         const existing = await UserModel.findOne({ email: normalizedEmail })
         if (existing) return res.status(409).json({ message: "Email already exists" })
@@ -515,6 +598,7 @@ export const adminController = {
             passwordAlgo: algo,
             passwordIterations: iterations,
 
+            assignedTransactionManager: role === "STAFF" ? effectiveManager : undefined,
             assignedDepartment: role === "STAFF" ? deptParsed.value : undefined,
             assignedWindow: role === "STAFF" ? winParsed.value : undefined,
         })
@@ -524,16 +608,20 @@ export const adminController = {
             action: "ADMIN_CREATE_USER",
             entityType: "User",
             entityId: user._id as any,
-            meta: { role },
+            meta: { role, transactionManager: role === "STAFF" ? effectiveManager : undefined },
         })
 
         return res.status(201).json({
             staff: {
                 id: String(user._id),
+                _id: String(user._id),
                 name: user.name,
                 email: user.email,
                 role: user.role,
                 active: user.active,
+                assignedTransactionManager: user.assignedTransactionManager
+                    ? String(user.assignedTransactionManager)
+                    : null,
                 assignedDepartment: user.assignedDepartment ? String(user.assignedDepartment) : null,
                 assignedWindow: user.assignedWindow ? String(user.assignedWindow) : null,
             },
@@ -550,6 +638,9 @@ export const adminController = {
         const departmentIdRaw = (req.body || {}).departmentId
         const windowIdRaw = (req.body || {}).windowId
 
+        const hasTransactionManagerPatch = Object.prototype.hasOwnProperty.call(req.body || {}, "transactionManager")
+        const transactionManagerRaw = (req.body || {}).transactionManager
+
         const user = await UserModel.findById(id)
         if (!user) return res.status(404).json({ message: "User not found" })
 
@@ -558,10 +649,6 @@ export const adminController = {
 
         if (nextRole) {
             user.role = nextRole
-            if (nextRole === "ADMIN") {
-                user.assignedDepartment = undefined
-                user.assignedWindow = undefined
-            }
         }
 
         if (user.role === "STAFF") {
@@ -577,10 +664,50 @@ export const adminController = {
                 user.assignedWindow = winParsed.value
             }
 
+            if (hasTransactionManagerPatch) {
+                const cleaned = cleanManager(transactionManagerRaw)
+                user.assignedTransactionManager = cleaned ? normalizeManagerKey(cleaned, "REGISTRAR") : undefined
+            }
+
+            let deptDoc: any = null
+            if (user.assignedDepartment) {
+                deptDoc = await DepartmentModel.findById(user.assignedDepartment).select("_id transactionManager enabled").lean()
+                if (!deptDoc) return res.status(400).json({ message: "assignedDepartment is invalid" })
+                if (deptDoc.enabled === false) return res.status(400).json({ message: "assignedDepartment is disabled" })
+            }
+
+            let winDoc: any = null
+            if (user.assignedWindow) {
+                winDoc = await ServiceWindowModel.findById(user.assignedWindow).select("_id department enabled").lean()
+                if (!winDoc) return res.status(400).json({ message: "assignedWindow is invalid" })
+                if (winDoc.enabled === false) return res.status(400).json({ message: "assignedWindow is disabled" })
+            }
+
             if (user.assignedWindow && !user.assignedDepartment) {
                 return res.status(400).json({ message: "assignedDepartment is required when assignedWindow is set" })
             }
+
+            if (user.assignedWindow && user.assignedDepartment && winDoc) {
+                if (String(winDoc.department) !== String(user.assignedDepartment)) {
+                    return res.status(400).json({ message: "assignedWindow does not belong to assignedDepartment" })
+                }
+            }
+
+            const deptManager = deptDoc ? normalizeManagerKey(deptDoc.transactionManager, "REGISTRAR") : undefined
+            const effectiveManager = normalizeManagerKey(
+                user.assignedTransactionManager || deptManager || "REGISTRAR",
+                "REGISTRAR",
+            )
+
+            if (deptManager && deptManager !== effectiveManager) {
+                return res.status(400).json({
+                    message: `Selected department belongs to manager ${deptManager}, but received ${effectiveManager}`,
+                })
+            }
+
+            user.assignedTransactionManager = effectiveManager
         } else {
+            user.assignedTransactionManager = undefined
             user.assignedDepartment = undefined
             user.assignedWindow = undefined
         }
@@ -604,6 +731,9 @@ export const adminController = {
                 name,
                 active,
                 role: nextRole,
+                transactionManager: hasTransactionManagerPatch
+                    ? cleanManager(transactionManagerRaw) ?? null
+                    : undefined,
                 departmentId: departmentIdRaw !== undefined ? cleanId(departmentIdRaw) : undefined,
                 windowId: windowIdRaw !== undefined ? cleanId(windowIdRaw) : undefined,
                 passwordChanged: Boolean(password),
@@ -613,10 +743,14 @@ export const adminController = {
         return res.json({
             staff: {
                 id: String(user._id),
+                _id: String(user._id),
                 name: user.name,
                 email: user.email,
                 role: user.role,
                 active: user.active,
+                assignedTransactionManager: user.assignedTransactionManager
+                    ? String(user.assignedTransactionManager)
+                    : null,
                 assignedDepartment: user.assignedDepartment ? String(user.assignedDepartment) : null,
                 assignedWindow: user.assignedWindow ? String(user.assignedWindow) : null,
             },
