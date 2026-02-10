@@ -19,7 +19,10 @@ import {
     presentDirectlyToDisplayMonitor,
     TicketTransactionSelectionModel,
 } from "../services/queue.service"
-import { getTransactionsForParticipant } from "../services/registrarTransactions.service"
+import {
+    getTransactionsForParticipant,
+    getTransactionsForParticipantInDepartment,
+} from "../services/registrarTransactions.service"
 
 const ACTIVE_STATUSES = ["WAITING", "CALLED", "HOLD"] as const
 
@@ -240,12 +243,36 @@ export const publicController = {
         const state = await verifyParticipantSession(sessionToken)
         if (!state) return res.status(401).json({ message: "Invalid or expired session" })
 
+        const requestedDepartmentId = asString(
+            (req.query || {}).departmentId || (req.body || {}).departmentId
+        )
+
+        const participantDepartmentId =
+            asString(state.profile?.departmentId) ||
+            asString((state.participant as any)?.department?.toString?.() ?? (state.participant as any)?.department)
+
+        const effectiveDepartmentId = requestedDepartmentId || participantDepartmentId
+
+        let availableTransactions = getTransactionsForParticipant(state.participant.type)
+
+        if (effectiveDepartmentId) {
+            try {
+                availableTransactions = await getTransactionsForParticipantInDepartment(
+                    state.participant.type,
+                    effectiveDepartmentId
+                )
+            } catch {
+                // Fallback for invalid/missing department mappings.
+                availableTransactions = getTransactionsForParticipant(state.participant.type)
+            }
+        }
+
         return res.json({
             session: {
                 expiresAt: state.session.expiresAt,
             },
             participant: state.profile,
-            availableTransactions: getTransactionsForParticipant(state.participant.type),
+            availableTransactions,
         })
     },
 

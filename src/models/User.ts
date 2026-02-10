@@ -66,6 +66,7 @@ const UserSchema = new Schema<UserDoc>(
             lowercase: true,
             trim: true,
             sparse: true,
+            unique: true,
             required: function (this: UserDoc) {
                 return isStaffRole(this.role)
             },
@@ -99,11 +100,12 @@ const UserSchema = new Schema<UserDoc>(
             type: String,
             trim: true,
             sparse: true,
+            unique: true,
             required: function (this: UserDoc) {
                 return this.role === "STUDENT" || this.type === "STUDENT"
             },
         },
-        studentId: { type: String, trim: true, sparse: true }, // alias of tcNumber
+        studentId: { type: String, trim: true, sparse: true, unique: true }, // alias of tcNumber
 
         mobileNumber: {
             type: String,
@@ -133,11 +135,6 @@ const UserSchema = new Schema<UserDoc>(
     },
     { timestamps: true }
 )
-
-// Unique identifiers where applicable
-UserSchema.index({ email: 1 }, { unique: true, sparse: true })
-UserSchema.index({ tcNumber: 1 }, { unique: true, sparse: true })
-UserSchema.index({ studentId: 1 }, { unique: true, sparse: true })
 
 // Keep compatibility aliases synchronized
 UserSchema.pre("validate", function (next) {

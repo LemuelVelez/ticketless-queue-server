@@ -41,8 +41,8 @@ const ParticipantSchema = new Schema<ParticipantDoc>(
         middleName: { type: String, trim: true },
         lastName: { type: String, required: true, trim: true },
 
-        tcNumber: { type: String, trim: true, uppercase: true, sparse: true },
-        mobileNumber: { type: String, required: true, trim: true },
+        tcNumber: { type: String, trim: true, uppercase: true, sparse: true, unique: true },
+        mobileNumber: { type: String, required: true, trim: true, unique: true },
 
         department: { type: Schema.Types.ObjectId, ref: "Department", required: true, index: true },
         active: { type: Boolean, default: true },
@@ -54,9 +54,6 @@ const ParticipantSchema = new Schema<ParticipantDoc>(
     },
     { timestamps: true }
 )
-
-ParticipantSchema.index({ tcNumber: 1 }, { unique: true, sparse: true })
-ParticipantSchema.index({ mobileNumber: 1 }, { unique: true })
 
 const ParticipantSessionSchema = new Schema<ParticipantSessionDoc>(
     {
@@ -110,6 +107,38 @@ export type AlumniVisitorSignupInput = {
     department: string // code/name/objectId
     mobileNumber: string
     pin: string
+}
+
+type MongoDuplicateKeyError = {
+    code?: number
+    keyPattern?: Record<string, unknown>
+    keyValue?: Record<string, unknown>
+    message?: string
+}
+
+function isDuplicateKeyError(err: unknown): err is MongoDuplicateKeyError {
+    return Boolean(
+        err &&
+        typeof err === "object" &&
+        "code" in err &&
+        Number((err as MongoDuplicateKeyError).code) === 11000
+    )
+}
+
+function duplicateKeyField(err: MongoDuplicateKeyError): "tcNumber" | "mobileNumber" | null {
+    const keyPattern = err.keyPattern ?? {}
+    if ("tcNumber" in keyPattern) return "tcNumber"
+    if ("mobileNumber" in keyPattern) return "mobileNumber"
+
+    const message = String(err.message ?? "")
+    if (message.includes("tcNumber")) return "tcNumber"
+    if (message.includes("mobileNumber")) return "mobileNumber"
+
+    return null
+}
+
+function normalizeNamePart(value: string | undefined) {
+    return String(value ?? "").trim().replace(/\s+/g, " ")
 }
 
 function escapeRegExp(input: string) {
@@ -207,79 +236,175 @@ async function createParticipantSession(participantId: Types.ObjectId) {
 }
 
 export async function signupStudent(input: StudentSignupInput) {
+    const firstName = normalizeNamePart(input.firstName)
+    const middleName = normalizeNamePart(input.middleName) || undefined
+    const lastName = normalizeNamePart(input.lastName)
+
     const tcNumber = normalizeTCNumber(input.tcNumber)
     const mobileNumber = normalizeMobileNumber(input.mobileNumber)
 
-    assertPin(input.pin)
-    assertMobile(mobileNumber)
-
-    const departmentId = await resolveDepartmentId(input.department)
-
-    const existing = await ParticipantModel.findOne({
-        $or: [{ tcNumber }, { mobileNumber }],
-    })
-
-    if (existing) {
-        throw new Error("Student account already exists.")
-    }
-
-    const pinSalt = randomBytes(16).toString("hex")
-    const pinHash = hashPin(input.pin, pinSalt, PIN_ITERATIONS)
-
-    const participant = await ParticipantModel.create({
-        type: "STUDENT",
-        firstName: input.firstName,
-        middleName: input.middleName,
-        lastName: input.lastName,
-        tcNumber,
-        mobileNumber,
-        department: departmentId,
-        pinSalt,
-        pinHash,
-        pinAlgo: "pbkdf2-sha256",
-        pinIterations: PIN_ITERATIONS,
-        active: true,
-    })
-
-    return {
-        participant: toPublicProfile(participant),
-        login: "Use TC Number + 4-digit PIN",
-    }
-}
-
-export async function signupAlumniVisitor(input: AlumniVisitorSignupInput) {
-    const mobileNumber = normalizeMobileNumber(input.mobileNumber)
+    if (!firstName) throw new Error("First name is required.")
+    if (!lastName) throw new Error("Last name is required.")
+    if (!tcNumber) throw new Error("TC Number is required.")
 
     assertPin(input.pin)
     assertMobile(mobileNumber)
 
     const departmentId = await resolveDepartmentId(input.department)
 
-    const existing = await ParticipantModel.findOne({ mobileNumber })
-    if (existing) {
+    const [existingByTc, existingByMobile] = await Promise.all([
+        ParticipantModel.findOne({ tcNumber }),
+        ParticipantModel.findOne({ mobileNumber }),
+    ])
+
+    if (existingByTc?.active) {
+        throw new Error("TC Number is already registered.")
+    }
+
+    if (existingByMobile?.active) {
+        throw new Error("Mobile number is already registered.")
+    }
+
+    // If both exist but point to different inactive records, avoid ambiguous merge.
+    if (
+        existingByTc &&
+        existingByMobile &&
+        existingByTc._id.toString() !== existingByMobile._id.toString()
+    ) {
         throw new Error("Mobile number is already registered.")
     }
 
     const pinSalt = randomBytes(16).toString("hex")
     const pinHash = hashPin(input.pin, pinSalt, PIN_ITERATIONS)
 
-    const participant = await ParticipantModel.create({
-        type: "ALUMNI_VISITOR",
-        firstName: input.firstName,
-        middleName: input.middleName,
-        lastName: input.lastName,
-        mobileNumber,
-        department: departmentId,
-        pinSalt,
-        pinHash,
-        pinAlgo: "pbkdf2-sha256",
-        pinIterations: PIN_ITERATIONS,
-        active: true,
-    })
+    // Reuse inactive account if present (prevents false "already exists" while preserving unique indexes).
+    const reusable = existingByTc ?? existingByMobile
+    if (reusable) {
+        reusable.type = "STUDENT"
+        reusable.firstName = firstName
+        reusable.middleName = middleName
+        reusable.lastName = lastName
+        reusable.tcNumber = tcNumber
+        reusable.mobileNumber = mobileNumber
+        reusable.department = departmentId
+        reusable.pinSalt = pinSalt
+        reusable.pinHash = pinHash
+        reusable.pinAlgo = "pbkdf2-sha256"
+        reusable.pinIterations = PIN_ITERATIONS
+        reusable.active = true
 
-    return {
-        participant: toPublicProfile(participant),
-        login: "Use Mobile Number + 4-digit PIN",
+        await reusable.save()
+
+        return {
+            participant: toPublicProfile(reusable),
+            login: "Use TC Number + 4-digit PIN",
+        }
+    }
+
+    try {
+        const participant = await ParticipantModel.create({
+            type: "STUDENT",
+            firstName,
+            middleName,
+            lastName,
+            tcNumber,
+            mobileNumber,
+            department: departmentId,
+            pinSalt,
+            pinHash,
+            pinAlgo: "pbkdf2-sha256",
+            pinIterations: PIN_ITERATIONS,
+            active: true,
+        })
+
+        return {
+            participant: toPublicProfile(participant),
+            login: "Use TC Number + 4-digit PIN",
+        }
+    } catch (err) {
+        if (isDuplicateKeyError(err)) {
+            const field = duplicateKeyField(err)
+            if (field === "tcNumber") throw new Error("TC Number is already registered.")
+            if (field === "mobileNumber") throw new Error("Mobile number is already registered.")
+            throw new Error("Student account already exists.")
+        }
+        throw err
+    }
+}
+
+export async function signupAlumniVisitor(input: AlumniVisitorSignupInput) {
+    const firstName = normalizeNamePart(input.firstName)
+    const middleName = normalizeNamePart(input.middleName) || undefined
+    const lastName = normalizeNamePart(input.lastName)
+
+    const mobileNumber = normalizeMobileNumber(input.mobileNumber)
+
+    if (!firstName) throw new Error("First name is required.")
+    if (!lastName) throw new Error("Last name is required.")
+
+    assertPin(input.pin)
+    assertMobile(mobileNumber)
+
+    const departmentId = await resolveDepartmentId(input.department)
+
+    const existingByMobile = await ParticipantModel.findOne({ mobileNumber })
+
+    if (existingByMobile?.active) {
+        throw new Error("Mobile number is already registered.")
+    }
+
+    const pinSalt = randomBytes(16).toString("hex")
+    const pinHash = hashPin(input.pin, pinSalt, PIN_ITERATIONS)
+
+    // Reuse inactive account if present (prevents false positive duplicate checks).
+    if (existingByMobile) {
+        existingByMobile.type = "ALUMNI_VISITOR"
+        existingByMobile.firstName = firstName
+        existingByMobile.middleName = middleName
+        existingByMobile.lastName = lastName
+        existingByMobile.tcNumber = undefined
+        existingByMobile.mobileNumber = mobileNumber
+        existingByMobile.department = departmentId
+        existingByMobile.pinSalt = pinSalt
+        existingByMobile.pinHash = pinHash
+        existingByMobile.pinAlgo = "pbkdf2-sha256"
+        existingByMobile.pinIterations = PIN_ITERATIONS
+        existingByMobile.active = true
+
+        await existingByMobile.save()
+
+        return {
+            participant: toPublicProfile(existingByMobile),
+            login: "Use Mobile Number + 4-digit PIN",
+        }
+    }
+
+    try {
+        const participant = await ParticipantModel.create({
+            type: "ALUMNI_VISITOR",
+            firstName,
+            middleName,
+            lastName,
+            mobileNumber,
+            department: departmentId,
+            pinSalt,
+            pinHash,
+            pinAlgo: "pbkdf2-sha256",
+            pinIterations: PIN_ITERATIONS,
+            active: true,
+        })
+
+        return {
+            participant: toPublicProfile(participant),
+            login: "Use Mobile Number + 4-digit PIN",
+        }
+    } catch (err) {
+        if (isDuplicateKeyError(err)) {
+            const field = duplicateKeyField(err)
+            if (field === "mobileNumber") throw new Error("Mobile number is already registered.")
+            throw new Error("Alumni/Visitor account already exists.")
+        }
+        throw err
     }
 }
 

@@ -8,7 +8,11 @@ import { SettingModel } from "../models/Setting"
 import { TicketModel } from "../models/Ticket"
 import { UserModel } from "../models/User"
 
-import { getDateKeyManila, getDepartmentWindowAssignments } from "../services/queue.service"
+import {
+    getDateKeyManila,
+    getDepartmentWindowAssignments,
+    TicketTransactionSelectionModel,
+} from "../services/queue.service"
 
 function todayKey() {
     return getDateKeyManila()
@@ -56,6 +60,148 @@ function normalizeIdString(value: unknown): string | null {
 
     const s = String(value).trim()
     return s || null
+}
+
+type ParticipantType = "STUDENT" | "ALUMNI_VISITOR" | "GUEST"
+
+function normalizeParticipantType(value: unknown): ParticipantType | null {
+    const raw = String(value ?? "").trim().toUpperCase()
+    if (!raw) return null
+
+    if (raw === "STUDENT") return "STUDENT"
+    if (raw === "GUEST") return "GUEST"
+    if (raw === "ALUMNI_VISITOR" || raw === "ALUMNI/VISITOR" || raw === "ALUMNI" || raw === "VISITOR") {
+        return "ALUMNI_VISITOR"
+    }
+
+    return null
+}
+
+function participantTypeLabel(value: ParticipantType | null | undefined): string | null {
+    if (!value) return null
+    if (value === "STUDENT") return "Student"
+    if (value === "ALUMNI_VISITOR") return "Alumni / Visitor"
+    if (value === "GUEST") return "Guest"
+    return null
+}
+
+function humanizeTransactionKey(value: string) {
+    return value
+        .replace(/[_-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase()
+        .replace(/\b\w/g, (m) => m.toUpperCase())
+}
+
+function extractStringArray(value: unknown): string[] {
+    if (!Array.isArray(value)) return []
+    const out: string[] = []
+    const seen = new Set<string>()
+
+    for (const item of value) {
+        const s = String(item ?? "").trim()
+        if (!s || seen.has(s)) continue
+        seen.add(s)
+        out.push(s)
+    }
+
+    return out
+}
+
+function firstNonEmptyText(candidates: unknown[]): string {
+    for (const candidate of candidates) {
+        const text = String(candidate ?? "").trim()
+        if (text) return text
+    }
+    return ""
+}
+
+function resolveQueuePurpose(ticket: any): string | null {
+    // 1) Array label candidates (most readable)
+    const arrayLabelCandidates = [
+        ticket?.transactionLabels,
+        ticket?.selectedTransactionLabels,
+        ticket?.meta?.transactionLabels,
+        ticket?.transactions?.transactionLabels,
+        ticket?.transactions?.labels,
+        ticket?.selection?.transactionLabels,
+        ticket?.join?.transactionLabels,
+    ]
+
+    for (const candidate of arrayLabelCandidates) {
+        const labels = extractStringArray(candidate)
+        if (labels.length) return labels.join(" • ")
+    }
+
+    // 2) Array-of-object candidates
+    const objectArrayCandidates = [
+        ticket?.selectedTransactions,
+        ticket?.transactionSelections,
+        ticket?.transactions?.items,
+        ticket?.transactions?.selected,
+    ]
+
+    for (const candidate of objectArrayCandidates) {
+        if (!Array.isArray(candidate)) continue
+
+        const labels = candidate
+            .map((item: any) =>
+                String(
+                    item?.label ??
+                    item?.name ??
+                    item?.title ??
+                    item?.transactionLabel ??
+                    "",
+                ).trim(),
+            )
+            .filter(Boolean)
+
+        if (labels.length) return uniqueStringIds(labels).join(" • ")
+    }
+
+    // 3) Direct string candidates
+    const direct = firstNonEmptyText([
+        ticket?.queuePurpose,
+        ticket?.purpose,
+        ticket?.transactionLabel,
+        ticket?.transaction?.label,
+        ticket?.transactionName,
+        ticket?.transactionTitle,
+        ticket?.meta?.purpose,
+        ticket?.meta?.transactionLabel,
+        ticket?.transactionCategory,
+        ticket?.meta?.transactionCategory,
+    ])
+
+    if (direct) return direct
+
+    // 4) Key arrays -> humanized labels
+    const keyArrayCandidates = [
+        ticket?.transactionKeys,
+        ticket?.selectedTransactionKeys,
+        ticket?.meta?.transactionKeys,
+        ticket?.transactions?.transactionKeys,
+        ticket?.selection?.transactionKeys,
+        ticket?.join?.transactionKeys,
+    ]
+
+    for (const candidate of keyArrayCandidates) {
+        const keys = extractStringArray(candidate).map((k) => humanizeTransactionKey(k)).filter(Boolean)
+        if (keys.length) return uniqueStringIds(keys).join(" • ")
+    }
+
+    // 5) Single key fallback
+    const rawKey = firstNonEmptyText([
+        ticket?.transactionKey,
+        ticket?.transaction?.key,
+        ticket?.meta?.transactionKey,
+        ticket?.transactionCode,
+    ])
+
+    if (rawKey) return humanizeTransactionKey(rawKey)
+
+    return null
 }
 
 function asObjectIdOrString(id: string) {
@@ -205,6 +351,12 @@ function hasHandledDepartments(scope: { handledDepartmentIds?: string[] }) {
 async function enrichTickets(tickets: any[]) {
     const plainTickets = tickets.map((t) => toPlainObject(t))
 
+    const ticketIds = uniqueStringIds(
+        plainTickets
+            .map((t) => normalizeIdString(t?._id))
+            .filter((v): v is string => Boolean(v)),
+    )
+
     const departmentIds = uniqueStringIds(
         plainTickets
             .map((t) => normalizeIdString(t?.department))
@@ -217,12 +369,32 @@ async function enrichTickets(tickets: any[]) {
             .filter((v): v is string => Boolean(v)),
     )
 
-    const [departmentRows, windowRows] = await Promise.all([
+    const studentIds = uniqueStringIds(
+        plainTickets
+            .map((t) => String(t?.studentId ?? "").trim())
+            .filter(Boolean),
+    )
+
+    const [departmentRows, windowRows, participantRows, transactionSelectionRows] = await Promise.all([
         departmentIds.length
             ? DepartmentModel.find({ _id: { $in: departmentIds } }).select("_id name code").lean()
             : Promise.resolve([] as any[]),
         windowIds.length
             ? ServiceWindowModel.find({ _id: { $in: windowIds } }).select("_id name number").lean()
+            : Promise.resolve([] as any[]),
+        studentIds.length
+            ? UserModel.find({
+                $or: [{ studentId: { $in: studentIds } }, { tcNumber: { $in: studentIds } }],
+            })
+                .select("_id role type studentId tcNumber")
+                .lean()
+            : Promise.resolve([] as any[]),
+        ticketIds.length
+            ? TicketTransactionSelectionModel.find({
+                ticket: { $in: ticketIds.map((id) => asObjectIdOrString(id)) },
+            })
+                .select("ticket participantType transactionKeys transactionLabels")
+                .lean()
             : Promise.resolve([] as any[]),
     ])
 
@@ -236,13 +408,130 @@ async function enrichTickets(tickets: any[]) {
         windowMap.set(String(row._id), row)
     }
 
+    const participantTypeByIdentity = new Map<string, ParticipantType>()
+    for (const row of participantRows as any[]) {
+        const normalized =
+            normalizeParticipantType(row?.type) ||
+            normalizeParticipantType(row?.role)
+
+        if (!normalized) continue
+
+        const keys = uniqueStringIds([
+            String(row?.studentId ?? ""),
+            String(row?.tcNumber ?? ""),
+        ])
+
+        for (const key of keys) {
+            participantTypeByIdentity.set(key, normalized)
+        }
+    }
+
+    const txSelectionByTicketId = new Map<
+        string,
+        {
+            participantType: ParticipantType | null
+            transactionKeys: string[]
+            transactionLabels: string[]
+        }
+    >()
+
+    for (const row of transactionSelectionRows as any[]) {
+        const tid = normalizeIdString(row?.ticket)
+        if (!tid) continue
+
+        const existing = txSelectionByTicketId.get(tid) || {
+            participantType: null as ParticipantType | null,
+            transactionKeys: [] as string[],
+            transactionLabels: [] as string[],
+        }
+
+        const p = normalizeParticipantType(row?.participantType)
+        if (!existing.participantType && p) {
+            existing.participantType = p
+        }
+
+        existing.transactionKeys = uniqueStringIds([
+            ...existing.transactionKeys,
+            ...extractStringArray(row?.transactionKeys),
+        ])
+
+        existing.transactionLabels = uniqueStringIds([
+            ...existing.transactionLabels,
+            ...extractStringArray(row?.transactionLabels),
+        ])
+
+        txSelectionByTicketId.set(tid, existing)
+    }
+
     return plainTickets.map((t: any) => {
         const id = normalizeIdString(t?._id)
         const departmentId = normalizeIdString(t?.department)
         const windowId = normalizeIdString(t?.window)
+        const studentId = String(t?.studentId ?? "").trim()
 
         const dep = departmentId ? departmentMap.get(departmentId) : null
         const win = windowId ? windowMap.get(windowId) : null
+        const txSelection = id ? txSelectionByTicketId.get(id) || null : null
+
+        const mergedTransactionKeys = uniqueStringIds([
+            ...extractStringArray(t?.transactionKeys),
+            ...extractStringArray(t?.selectedTransactionKeys),
+            ...extractStringArray(t?.transactions?.transactionKeys),
+            ...(txSelection?.transactionKeys ?? []),
+        ])
+
+        const mergedTransactionLabels = uniqueStringIds([
+            ...extractStringArray(t?.transactionLabels),
+            ...extractStringArray(t?.selectedTransactionLabels),
+            ...extractStringArray(t?.transactions?.transactionLabels),
+            ...extractStringArray(t?.transactions?.labels),
+            ...(txSelection?.transactionLabels ?? []),
+        ])
+
+        const explicitParticipantType =
+            normalizeParticipantType(
+                t?.participantType ??
+                t?.transactions?.participantType ??
+                t?.meta?.participantType ??
+                t?.participant ??
+                t?.userType ??
+                t?.role,
+            ) || null
+
+        const participantType =
+            explicitParticipantType ||
+            txSelection?.participantType ||
+            (studentId ? participantTypeByIdentity.get(studentId) || null : null)
+
+        const transactionsPayload = {
+            ...(t?.transactions && typeof t.transactions === "object" ? t.transactions : {}),
+            participantType: participantType || null,
+            participantTypeLabel: participantTypeLabel(participantType || null),
+            transactionKey:
+                firstNonEmptyText([
+                    t?.transactions?.transactionKey,
+                    t?.transactionKey,
+                    mergedTransactionKeys[0],
+                ]) || null,
+            transactionKeys: mergedTransactionKeys,
+            transactionLabel:
+                firstNonEmptyText([
+                    t?.transactions?.transactionLabel,
+                    t?.transactionLabel,
+                    mergedTransactionLabels[0],
+                ]) || null,
+            transactionLabels: mergedTransactionLabels,
+            labels: mergedTransactionLabels,
+        }
+
+        const queuePurpose = resolveQueuePurpose({
+            ...t,
+            transactionKeys: mergedTransactionKeys,
+            selectedTransactionKeys: mergedTransactionKeys,
+            transactionLabels: mergedTransactionLabels,
+            selectedTransactionLabels: mergedTransactionLabels,
+            transactions: transactionsPayload,
+        })
 
         return {
             ...t,
@@ -252,6 +541,34 @@ async function enrichTickets(tickets: any[]) {
             departmentCode: dep?.code ? String(dep.code) : null,
             windowId,
             windowName: win?.name ? String(win.name) : null,
+
+            participantType: participantType || null,
+            participantLabel:
+                firstNonEmptyText([
+                    t?.participantLabel,
+                    t?.transactions?.participantTypeLabel,
+                    t?.meta?.participantLabel,
+                    participantTypeLabel(participantType || null),
+                ]) || null,
+
+            transactionKeys: mergedTransactionKeys,
+            selectedTransactionKeys: mergedTransactionKeys,
+            transactionLabels: mergedTransactionLabels,
+            selectedTransactionLabels: mergedTransactionLabels,
+
+            transactions: transactionsPayload,
+            transactionSelections: txSelection
+                ? [
+                    {
+                        ticket: id || null,
+                        participantType: txSelection.participantType,
+                        transactionKeys: txSelection.transactionKeys,
+                        transactionLabels: txSelection.transactionLabels,
+                    },
+                ]
+                : t?.transactionSelections ?? [],
+
+            queuePurpose: queuePurpose || null,
         }
     })
 }

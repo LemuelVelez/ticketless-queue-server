@@ -1,6 +1,7 @@
 import mongoose, { Schema, Types } from "mongoose"
 
 export type TicketStatus = "WAITING" | "CALLED" | "HOLD" | "OUT" | "SERVED"
+export type TicketParticipantType = "STUDENT" | "ALUMNI_VISITOR" | "GUEST"
 
 export type TicketDoc = {
     department: Types.ObjectId
@@ -9,6 +10,21 @@ export type TicketDoc = {
 
     studentId: string
     phone?: string
+
+    /**
+     * Who joined the queue.
+     * Useful for staff visibility (Student / Alumni-Visitor / Guest).
+     */
+    participantType?: TicketParticipantType
+
+    /**
+     * Queue purpose / transaction context.
+     * These fields allow staff to see why the participant joined.
+     */
+    transactionCategory?: string
+    transactionKey?: string
+    transactionLabel?: string
+    purpose?: string
 
     status: TicketStatus
     holdAttempts: number
@@ -34,6 +50,17 @@ const TicketSchema = new Schema<TicketDoc>(
         studentId: { type: String, required: true, trim: true, index: true },
         phone: { type: String, trim: true },
 
+        participantType: {
+            type: String,
+            enum: ["STUDENT", "ALUMNI_VISITOR", "GUEST"],
+            index: true,
+        },
+
+        transactionCategory: { type: String, trim: true, uppercase: true, index: true },
+        transactionKey: { type: String, trim: true, lowercase: true, index: true },
+        transactionLabel: { type: String, trim: true },
+        purpose: { type: String, trim: true },
+
         status: { type: String, enum: ["WAITING", "CALLED", "HOLD", "OUT", "SERVED"], default: "WAITING" },
         holdAttempts: { type: Number, default: 0, min: 0 },
 
@@ -55,5 +82,9 @@ TicketSchema.index({ department: 1, dateKey: 1, queueNumber: 1 }, { unique: true
 // ✅ Reports-friendly indexes
 TicketSchema.index({ dateKey: 1, department: 1, status: 1 })
 TicketSchema.index({ dateKey: 1, status: 1 })
+
+// Staff visibility helpers
+TicketSchema.index({ dateKey: 1, department: 1, participantType: 1 })
+TicketSchema.index({ dateKey: 1, department: 1, transactionKey: 1 })
 
 export const TicketModel = mongoose.model<TicketDoc>("Ticket", TicketSchema)
