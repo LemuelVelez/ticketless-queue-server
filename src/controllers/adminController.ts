@@ -1,5 +1,6 @@
 import type { Request, Response } from "express"
 import { Types } from "mongoose"
+import * as crypto from "crypto"
 
 import { DepartmentModel } from "../models/Department"
 import { ServiceWindowModel } from "../models/ServiceWindow"
@@ -8,6 +9,7 @@ import { UserModel, type UserRole } from "../models/User"
 import { AuditLogModel } from "../models/AuditLog"
 import { TicketModel, type TicketStatus } from "../models/Ticket"
 import { hashPassword } from "./security"
+import { sendLoginCredentialsEmail } from "../lib/mailer"
 import {
   createTransactionDefinition,
   deleteTransactionDefinition,
@@ -435,6 +437,15 @@ async function clearStaffAssignment(userId: string | Types.ObjectId) {
       },
     } as any,
   )
+}
+
+function generateTemporaryPassword(length = 12) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+  const out: string[] = []
+  for (let i = 0; i < Math.max(8, length); i++) {
+    out.push(chars[crypto.randomInt(0, chars.length)])
+  }
+  return out.join("")
 }
 
 /** =================
@@ -1132,13 +1143,30 @@ export const adminController = {
     const roleRaw = body.role
     const role: UserRole = isRole(roleRaw) ? roleRaw : "STAFF"
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: "name, email, password are required" })
+    const nameTrimmed = String(name ?? "").trim()
+    const normalizedEmail = normalizeEmail(email)
+
+    // ✅ sendCredentials defaults to TRUE (better UX) unless explicitly set false
+    const wantsSendCredentials =
+      body.sendCredentials === undefined ? true : Boolean(body.sendCredentials)
+
+    if (!nameTrimmed || !normalizedEmail) {
+      return res.status(400).json({ message: "name and email are required" })
     }
 
-    const normalizedEmail = normalizeEmail(email)
     const existing = await UserModel.findOne({ email: normalizedEmail })
     if (existing) return res.status(409).json({ message: "Email already exists" })
+
+    // ✅ Password can be provided OR auto-generated (recommended when sending credentials)
+    let passwordToUse = String(password ?? "").trim()
+    const passwordWasGenerated = !passwordToUse
+    if (!passwordToUse) {
+      passwordToUse = generateTemporaryPassword(12)
+      // If password is generated, we MUST send it, otherwise user cannot login
+      if (!wantsSendCredentials) {
+        return res.status(400).json({ message: "password is required when sendCredentials is false" })
+      }
+    }
 
     // Resolve assignment first so we fail before creating user if invalid.
     const hasDepartmentIdPatch = Object.prototype.hasOwnProperty.call(body, "departmentId")
@@ -1172,10 +1200,10 @@ export const adminController = {
       resolvedAssignment = resolved.value!
     }
 
-    const { salt, hash, algo, iterations } = await hashPassword(String(password))
+    const { salt, hash, algo, iterations } = await hashPassword(String(passwordToUse))
 
     const userPayload: any = {
-      name: String(name).trim(),
+      name: nameTrimmed,
       email: normalizedEmail,
       role,
       active: true,
@@ -1211,12 +1239,132 @@ export const adminController = {
                 windowId: resolvedAssignment.windowId,
               }
             : undefined,
+        credentials: {
+          sendRequested: wantsSendCredentials,
+          passwordGenerated: passwordWasGenerated,
+        },
       },
     })
 
+    // ✅ Send credentials email (optional, but default TRUE)
+    const credentials = {
+      attempted: Boolean(wantsSendCredentials),
+      sent: false,
+      error: null as string | null,
+    }
+
+    if (wantsSendCredentials) {
+      try {
+        await sendLoginCredentialsEmail({
+          to: normalizedEmail,
+          name: nameTrimmed,
+          email: normalizedEmail,
+          password: String(passwordToUse),
+          role,
+        })
+
+        credentials.sent = true
+
+        await AuditLogModel.create({
+          ...actor(req),
+          action: "ADMIN_SEND_LOGIN_CREDENTIALS",
+          entityType: "User",
+          entityId: user._id as any,
+          meta: { to: normalizedEmail, role, sent: true },
+        })
+      } catch (err: any) {
+        const msg = String(err?.message ?? err ?? "Failed to send email")
+        credentials.error = msg
+
+        await AuditLogModel.create({
+          ...actor(req),
+          action: "ADMIN_SEND_LOGIN_CREDENTIALS",
+          entityType: "User",
+          entityId: user._id as any,
+          meta: { to: normalizedEmail, role, sent: false, error: msg.slice(0, 300) },
+        })
+      }
+    }
+
     return res.status(201).json({
       staff: mapUserForAdminResponse(refreshed ?? user),
+      credentials,
     })
+  },
+
+  // ✅ Resend login credentials (generates a NEW temporary password and emails it)
+  resendLoginCredentials: async (req: Request, res: Response) => {
+    const { id } = req.params
+
+    const user = await UserModel.findById(id)
+    if (!user) {
+      // participant records do not have email credentials
+      const participant = await ParticipantModel.findById(id)
+      if (participant) {
+        return res.status(400).json({ message: "Cannot send login credentials to participant records (no email)." })
+      }
+      return res.status(404).json({ message: "User not found" })
+    }
+
+    const to = normalizeEmail((user as any).email)
+    if (!to) return res.status(400).json({ message: "User has no email address." })
+
+    const prevCreds = {
+      passwordSalt: (user as any).passwordSalt,
+      passwordHash: (user as any).passwordHash,
+      passwordAlgo: (user as any).passwordAlgo,
+      passwordIterations: (user as any).passwordIterations,
+    }
+
+    const tempPassword = generateTemporaryPassword(12)
+    const { salt, hash, algo, iterations } = await hashPassword(String(tempPassword))
+
+    // Update first, then send, and revert on send failure (so user isn't locked out)
+    ;(user as any).passwordSalt = salt
+    ;(user as any).passwordHash = hash
+    ;(user as any).passwordAlgo = algo
+    ;(user as any).passwordIterations = iterations
+
+    await user.save()
+
+    try {
+      await sendLoginCredentialsEmail({
+        to,
+        name: String((user as any).name ?? "").trim(),
+        email: to,
+        password: tempPassword,
+        role: (user as any).role,
+      })
+
+      await AuditLogModel.create({
+        ...actor(req),
+        action: "ADMIN_RESEND_LOGIN_CREDENTIALS",
+        entityType: "User",
+        entityId: user._id as any,
+        meta: { to, role: (user as any).role, sent: true },
+      })
+
+      return res.json({ ok: true, sent: true })
+    } catch (err: any) {
+      // revert credentials on failure
+      ;(user as any).passwordSalt = prevCreds.passwordSalt
+      ;(user as any).passwordHash = prevCreds.passwordHash
+      ;(user as any).passwordAlgo = prevCreds.passwordAlgo
+      ;(user as any).passwordIterations = prevCreds.passwordIterations
+      await user.save()
+
+      const msg = String(err?.message ?? err ?? "Failed to send email")
+
+      await AuditLogModel.create({
+        ...actor(req),
+        action: "ADMIN_RESEND_LOGIN_CREDENTIALS",
+        entityType: "User",
+        entityId: user._id as any,
+        meta: { to, role: (user as any).role, sent: false, error: msg.slice(0, 300) },
+      })
+
+      return res.status(500).json({ message: "Failed to resend login credentials", error: msg })
+    }
   },
 
   updateStaff: async (req: Request, res: Response) => {

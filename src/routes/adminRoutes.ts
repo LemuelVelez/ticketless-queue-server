@@ -148,6 +148,9 @@ router.get("/staff", async (_req, res) => {
 router.post("/staff", adminController.createStaff)
 router.put("/staff/:id", adminController.updateStaff)
 
+// ✅ resend login credentials (generates new temporary password and emails it)
+router.post("/staff/:id/resend-credentials", adminController.resendLoginCredentials)
+
 // ✅ delete account (used by accounts.tsx)
 router.delete("/staff/:id", adminController.deleteStaff)
 

@@ -1,6 +1,7 @@
 import nodemailer from "nodemailer"
 import * as fs from "fs"
 import * as path from "path"
+import { buildSendLoginCredentialsEmail } from "./email-templates/send-login-credentials"
 
 function getTransporter() {
     const user = process.env.GMAIL_USER
@@ -29,6 +30,13 @@ function buildResetLinkFromClientOrigin(token: string) {
 
     const origin = originRaw.replace(/\/$/, "")
     return `${origin}/reset-password?token=${encodeURIComponent(token)}`
+}
+
+function buildLoginLinkFromClientOrigin() {
+    const originRaw = process.env.CLIENT_ORIGIN
+    if (!originRaw) return null
+    const origin = originRaw.replace(/\/$/, "")
+    return `${origin}/login`
 }
 
 /**
@@ -284,6 +292,45 @@ export async function sendPasswordResetEmail(opts: {
         subject,
         text,
         html,
+        attachments: logoAttachment ? [logoAttachment] : undefined,
+    })
+}
+
+export async function sendLoginCredentialsEmail(opts: {
+    to: string
+    name?: string
+    email: string
+    password: string
+    role?: string
+    loginLink?: string
+}) {
+    const transporter = getTransporter()
+    if (!transporter) {
+        throw new Error("Email not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD.")
+    }
+
+    const fromUser = process.env.GMAIL_USER!
+
+    const loginLink = buildLoginLinkFromClientOrigin() ?? opts.loginLink ?? null
+
+    const logoAttachment = getInlineLogoAttachment()
+    const payload = buildSendLoginCredentialsEmail({
+        name: opts.name,
+        email: opts.email,
+        password: opts.password,
+        role: opts.role,
+        loginLink,
+        hasInlineLogo: Boolean(logoAttachment),
+        logoCid: LOGO_PNG_CID,
+        theme: THEME,
+    })
+
+    await transporter.sendMail({
+        from: `QueuePass <${fromUser}>`,
+        to: opts.to,
+        subject: payload.subject,
+        text: payload.text,
+        html: payload.html,
         attachments: logoAttachment ? [logoAttachment] : undefined,
     })
 }
