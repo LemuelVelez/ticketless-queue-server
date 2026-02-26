@@ -4,8 +4,17 @@ import { DepartmentModel, type DepartmentDoc } from "../models/Department"
 import { QueueCounterModel } from "../models/QueueCounter"
 import { ServiceWindowModel, type ServiceWindowDoc } from "../models/ServiceWindow"
 import { SettingModel, type SettingDoc } from "../models/Setting"
-import { TicketModel, type TicketDoc, type TicketParticipantType, type TicketStatus } from "../models/Ticket"
+import { TicketModel, type TicketParticipantType, type TicketStatus } from "../models/Ticket"
 import { UserModel, type UserDoc, type UserRole } from "../models/User"
+
+type WithId<T> = T & { _id: Types.ObjectId }
+
+type DepartmentLean = WithId<DepartmentDoc>
+type ServiceWindowLean = WithId<ServiceWindowDoc>
+
+function isPopulatedDoc<T extends { _id: unknown }>(v: unknown): v is T {
+    return Boolean(v && typeof v === "object" && "_id" in (v as any))
+}
 
 export type AuthActor = {
     _id?: Types.ObjectId | string
@@ -171,12 +180,11 @@ function normalizeManagerKey(v?: string): string | undefined {
  * Example: "2026-02-26"
  */
 export function getDateKey(now = new Date()): string {
-    // en-CA yields YYYY-MM-DD in most Node builds
     return now.toLocaleDateString("en-CA", { timeZone: "Asia/Manila" })
 }
 
 async function getOrCreateSettings(): Promise<SettingDoc> {
-    let doc = await SettingModel.findOne().lean<SettingDoc>().exec()
+    const doc = await SettingModel.findOne().lean<WithId<SettingDoc>>().exec()
     if (doc) return doc
 
     const created = await SettingModel.create({})
@@ -234,7 +242,6 @@ async function hydrateParticipantMap(studentIds: string[]) {
     const unique = Array.from(new Set(studentIds.map((s) => String(s).trim()).filter(Boolean)))
     if (!unique.length) return new Map<string, { name?: string; phone?: string; type?: TicketParticipantType }>()
 
-    // user may store tcNumber and studentId as aliases; query both
     const users = await UserModel.find({
         $or: [{ tcNumber: { $in: unique } }, { studentId: { $in: unique } }],
     })
@@ -256,8 +263,13 @@ async function hydrateParticipantMap(studentIds: string[]) {
 }
 
 function toTicketView(t: any): TicketView {
-    const dep = t.department as Partial<DepartmentDoc> | undefined
-    const win = t.window as Partial<ServiceWindowDoc> | undefined
+    const depObj = isPopulatedDoc<DepartmentLean>(t.department) ? (t.department as DepartmentLean) : undefined
+    const winObj = isPopulatedDoc<ServiceWindowLean>(t.window) ? (t.window as ServiceWindowLean) : undefined
+
+    const departmentId = depObj?._id ? String(depObj._id) : String(t.department)
+    const departmentName = String(depObj?.name ?? "").trim() || "Department"
+    const departmentCode = depObj?.code ? String(depObj.code) : undefined
+    const transactionManager = String(depObj?.transactionManager ?? "").trim()
 
     return {
         id: String(t._id),
@@ -266,10 +278,10 @@ function toTicketView(t: any): TicketView {
         status: t.status as TicketStatus,
 
         department: {
-            id: dep?._id ? String(dep._id) : String(t.department),
-            name: String(dep?.name ?? "").trim() || "Department",
-            code: dep?.code ? String(dep.code) : undefined,
-            transactionManager: String((dep as any)?.transactionManager ?? "").trim(),
+            id: departmentId,
+            name: departmentName,
+            code: departmentCode,
+            transactionManager,
         },
 
         participant: {
@@ -286,12 +298,11 @@ function toTicketView(t: any): TicketView {
             purpose: t.purpose ? String(t.purpose) : undefined,
         },
 
-        window:
-            win && win._id
-                ? { id: String(win._id), name: String(win.name ?? "Window"), number: Number(win.number ?? t.windowNumber) }
-                : t.window
-                  ? { id: String(t.window), name: "Window", number: Number(t.windowNumber ?? 0) }
-                  : undefined,
+        window: winObj?._id
+            ? { id: String(winObj._id), name: String(winObj.name ?? "Window"), number: Number(winObj.number ?? t.windowNumber) }
+            : t.window
+              ? { id: String(t.window), name: "Window", number: Number(t.windowNumber ?? 0) }
+              : undefined,
 
         holdAttempts: Number(t.holdAttempts ?? 0),
         waitingSince: new Date(t.waitingSince).toISOString(),
@@ -317,7 +328,6 @@ async function attachParticipantNames(tickets: any[]) {
 }
 
 async function nextQueueNumber(departmentId: Types.ObjectId, dateKey: string): Promise<number> {
-    // Atomic $inc (prevents duplicate seq generation across staff/windows)
     const counter = await QueueCounterModel.findOneAndUpdate(
         { department: departmentId, dateKey },
         { $inc: { seq: 1 } },
@@ -329,16 +339,16 @@ async function nextQueueNumber(departmentId: Types.ObjectId, dateKey: string): P
     return Number(counter?.seq ?? 1)
 }
 
-async function resolveDepartmentOrFail(departmentId: string) {
+async function resolveDepartmentOrFail(departmentId: string): Promise<DepartmentLean> {
     const depId = asObjectId(departmentId, "departmentId")
-    const dep = await DepartmentModel.findById(depId).lean<DepartmentDoc>().exec()
+    const dep = await DepartmentModel.findById(depId).lean<DepartmentLean>().exec()
     if (!dep || !dep.enabled) throw new HttpError(404, "DEPARTMENT_NOT_FOUND", "Department not found or disabled.")
     return dep
 }
 
-async function resolveWindowOrFail(windowId: string) {
+async function resolveWindowOrFail(windowId: string): Promise<ServiceWindowLean> {
     const winId = asObjectId(windowId, "windowId")
-    const win = await ServiceWindowModel.findById(winId).lean<ServiceWindowDoc>().exec()
+    const win = await ServiceWindowModel.findById(winId).lean<ServiceWindowLean>().exec()
     if (!win || !win.enabled) throw new HttpError(404, "WINDOW_NOT_FOUND", "Service window not found or disabled.")
     return win
 }
@@ -358,12 +368,17 @@ export async function listDepartmentsByManager(manager: string) {
     const key = normalizeManagerKey(manager)
     if (!key) throw new HttpError(400, "MISSING_MANAGER", "Manager is required.")
     const deps = await DepartmentModel.find({ enabled: true, transactionManager: key })
-        .select("name code transactionManager")
+        .select("_id name code transactionManager")
         .sort({ name: 1 })
-        .lean<DepartmentDoc[]>()
+        .lean<DepartmentLean[]>()
         .exec()
 
-    return deps.map((d) => ({ id: String((d as any)._id), name: d.name, code: d.code, transactionManager: d.transactionManager }))
+    return deps.map((d) => ({
+        id: String(d._id),
+        name: d.name,
+        code: d.code,
+        transactionManager: d.transactionManager,
+    }))
 }
 
 /**
@@ -375,7 +390,7 @@ export async function listWindowsByManager(manager: string) {
 
     const deps = await DepartmentModel.find({ enabled: true, transactionManager: key })
         .select("_id name code")
-        .lean<Pick<DepartmentDoc, "name" | "code"> & { _id: Types.ObjectId }[]>()
+        .lean<(Pick<DepartmentDoc, "name" | "code"> & { _id: Types.ObjectId })[]>()
         .exec()
 
     const depIdSet = new Set(deps.map((d) => String(d._id)))
@@ -387,14 +402,14 @@ export async function listWindowsByManager(manager: string) {
     })
         .select("name number enabled department departmentIds")
         .sort({ number: 1, name: 1 })
-        .lean<ServiceWindowDoc[]>()
+        .lean<ServiceWindowLean[]>()
         .exec()
 
     return wins.map((w) => {
         const ids = (w.departmentIds?.length ? w.departmentIds : [w.department]).map((x) => String(x))
         const departments = ids.filter((id) => depIdSet.has(id)).map((id) => depMap.get(id)!).filter(Boolean)
 
-        return { id: String((w as any)._id), name: w.name, number: w.number, enabled: w.enabled, departments }
+        return { id: String(w._id), name: w.name, number: w.number, enabled: w.enabled, departments }
     })
 }
 
@@ -424,7 +439,8 @@ export async function createTicket(actor: AuthActor | undefined, input: QueueTic
     const dateKey = getDateKey()
 
     const participantRole = actor?.role === "STUDENT" || actor?.role === "ALUMNI_VISITOR" || actor?.role === "GUEST"
-    const profileDeptId = actor?.departmentId && Types.ObjectId.isValid(String(actor.departmentId)) ? String(actor.departmentId) : undefined
+    const profileDeptId =
+        actor?.departmentId && Types.ObjectId.isValid(String(actor.departmentId)) ? String(actor.departmentId) : undefined
 
     // ✅ lock department after registration (if participant has departmentId)
     const requestedDept = String(input.departmentId ?? "").trim()
@@ -435,9 +451,7 @@ export async function createTicket(actor: AuthActor | undefined, input: QueueTic
     const studentId = pickParticipantStudentId(actor, input.studentId)
     const phone = String(input.phone ?? actor?.phone ?? actor?.mobileNumber ?? "").trim() || undefined
     const participantType: TicketParticipantType | undefined =
-        input.participantType ||
-        (participantRole ? (actor?.role as TicketParticipantType) : undefined) ||
-        undefined
+        input.participantType || (participantRole ? (actor?.role as TicketParticipantType) : undefined) || undefined
 
     if (settings.disallowDuplicateActiveTickets) {
         const existing = await TicketModel.findOne({
@@ -459,7 +473,7 @@ export async function createTicket(actor: AuthActor | undefined, input: QueueTic
     }
 
     // Centralized & duplicate-safe queue number generation + insert retry
-    const departmentObjectId = new Types.ObjectId(String((dep as any)._id))
+    const departmentObjectId = dep._id
     let created: any | null = null
 
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -487,7 +501,6 @@ export async function createTicket(actor: AuthActor | undefined, input: QueueTic
 
             break
         } catch (err: any) {
-            // If unique constraint hit (rare), retry by generating next number.
             if (err?.code === 11000) continue
             throw err
         }
@@ -533,7 +546,7 @@ export async function getStaffQueueState(actor: AuthActor | undefined, query: Qu
     let scopedDepartmentIds: Types.ObjectId[] = []
 
     if (windowId) {
-        const win = await ServiceWindowModel.findById(windowId).lean<ServiceWindowDoc>().exec()
+        const win = await ServiceWindowModel.findById(windowId).lean<ServiceWindowLean>().exec()
         if (!win) throw new HttpError(404, "WINDOW_NOT_FOUND", "Service window not found.")
         const ids = (win.departmentIds?.length ? win.departmentIds : [win.department]).filter(Boolean)
         scopedDepartmentIds = ids.map((x) => new Types.ObjectId(String(x)))
@@ -546,7 +559,6 @@ export async function getStaffQueueState(actor: AuthActor | undefined, query: Qu
             .exec()
         scopedDepartmentIds = deps.map((d) => d._id)
     } else {
-        // fallback: if staff has assignments, scope to them
         const assigned = new Set<string>()
         if (actor?.assignedDepartment) assigned.add(String(actor.assignedDepartment))
         for (const d of actor?.assignedDepartments ?? []) assigned.add(String(d))
@@ -591,7 +603,6 @@ export async function getStaffQueueState(actor: AuthActor | undefined, query: Qu
     const upNextCount = Number(settings.upNextCount ?? 5)
     const upNext = waiting.slice(0, upNextCount)
 
-    // If scoped to a window, show its now serving (called ticket for that window)
     let nowServing: any | undefined
     if (windowId) {
         nowServing = called.find((t: any) => String(t.window) === String(windowId)) || undefined
@@ -646,7 +657,9 @@ export async function callNextQueue(actor: AuthActor | undefined, windowId: stri
 
     await ensureWindowHasNoActiveCall(winObjectId, dateKey)
 
-    const departmentIds = (win.departmentIds?.length ? win.departmentIds : [win.department]).map((x) => new Types.ObjectId(String(x)))
+    const departmentIds = (win.departmentIds?.length ? win.departmentIds : [win.department]).map(
+        (x) => new Types.ObjectId(String(x))
+    )
 
     const updated = await TicketModel.findOneAndUpdate(
         {
@@ -692,6 +705,7 @@ export async function callNextQueue(actor: AuthActor | undefined, windowId: stri
     const voiceText = voiceTextParts.join(" ")
 
     await audit(actor, "TICKET_CALLED", "Ticket", new Types.ObjectId(view.id), {
+        ticketId: view.id,
         dateKey,
         queueNumber: view.queueNumber,
         departmentId: view.department.id,
@@ -823,7 +837,6 @@ async function getAnnouncements(manager: string, sinceIso?: string): Promise<Ann
     const since = sinceIso ? new Date(sinceIso) : undefined
     if (sinceIso && String(since).includes("Invalid")) throw new HttpError(400, "INVALID_SINCE", "Invalid 'since' timestamp.")
 
-    // AuditLog stores everything needed for centralized audio triggers (display polls these)
     const match: any = { action: "TICKET_CALLED" }
     if (since) match.createdAt = { $gt: since }
 
@@ -833,17 +846,16 @@ async function getAnnouncements(manager: string, sinceIso?: string): Promise<Ann
         .lean()
         .exec()
 
-    // Filter by manager by reading meta.departmentId -> department.transactionManager
     const departmentIds = logs
         .map((l: any) => String(l?.meta?.departmentId ?? "").trim())
         .filter((id) => Types.ObjectId.isValid(id))
 
     const deps = await DepartmentModel.find({ _id: { $in: departmentIds }, transactionManager: manager })
         .select("_id name transactionManager")
-        .lean<DepartmentDoc[]>()
+        .lean<DepartmentLean[]>()
         .exec()
 
-    const allowed = new Set(deps.map((d: any) => String(d._id)))
+    const allowed = new Set(deps.map((d) => String(d._id)))
 
     const out: Announcement[] = []
     for (const l of logs) {
@@ -865,7 +877,6 @@ async function getAnnouncements(manager: string, sinceIso?: string): Promise<Ann
         })
     }
 
-    // Return chronological order for easier client playback
     return out.reverse()
 }
 
@@ -881,11 +892,11 @@ export async function getPublicDisplayState(manager: string, sinceIso?: string):
     const deps = await DepartmentModel.find({ enabled: true, transactionManager: key })
         .select("_id name code transactionManager")
         .sort({ name: 1 })
-        .lean<DepartmentDoc[]>()
+        .lean<DepartmentLean[]>()
         .exec()
 
-    const depIds = deps.map((d: any) => d._id as Types.ObjectId)
-    const depMap = new Map(deps.map((d: any) => [String(d._id), d]))
+    const depIds = deps.map((d) => d._id)
+    const depMap = new Map(deps.map((d) => [String(d._id), d]))
 
     const wins = await ServiceWindowModel.find({
         enabled: true,
@@ -893,7 +904,7 @@ export async function getPublicDisplayState(manager: string, sinceIso?: string):
     })
         .select("_id name number enabled department departmentIds")
         .sort({ number: 1, name: 1 })
-        .lean<ServiceWindowDoc[]>()
+        .lean<ServiceWindowLean[]>()
         .exec()
 
     const calledTickets = await TicketModel.find({
@@ -925,7 +936,6 @@ export async function getPublicDisplayState(manager: string, sinceIso?: string):
     for (const t of calledTickets) {
         const w = t.window ? String(t.window) : ""
         if (!w) continue
-        // latest called wins
         if (!calledByWindow.has(w)) calledByWindow.set(w, t)
         else {
             const prev = calledByWindow.get(w)
@@ -942,11 +952,11 @@ export async function getPublicDisplayState(manager: string, sinceIso?: string):
         const departments = ids
             .map((id) => depMap.get(id))
             .filter(Boolean)
-            .map((d: any) => ({ id: String(d._id), name: d.name, code: d.code }))
+            .map((d) => ({ id: String((d as DepartmentLean)._id), name: (d as DepartmentLean).name, code: (d as DepartmentLean).code }))
 
-        const nowServing = calledByWindow.get(String((w as any)._id))
+        const nowServing = calledByWindow.get(String(w._id))
         return {
-            id: String((w as any)._id),
+            id: String(w._id),
             name: w.name,
             number: w.number,
             enabled: w.enabled,
@@ -962,7 +972,7 @@ export async function getPublicDisplayState(manager: string, sinceIso?: string):
         serverTime: new Date().toISOString(),
         dateKey,
         windows,
-        departments: deps.map((d: any) => ({ id: String(d._id), name: d.name, code: d.code })),
+        departments: deps.map((d) => ({ id: String(d._id), name: d.name, code: d.code })),
         upNext,
         announcements,
     }
