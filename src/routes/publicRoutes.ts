@@ -42,6 +42,28 @@ function on(method: "get" | "post" | "put" | "patch" | "options", path: string, 
 
 const okOptions = (_req: any, res: any) => res.sendStatus(204)
 
+/**
+ * 🔒 Department is locked to the participant record.
+ * We explicitly strip any attempted override for the "session read" endpoints.
+ * (Profile updates still accept departmentId only for first-time save; controller enforces locking after that.)
+ */
+function stripDepartmentOverride(req: any, _res: any, next: any) {
+    try {
+        if (req?.query && typeof req.query === "object") {
+            delete req.query.departmentId
+            delete req.query.department
+        }
+        if (req?.body && typeof req.body === "object") {
+            // session read (POST) sometimes includes departmentId—ignore it
+            delete req.body.departmentId
+            delete req.body.department
+        }
+    } catch {
+        // ignore
+    }
+    next()
+}
+
 // --------------------
 // Departments
 // --------------------
@@ -65,15 +87,15 @@ on("post", "/auth/login/guest", publicController.loginAlumniVisitor) // alias
 
 // ✅ Session endpoint (GET/POST + PATCH/PUT for profile updates)
 on("options", "/auth/session", okOptions)
-on("get", "/auth/session", publicController.participantSession)
-on("post", "/auth/session", publicController.participantSession)
+on("get", "/auth/session", stripDepartmentOverride, publicController.participantSession)
+on("post", "/auth/session", stripDepartmentOverride, publicController.participantSession)
 on("patch", "/auth/session", publicController.updateParticipantProfile)
 on("put", "/auth/session", publicController.updateParticipantProfile)
 
 // ✅ "me/profile" aliases (some frontends call these)
 for (const p of ["/auth/me", "/auth/profile"] as const) {
     on("options", p, okOptions)
-    on("get", p, publicController.participantSession)
+    on("get", p, stripDepartmentOverride, publicController.participantSession)
     on("patch", p, publicController.updateParticipantProfile)
     on("put", p, publicController.updateParticipantProfile)
     // fallback: some proxies/environments strip/avoid PATCH

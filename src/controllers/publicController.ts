@@ -243,12 +243,12 @@ function modelProbablyStoresParticipants(Model: any) {
     if (!paths) return false
     return Boolean(
         paths.mobileNumber ||
-        paths.phone ||
-        paths.tcNumber ||
-        paths.studentId ||
-        paths.departmentId ||
-        paths.department ||
-        paths.type
+            paths.phone ||
+            paths.tcNumber ||
+            paths.studentId ||
+            paths.departmentId ||
+            paths.department ||
+            paths.type
     )
 }
 
@@ -307,6 +307,25 @@ async function findParticipantLeanById(id: string): Promise<any | null> {
     return null
 }
 
+function extractDepartmentIdFromProfileOrState(profile: any, state: any): string {
+    // Prefer stored participant department (locked)
+    const fromProfile =
+        asString(profile?.departmentId) ||
+        asString(profile?.department) ||
+        asString(state?.profile?.departmentId) ||
+        asString(state?.profile?.department) ||
+        asString(state?.participant?.departmentId) ||
+        asString(state?.participant?.department) ||
+        asString(state?.participant?.department?.toString?.() ?? state?.participant?.department)
+
+    return fromProfile
+}
+
+async function ensureEnabledDepartment(deptId: Types.ObjectId): Promise<boolean> {
+    const exists = await DepartmentModel.exists({ _id: deptId, enabled: true })
+    return Boolean(exists)
+}
+
 export const publicController = {
     listDepartments: async (_req: Request, res: Response) => {
         const departments = await DepartmentModel.find({ enabled: true }).sort({ name: 1 })
@@ -326,6 +345,13 @@ export const publicController = {
             const mobileNumber = asString(body.mobileNumber || body.phone)
             const departmentId = asString(body.departmentId || body.department)
 
+            if (!departmentId) return res.status(400).json({ message: "departmentId is required" })
+            const deptObjId = safeObjectId(departmentId)
+            if (!deptObjId) return res.status(400).json({ message: "Invalid departmentId" })
+
+            const okDept = await ensureEnabledDepartment(deptObjId)
+            if (!okDept) return res.status(404).json({ message: "Department not found/disabled" })
+
             const fullName = composeName(firstName, middleName, lastName)
 
             const payload = {
@@ -338,10 +364,12 @@ export const publicController = {
                 tcNumber: optional(tcNumber),
                 pin: optional(pin),
                 mobileNumber: optional(mobileNumber),
-                departmentId: optional(departmentId),
-                department: optional(asString(body.department || departmentId)),
+
+                // IMPORTANT: always set canonical departmentId for participant records
+                departmentId: String(deptObjId),
 
                 // compatibility aliases (old/new services)
+                department: optional(asString(body.department || departmentId)),
                 name: optional(asString(body.name)) || optional(fullName),
                 studentId: optional(asString(body.studentId || tcNumber)),
                 password: optional(asString(body.password || pin)),
@@ -368,6 +396,13 @@ export const publicController = {
             const pin = asString(body.pin || body.password)
             const departmentId = asString(body.departmentId || body.department)
 
+            if (!departmentId) return res.status(400).json({ message: "departmentId is required" })
+            const deptObjId = safeObjectId(departmentId)
+            if (!deptObjId) return res.status(400).json({ message: "Invalid departmentId" })
+
+            const okDept = await ensureEnabledDepartment(deptObjId)
+            if (!okDept) return res.status(404).json({ message: "Department not found/disabled" })
+
             const fullName = composeName(firstName, middleName, lastName)
 
             const payload = {
@@ -379,10 +414,12 @@ export const publicController = {
                 lastName: optional(lastName),
                 mobileNumber: optional(mobileNumber),
                 pin: optional(pin),
-                departmentId: optional(departmentId),
-                department: optional(asString(body.department || departmentId)),
+
+                // IMPORTANT: always set canonical departmentId for participant records
+                departmentId: String(deptObjId),
 
                 // compatibility aliases (old/new services)
+                department: optional(asString(body.department || departmentId)),
                 name: optional(asString(body.name)) || optional(fullName),
                 password: optional(asString(body.password || pin)),
                 phone: optional(asString(body.phone || mobileNumber)),
@@ -449,16 +486,9 @@ export const publicController = {
             // ignore (fallback to state.profile)
         }
 
-        const requestedDepartmentId = asString((req.query || {}).departmentId || (req.body || {}).departmentId)
-
-        const participantDepartmentId =
-            asString(profile?.departmentId) ||
-            asString((profile as any)?.department) ||
-            asString(state.profile?.departmentId) ||
-            asString((state.profile as any)?.department) ||
-            asString((state.participant as any)?.department?.toString?.() ?? (state.participant as any)?.department)
-
-        const effectiveDepartmentId = requestedDepartmentId || participantDepartmentId
+        // 🔒 Department is LOCKED to the participant record.
+        // Do NOT allow overriding via query/body (prevents switching departments after registration).
+        const participantDepartmentId = extractDepartmentIdFromProfileOrState(profile, state)
 
         const participantTypeRaw =
             asString(profile?.type) || asString(state.profile?.type) || asString(state.participant?.type) || ""
@@ -467,12 +497,9 @@ export const publicController = {
 
         let availableTransactions = getTransactionsForParticipant(participantType)
 
-        if (effectiveDepartmentId) {
+        if (participantDepartmentId) {
             try {
-                availableTransactions = await getTransactionsForParticipantInDepartment(
-                    participantType,
-                    effectiveDepartmentId
-                )
+                availableTransactions = await getTransactionsForParticipantInDepartment(participantType, participantDepartmentId)
             } catch {
                 // Fallback for invalid/missing department mappings.
                 availableTransactions = getTransactionsForParticipant(participantType)
@@ -485,6 +512,8 @@ export const publicController = {
             },
             participant: profile,
             availableTransactions,
+            // ✅ helps frontend lock department UI after registration
+            departmentLocked: Boolean(participantDepartmentId),
         })
     },
 
@@ -525,7 +554,9 @@ export const publicController = {
 
             const tcNumber = asString(body.tcNumber || body.studentId)
             const mobileNumber = asString(body.mobileNumber || body.phone)
-            const incomingDepartmentId = asString(body.departmentId || body.department)
+
+            // May be omitted after registration (because department becomes locked)
+            const requestedDepartmentId = asString(body.departmentId || body.department)
 
             const smsUpdates = typeof body.smsUpdates === "boolean" ? Boolean(body.smsUpdates) : undefined
 
@@ -533,18 +564,26 @@ export const publicController = {
             if (!firstName) return res.status(400).json({ message: "firstName is required" })
             if (!lastName) return res.status(400).json({ message: "lastName is required" })
             if (!mobileNumber) return res.status(400).json({ message: "mobileNumber is required" })
-            if (!incomingDepartmentId) return res.status(400).json({ message: "departmentId is required" })
 
-            // 🔒 Department lock behavior: once saved, do not allow changing (prevents abuse/spam)
+            // 🔒 Department lock behavior:
+            // - If participant already has a departmentId, it is LOCKED and cannot be changed.
+            // - If participant has no departmentId yet, the first provided departmentId is saved and becomes locked.
             const currentDept =
-                (user as any).departmentId ? String((user as any).departmentId) :
-                (user as any).department ? String((user as any).department) : ""
+                (user as any).departmentId ? String((user as any).departmentId) : (user as any).department ? String((user as any).department) : ""
 
-            const requestedDept = incomingDepartmentId
-            const deptToUse = currentDept || requestedDept
+            const departmentChangeIgnored = Boolean(currentDept && requestedDepartmentId && currentDept !== requestedDepartmentId)
+
+            const deptToUse = currentDept || requestedDepartmentId
+            if (!deptToUse) return res.status(400).json({ message: "departmentId is required" })
 
             const deptObjId = safeObjectId(deptToUse)
             if (!deptObjId) return res.status(400).json({ message: "Invalid departmentId" })
+
+            // Only validate enabled department when it's being set for the first time
+            if (!currentDept) {
+                const okDept = await ensureEnabledDepartment(deptObjId)
+                if (!okDept) return res.status(404).json({ message: "Department not found/disabled" })
+            }
 
             ;(user as any).firstName = firstName
             ;(user as any).middleName = middleName || undefined
@@ -554,9 +593,8 @@ export const publicController = {
             ;(user as any).mobileNumber = mobileNumber
             ;(user as any).phone = mobileNumber // keep alias
 
-            // Keep both fields for compatibility across older code paths
+            // ✅ Locked department persisted in canonical field
             ;(user as any).departmentId = deptObjId
-            ;(user as any).department = deptObjId
 
             // Keep participant type aligned (safe for participant accounts)
             ;(user as any).type = incomingType
@@ -582,7 +620,10 @@ export const publicController = {
             return res.json({
                 ok: true,
                 participant: typeof (user as any).toObject === "function" ? (user as any).toObject() : user,
-                departmentLocked: Boolean(currentDept) && currentDept !== requestedDept,
+                // ✅ tells UI that department is immutable once saved
+                departmentLocked: Boolean((user as any).departmentId),
+                // ✅ tells UI an attempted change was ignored (useful for showing a toast)
+                departmentChangeIgnored,
             })
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to update profile"
@@ -610,6 +651,26 @@ export const publicController = {
         // New participant-session based flow
         if (sessionToken && hasModernPayload) {
             try {
+                const state = await verifyParticipantSession(sessionToken)
+                if (!state) return res.status(401).json({ message: "Invalid or expired session" })
+
+                let profile: any = state.profile || null
+                try {
+                    const participantId = await getParticipantIdFromState(state)
+                    if (participantId) {
+                        const fresh = await findParticipantLeanById(participantId)
+                        if (fresh) profile = fresh
+                    }
+                } catch {
+                    // ignore
+                }
+
+                // 🔒 Department is LOCKED to the participant record.
+                // Ignore any client-provided departmentId to prevent switching departments after registration.
+                const lockedDepartmentId = extractDepartmentIdFromProfileOrState(profile, state)
+                const fallbackDepartmentId = asString(body.departmentId || body.department)
+                const departmentIdToUse = lockedDepartmentId || fallbackDepartmentId
+
                 const transactionKeys: string[] = asStringArray(body.transactionKeys)
 
                 const displayImmediately =
@@ -619,7 +680,7 @@ export const publicController = {
                     sessionToken,
                     transactionKeys,
                     presentDirectlyToDisplayMonitor: displayImmediately,
-                    departmentId: optional(asString(body.departmentId)),
+                    departmentId: optional(asString(departmentIdToUse)),
                     studentId: optional(asString(body.studentId)),
                     phone: optional(asString(body.phone)),
                 })
@@ -638,6 +699,7 @@ export const publicController = {
                 return res.status(201).json({
                     ticket: ticketDoc ?? fallbackTicket,
                     join: joined,
+                    departmentLocked: Boolean(lockedDepartmentId),
                 })
             } catch (err) {
                 const message = err instanceof Error ? err.message : "Unable to join queue"
@@ -722,10 +784,10 @@ export const publicController = {
             ticket,
             transactions: transactions
                 ? {
-                    transactionKeys: transactions.transactionKeys,
-                    transactionLabels: transactions.transactionLabels,
-                    participantType: transactions.participantType,
-                }
+                      transactionKeys: transactions.transactionKeys,
+                      transactionLabels: transactions.transactionLabels,
+                      participantType: transactions.participantType,
+                  }
                 : null,
         })
     },
