@@ -2,6 +2,7 @@ import { Router } from "express"
 import { requireAuth, requireRole } from "../controllers/middlewares"
 import { staffController } from "../controllers/staffController"
 import { smsController } from "../controllers/smsController"
+import { QueueManagementController } from "../controllers/queueManagement"
 
 const router = Router()
 
@@ -19,7 +20,20 @@ router.get("/queue/hold", staffController.listHold)
 router.get("/queue/out", staffController.listOut)
 router.get("/queue/history", staffController.listHistory)
 
-// Queue operations
+/**
+ * ✅ CENTRALIZED REAL-TIME QUEUE (Critical Foundation)
+ * One unified queue state shared across all staff/windows:
+ * - pollable staff queue state (single DB truth)
+ * - race-safe "Next Queue" via backend atomic updates
+ * - no separate display instances per staff window
+ */
+router.get("/queue/state", QueueManagementController.getStaffQueueState)
+router.post("/queue/call-next-central", QueueManagementController.callNext)
+router.post("/queue/serve", QueueManagementController.serve)
+router.post("/queue/hold", QueueManagementController.hold)
+router.post("/queue/out", QueueManagementController.out)
+
+// Queue operations (legacy endpoints)
 router.post("/queue/call-next", staffController.callNext)
 router.get("/queue/current-called", staffController.currentCalledForWindow)
 router.post("/tickets/:id/served", staffController.markServed)
