@@ -5,80 +5,94 @@ import { requireParticipantAuth } from "../controllers/middlewares"
 
 const router = Router()
 
-// Departments
-router.get("/departments", publicController.listDepartments)
-
-// Home overview charts
-router.get("/home/overview", homeController.overview)
-
-// Participant auth/session
-router.post("/auth/signup/student", publicController.signupStudent)
-router.post("/auth/signup/alumni-visitor", publicController.signupAlumniVisitor)
-router.post("/auth/signup/guest", publicController.signupAlumniVisitor) // alias
-
-router.post("/auth/login/student", publicController.loginStudent)
-router.post("/auth/login/alumni-visitor", publicController.loginAlumniVisitor)
-router.post("/auth/login/guest", publicController.loginAlumniVisitor) // alias
-
-router.get("/auth/session", publicController.participantSession)
-router.post("/auth/session", publicController.participantSession)
-
-// ✅ IMPORTANT: allow profile updates via the existing /auth/session route
-// This fixes cases where /auth/me or /auth/profile are not mounted in some environments.
-router.options("/auth/session", (_req, res) => res.sendStatus(204))
-router.patch("/auth/session", publicController.updateParticipantProfile)
-router.put("/auth/session", publicController.updateParticipantProfile)
-
 /**
- * ✅ Participant "me/profile" endpoints
- * Some frontends call:
- * - /api/public/auth/me
- * - /api/public/auth/profile
+ * ✅ Route aliasing helper
+ * Your frontend calls URLs like:
+ *   /api/public/auth/session
+ *   /api/public/auth/me
+ *   /api/public/auth/profile
  *
- * Depending on how this router is mounted (/, /api, /api/public),
- * we register safe aliases for GET + PATCH (and PUT/POST fallback),
- * and also respond to OPTIONS for CORS preflight.
+ * But depending on how this router is mounted, the real Express path can vary:
+ * - mounted at "/api/public"  => router paths should be "/auth/*"
+ * - mounted at "/api"         => router paths should be "/public/auth/*"
+ * - mounted at "/"            => router paths should be "/api/public/auth/*"
+ *
+ * To prevent 404s across environments, we register aliases for all three.
  */
-const participantProfilePaths = [
-    // If router is mounted at /api/public
-    "/auth/me",
-    "/auth/profile",
+const BASE_PREFIXES = ["", "/public", "/api/public"] as const
 
-    // If router is mounted at /api
-    "/public/auth/me",
-    "/public/auth/profile",
-
-    // If router is mounted at /
-    "/api/public/auth/me",
-    "/api/public/auth/profile",
-] as const
-
-for (const p of participantProfilePaths) {
-    // CORS preflight friendliness (especially for PATCH)
-    router.options(p, (_req, res) => res.sendStatus(204))
-
-    // Many apps use GET /auth/me to fetch session/profile
-    router.get(p, publicController.participantSession)
-
-    // Profile update
-    router.patch(p, publicController.updateParticipantProfile)
-
-    // Fallbacks (some proxies/environments strip/avoid PATCH)
-    router.put(p, publicController.updateParticipantProfile)
-    router.post(p, publicController.updateParticipantProfile)
+function normalizeSlashes(path: string) {
+    return path.replace(/\/{2,}/g, "/")
 }
 
-router.post("/auth/logout", publicController.logoutParticipant)
+function aliasPaths(path: string): string[] {
+    const clean = path.startsWith("/") ? path : `/${path}`
+    const set = new Set<string>()
+    for (const base of BASE_PREFIXES) {
+        set.add(normalizeSlashes(`${base}${clean}`))
+    }
+    return Array.from(set)
+}
 
-// Queue
-// join/find/getTicket are intentionally open for legacy public kiosk flow;
-// controller still supports session-token flow when Authorization/sessionToken is provided.
-router.post("/tickets/join", publicController.joinQueue)
-router.get("/tickets", publicController.findActiveByStudent)
-router.get("/tickets/:id", publicController.getTicket)
+function on(method: "get" | "post" | "put" | "patch" | "options", path: string, ...handlers: any[]) {
+    for (const p of aliasPaths(path)) {
+        ;(router as any)[method](p, ...handlers)
+    }
+}
 
-// Display-monitor actions remain participant-protected.
-router.post("/tickets/present", requireParticipantAuth, publicController.presentToDisplayMonitor)
-router.post("/tickets/present-to-display-monitor", requireParticipantAuth, publicController.presentToDisplayMonitor)
+const okOptions = (_req: any, res: any) => res.sendStatus(204)
+
+// --------------------
+// Departments
+// --------------------
+on("get", "/departments", publicController.listDepartments)
+
+// --------------------
+// Home overview charts
+// --------------------
+on("get", "/home/overview", homeController.overview)
+
+// --------------------
+// Participant auth/session
+// --------------------
+on("post", "/auth/signup/student", publicController.signupStudent)
+on("post", "/auth/signup/alumni-visitor", publicController.signupAlumniVisitor)
+on("post", "/auth/signup/guest", publicController.signupAlumniVisitor) // alias
+
+on("post", "/auth/login/student", publicController.loginStudent)
+on("post", "/auth/login/alumni-visitor", publicController.loginAlumniVisitor)
+on("post", "/auth/login/guest", publicController.loginAlumniVisitor) // alias
+
+// ✅ Session endpoint (GET/POST + PATCH/PUT for profile updates)
+on("options", "/auth/session", okOptions)
+on("get", "/auth/session", publicController.participantSession)
+on("post", "/auth/session", publicController.participantSession)
+on("patch", "/auth/session", publicController.updateParticipantProfile)
+on("put", "/auth/session", publicController.updateParticipantProfile)
+
+// ✅ "me/profile" aliases (some frontends call these)
+for (const p of ["/auth/me", "/auth/profile"] as const) {
+    on("options", p, okOptions)
+    on("get", p, publicController.participantSession)
+    on("patch", p, publicController.updateParticipantProfile)
+    on("put", p, publicController.updateParticipantProfile)
+    // fallback: some proxies/environments strip/avoid PATCH
+    on("post", p, publicController.updateParticipantProfile)
+}
+
+on("post", "/auth/logout", publicController.logoutParticipant)
+
+// --------------------
+// Queue (public kiosk + participant-session supported by controller)
+// --------------------
+on("post", "/tickets/join", publicController.joinQueue)
+on("get", "/tickets", publicController.findActiveByStudent)
+on("get", "/tickets/:id", publicController.getTicket)
+
+// --------------------
+// Display-monitor actions remain participant-protected
+// --------------------
+on("post", "/tickets/present", requireParticipantAuth, publicController.presentToDisplayMonitor)
+on("post", "/tickets/present-to-display-monitor", requireParticipantAuth, publicController.presentToDisplayMonitor)
 
 export default router
