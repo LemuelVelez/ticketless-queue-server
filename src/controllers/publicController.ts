@@ -1,5 +1,5 @@
 import type { Request, Response } from "express"
-import { Types } from "mongoose"
+import mongoose, { Types } from "mongoose"
 
 import { DepartmentModel } from "../models/Department"
 import { QueueCounterModel } from "../models/QueueCounter"
@@ -144,19 +144,167 @@ async function nextQueueNumber(departmentId: string, dateKey: string) {
     return counter.seq
 }
 
+/** -----------------------------
+ * ✅ Robust participant resolution
+ * Fixes: PATCH profile returning 404 "Participant not found"
+ * when verifyParticipantSession returns an id/profile stored in a different model/shape.
+ * ----------------------------- */
+
+function isMongooseDoc(v: any): v is { _id: any; save: () => Promise<any>; toObject: () => any } {
+    return Boolean(v && typeof v === "object" && v._id && typeof v.save === "function")
+}
+
+function looksLikeParticipantRecord(v: any) {
+    if (!v || typeof v !== "object") return false
+    const role = String((v as any).role ?? (v as any).type ?? "").toUpperCase()
+    if (["STUDENT", "ALUMNI_VISITOR", "GUEST", "VISITOR"].includes(role)) return true
+
+    // heuristic: participant records usually have at least one of these
+    if ("mobileNumber" in v || "phone" in v || "tcNumber" in v || "studentId" in v || "departmentId" in v) return true
+    return false
+}
+
+function extractId(val: any): string {
+    if (!val) return ""
+    if (typeof val === "string") return val.trim()
+
+    if (typeof val === "object") {
+        const candidates = [
+            (val as any)._id,
+            (val as any).id,
+            (val as any).userId,
+            (val as any).participantId,
+        ]
+        for (const c of candidates) {
+            const s = String(c ?? "").trim()
+            if (s) return s
+        }
+    }
+
+    return ""
+}
+
 async function getParticipantIdFromState(state: any): Promise<string> {
     const candidates = [
+        state?.participantId,
+        state?.profileId,
+        state?.userId,
+
+        state?.participant,
+        state?.profile,
+        state?.user,
+
         state?.participant?._id,
         state?.participant?.id,
+
         state?.profile?._id,
         state?.profile?.id,
+        state?.profile?.userId,
+        state?.profile?.participantId,
+
+        state?.user?._id,
+        state?.user?.id,
+
         state?.session?.participantId,
         state?.session?.userId,
-    ]
-        .map((x) => String(x ?? "").trim())
-        .filter(Boolean)
+        state?.session?.participant?._id,
+        state?.session?.participant?.id,
+        state?.session?.profile?._id,
+        state?.session?.profile?.id,
 
-    return candidates[0] || ""
+        state?.session?.user?._id,
+        state?.session?.user?.id,
+    ]
+
+    for (const c of candidates) {
+        const id = extractId(c)
+        if (id) return id
+    }
+
+    return ""
+}
+
+const PARTICIPANT_MODEL_NAME_CANDIDATES = [
+    "Participant",
+    "Participants",
+    "Student",
+    "Students",
+    "AlumniVisitor",
+    "Alumni",
+    "Guest",
+    "Visitor",
+    "Registrant",
+    "PublicUser",
+    "PublicAccount",
+] as const
+
+function modelProbablyStoresParticipants(Model: any) {
+    const paths = Model?.schema?.paths
+    if (!paths) return false
+    return Boolean(
+        paths.mobileNumber ||
+        paths.phone ||
+        paths.tcNumber ||
+        paths.studentId ||
+        paths.departmentId ||
+        paths.department ||
+        paths.type
+    )
+}
+
+async function findParticipantDocById(id: string): Promise<any | null> {
+    const clean = String(id ?? "").trim()
+    if (!clean || !Types.ObjectId.isValid(clean)) return null
+
+    // 1) Try the obvious model used throughout the codebase
+    const userDoc = await UserModel.findById(clean)
+    if (userDoc && looksLikeParticipantRecord(userDoc)) return userDoc
+
+    // 2) Try well-known participant-ish model names if they exist
+    for (const name of PARTICIPANT_MODEL_NAME_CANDIDATES) {
+        const Model = (mongoose.models as any)?.[name]
+        if (!Model || typeof Model.findById !== "function") continue
+        const doc = await Model.findById(clean)
+        if (doc && looksLikeParticipantRecord(doc)) return doc
+    }
+
+    // 3) Last resort: scan registered models that have participant-like fields
+    for (const name of mongoose.modelNames()) {
+        const Model = (mongoose.models as any)?.[name]
+        if (!Model || typeof Model.findById !== "function") continue
+        if (!modelProbablyStoresParticipants(Model)) continue
+
+        const doc = await Model.findById(clean)
+        if (doc && looksLikeParticipantRecord(doc)) return doc
+    }
+
+    return null
+}
+
+async function findParticipantLeanById(id: string): Promise<any | null> {
+    const clean = String(id ?? "").trim()
+    if (!clean || !Types.ObjectId.isValid(clean)) return null
+
+    const user = await UserModel.findById(clean).lean()
+    if (user && looksLikeParticipantRecord(user)) return user
+
+    for (const name of PARTICIPANT_MODEL_NAME_CANDIDATES) {
+        const Model = (mongoose.models as any)?.[name]
+        if (!Model || typeof Model.findById !== "function") continue
+        const doc = await Model.findById(clean).lean?.()
+        if (doc && looksLikeParticipantRecord(doc)) return doc
+    }
+
+    for (const name of mongoose.modelNames()) {
+        const Model = (mongoose.models as any)?.[name]
+        if (!Model || typeof Model.findById !== "function") continue
+        if (!modelProbablyStoresParticipants(Model)) continue
+
+        const doc = await Model.findById(clean).lean?.()
+        if (doc && looksLikeParticipantRecord(doc)) return doc
+    }
+
+    return null
 }
 
 export const publicController = {
@@ -294,7 +442,7 @@ export const publicController = {
         try {
             const participantId = await getParticipantIdFromState(state)
             if (participantId) {
-                const fresh = await UserModel.findById(participantId).lean()
+                const fresh = await findParticipantLeanById(participantId)
                 if (fresh) profile = fresh
             }
         } catch {
@@ -349,11 +497,20 @@ export const publicController = {
             const state = await verifyParticipantSession(sessionToken)
             if (!state) return res.status(401).json({ message: "Invalid or expired session" })
 
-            const participantId = await getParticipantIdFromState(state)
-            if (!participantId) return res.status(404).json({ message: "Participant not found" })
+            // ✅ Fix: resolve participant reliably (state shape + model can differ)
+            let user: any = null
 
-            const user = await UserModel.findById(participantId)
-            if (!user) return res.status(404).json({ message: "Participant not found" })
+            if (isMongooseDoc(state?.profile) && looksLikeParticipantRecord(state.profile)) {
+                user = state.profile
+            } else if (isMongooseDoc(state?.participant) && looksLikeParticipantRecord(state.participant)) {
+                user = state.participant
+            } else {
+                const participantId = await getParticipantIdFromState(state)
+                if (!participantId) return res.status(404).json({ message: "Participant not found" })
+
+                user = await findParticipantDocById(participantId)
+                if (!user) return res.status(404).json({ message: "Participant not found" })
+            }
 
             const body = req.body || {}
 
@@ -361,7 +518,9 @@ export const publicController = {
             const middleName = asString(body.middleName)
             const lastName = asString(body.lastName)
 
-            const incomingType = toParticipantQueueType(body.type || body.participantType || (user as any).type || (user as any).role)
+            const incomingType = toParticipantQueueType(
+                body.type || body.participantType || (user as any).type || (user as any).role
+            )
             const name = asString(body.name) || composeName(firstName, middleName, lastName)
 
             const tcNumber = asString(body.tcNumber || body.studentId)
@@ -418,11 +577,11 @@ export const publicController = {
                 ;(user as any).smsUpdates = smsUpdates
             }
 
-            await user.save()
+            await (user as any).save()
 
             return res.json({
                 ok: true,
-                participant: user.toObject(),
+                participant: typeof (user as any).toObject === "function" ? (user as any).toObject() : user,
                 departmentLocked: Boolean(currentDept) && currentDept !== requestedDept,
             })
         } catch (err) {
