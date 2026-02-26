@@ -23,9 +23,50 @@ router.post("/auth/login/guest", publicController.loginAlumniVisitor) // alias
 router.get("/auth/session", publicController.participantSession)
 router.post("/auth/session", publicController.participantSession)
 
-// ✅ NEW: participant profile update (used by student/alumni profile pages)
-router.patch("/auth/me", publicController.updateParticipantProfile)
-router.patch("/auth/profile", publicController.updateParticipantProfile) // alias
+// ✅ IMPORTANT: allow profile updates via the existing /auth/session route
+// This fixes cases where /auth/me or /auth/profile are not mounted in some environments.
+router.options("/auth/session", (_req, res) => res.sendStatus(204))
+router.patch("/auth/session", publicController.updateParticipantProfile)
+router.put("/auth/session", publicController.updateParticipantProfile)
+
+/**
+ * ✅ Participant "me/profile" endpoints
+ * Some frontends call:
+ * - /api/public/auth/me
+ * - /api/public/auth/profile
+ *
+ * Depending on how this router is mounted (/, /api, /api/public),
+ * we register safe aliases for GET + PATCH (and PUT/POST fallback),
+ * and also respond to OPTIONS for CORS preflight.
+ */
+const participantProfilePaths = [
+    // If router is mounted at /api/public
+    "/auth/me",
+    "/auth/profile",
+
+    // If router is mounted at /api
+    "/public/auth/me",
+    "/public/auth/profile",
+
+    // If router is mounted at /
+    "/api/public/auth/me",
+    "/api/public/auth/profile",
+] as const
+
+for (const p of participantProfilePaths) {
+    // CORS preflight friendliness (especially for PATCH)
+    router.options(p, (_req, res) => res.sendStatus(204))
+
+    // Many apps use GET /auth/me to fetch session/profile
+    router.get(p, publicController.participantSession)
+
+    // Profile update
+    router.patch(p, publicController.updateParticipantProfile)
+
+    // Fallbacks (some proxies/environments strip/avoid PATCH)
+    router.put(p, publicController.updateParticipantProfile)
+    router.post(p, publicController.updateParticipantProfile)
+}
 
 router.post("/auth/logout", publicController.logoutParticipant)
 

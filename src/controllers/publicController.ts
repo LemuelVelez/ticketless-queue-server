@@ -305,7 +305,9 @@ export const publicController = {
 
         const participantDepartmentId =
             asString(profile?.departmentId) ||
+            asString((profile as any)?.department) ||
             asString(state.profile?.departmentId) ||
+            asString((state.profile as any)?.department) ||
             asString((state.participant as any)?.department?.toString?.() ?? (state.participant as any)?.department)
 
         const effectiveDepartmentId = requestedDepartmentId || participantDepartmentId
@@ -338,7 +340,7 @@ export const publicController = {
         })
     },
 
-    // ✅ NEW: Update participant profile (Student / Alumni-Visitor / Guest)
+    // ✅ Update participant profile (Student / Alumni-Visitor / Guest)
     updateParticipantProfile: async (req: Request, res: Response) => {
         try {
             const sessionToken = getSessionToken(req)
@@ -358,6 +360,8 @@ export const publicController = {
             const firstName = asString(body.firstName)
             const middleName = asString(body.middleName)
             const lastName = asString(body.lastName)
+
+            const incomingType = toParticipantQueueType(body.type || body.participantType || (user as any).type || (user as any).role)
             const name = asString(body.name) || composeName(firstName, middleName, lastName)
 
             const tcNumber = asString(body.tcNumber || body.studentId)
@@ -373,28 +377,40 @@ export const publicController = {
             if (!incomingDepartmentId) return res.status(400).json({ message: "departmentId is required" })
 
             // 🔒 Department lock behavior: once saved, do not allow changing (prevents abuse/spam)
-            const currentDept = user.departmentId ? String(user.departmentId) : ""
+            const currentDept =
+                (user as any).departmentId ? String((user as any).departmentId) :
+                (user as any).department ? String((user as any).department) : ""
+
             const requestedDept = incomingDepartmentId
             const deptToUse = currentDept || requestedDept
 
             const deptObjId = safeObjectId(deptToUse)
             if (!deptObjId) return res.status(400).json({ message: "Invalid departmentId" })
 
-            user.firstName = firstName
-            user.middleName = middleName || undefined
-            user.lastName = lastName
-            user.name = name
+            ;(user as any).firstName = firstName
+            ;(user as any).middleName = middleName || undefined
+            ;(user as any).lastName = lastName
+            ;(user as any).name = name
 
-            user.mobileNumber = mobileNumber
-            user.phone = mobileNumber // keep alias
+            ;(user as any).mobileNumber = mobileNumber
+            ;(user as any).phone = mobileNumber // keep alias
 
-            user.departmentId = deptObjId
+            // Keep both fields for compatibility across older code paths
+            ;(user as any).departmentId = deptObjId
+            ;(user as any).department = deptObjId
+
+            // Keep participant type aligned (safe for participant accounts)
+            ;(user as any).type = incomingType
+            const roleUpper = String((user as any).role || "").toUpperCase()
+            if (roleUpper === "STUDENT" || roleUpper === "ALUMNI_VISITOR" || roleUpper === "GUEST" || !roleUpper) {
+                ;(user as any).role = incomingType
+            }
 
             // If this participant is a STUDENT, keep tcNumber + studentId synchronized
-            if (user.role === "STUDENT" || user.type === "STUDENT") {
+            if (incomingType === "STUDENT") {
                 if (!tcNumber) return res.status(400).json({ message: "tcNumber is required for students" })
-                user.tcNumber = tcNumber
-                user.studentId = tcNumber
+                ;(user as any).tcNumber = tcNumber
+                ;(user as any).studentId = tcNumber
             }
 
             // Optional preference (safe even if older clients don’t send it)
