@@ -1,9 +1,11 @@
 import type { Request, Response } from "express"
+import { Types } from "mongoose"
 
 import { DepartmentModel } from "../models/Department"
 import { QueueCounterModel } from "../models/QueueCounter"
 import { SettingModel } from "../models/Setting"
 import { TicketModel } from "../models/Ticket"
+import { UserModel } from "../models/User"
 
 import {
     loginAlumniVisitor,
@@ -22,6 +24,7 @@ import {
 import {
     getTransactionsForParticipant,
     getTransactionsForParticipantInDepartment,
+    type ParticipantQueueType,
 } from "../services/registrarTransactions.service"
 
 const ACTIVE_STATUSES = ["WAITING", "CALLED", "HOLD"] as const
@@ -104,6 +107,34 @@ function optional(value: string) {
     return v ? v : undefined
 }
 
+function safeObjectId(value: string) {
+    const v = String(value ?? "").trim()
+    if (!v) return null
+    if (!Types.ObjectId.isValid(v)) return null
+    return new Types.ObjectId(v)
+}
+
+/**
+ * ✅ Narrow any unknown/string participant type into ParticipantQueueType
+ * so TS is happy and runtime stays safe.
+ */
+function toParticipantQueueType(value: unknown): ParticipantQueueType {
+    const raw = asString(value)
+    const upper = raw.replace(/\s+/g, "_").toUpperCase()
+
+    // Common canonical values
+    if (upper === "STUDENT") return "STUDENT" as ParticipantQueueType
+    if (upper === "ALUMNI_VISITOR") return "ALUMNI_VISITOR" as ParticipantQueueType
+    if (upper === "GUEST") return "GUEST" as ParticipantQueueType
+
+    // Common legacy/variants -> map safely
+    if (upper === "ALUMNI-VISITOR" || upper === "ALUMNI") return "ALUMNI_VISITOR" as ParticipantQueueType
+    if (upper === "VISITOR") return "GUEST" as ParticipantQueueType
+
+    // Safe fallback (least privilege)
+    return "GUEST" as ParticipantQueueType
+}
+
 async function nextQueueNumber(departmentId: string, dateKey: string) {
     const counter = await QueueCounterModel.findOneAndUpdate(
         { department: departmentId, dateKey },
@@ -111,6 +142,21 @@ async function nextQueueNumber(departmentId: string, dateKey: string) {
         { new: true, upsert: true }
     )
     return counter.seq
+}
+
+async function getParticipantIdFromState(state: any): Promise<string> {
+    const candidates = [
+        state?.participant?._id,
+        state?.participant?.id,
+        state?.profile?._id,
+        state?.profile?.id,
+        state?.session?.participantId,
+        state?.session?.userId,
+    ]
+        .map((x) => String(x ?? "").trim())
+        .filter(Boolean)
+
+    return candidates[0] || ""
 }
 
 export const publicController = {
@@ -243,27 +289,43 @@ export const publicController = {
         const state = await verifyParticipantSession(sessionToken)
         if (!state) return res.status(401).json({ message: "Invalid or expired session" })
 
-        const requestedDepartmentId = asString(
-            (req.query || {}).departmentId || (req.body || {}).departmentId
-        )
+        // ✅ Always return the freshest profile from DB (prevents stale session profile after PATCH)
+        let profile: any = state.profile || null
+        try {
+            const participantId = await getParticipantIdFromState(state)
+            if (participantId) {
+                const fresh = await UserModel.findById(participantId).lean()
+                if (fresh) profile = fresh
+            }
+        } catch {
+            // ignore (fallback to state.profile)
+        }
+
+        const requestedDepartmentId = asString((req.query || {}).departmentId || (req.body || {}).departmentId)
 
         const participantDepartmentId =
+            asString(profile?.departmentId) ||
             asString(state.profile?.departmentId) ||
             asString((state.participant as any)?.department?.toString?.() ?? (state.participant as any)?.department)
 
         const effectiveDepartmentId = requestedDepartmentId || participantDepartmentId
 
-        let availableTransactions = getTransactionsForParticipant(state.participant.type)
+        const participantTypeRaw =
+            asString(profile?.type) || asString(state.profile?.type) || asString(state.participant?.type) || ""
+
+        const participantType = toParticipantQueueType(participantTypeRaw)
+
+        let availableTransactions = getTransactionsForParticipant(participantType)
 
         if (effectiveDepartmentId) {
             try {
                 availableTransactions = await getTransactionsForParticipantInDepartment(
-                    state.participant.type,
+                    participantType,
                     effectiveDepartmentId
                 )
             } catch {
                 // Fallback for invalid/missing department mappings.
-                availableTransactions = getTransactionsForParticipant(state.participant.type)
+                availableTransactions = getTransactionsForParticipant(participantType)
             }
         }
 
@@ -271,9 +333,86 @@ export const publicController = {
             session: {
                 expiresAt: state.session.expiresAt,
             },
-            participant: state.profile,
+            participant: profile,
             availableTransactions,
         })
+    },
+
+    // ✅ NEW: Update participant profile (Student / Alumni-Visitor / Guest)
+    updateParticipantProfile: async (req: Request, res: Response) => {
+        try {
+            const sessionToken = getSessionToken(req)
+            if (!sessionToken) return res.status(400).json({ message: "sessionToken is required" })
+
+            const state = await verifyParticipantSession(sessionToken)
+            if (!state) return res.status(401).json({ message: "Invalid or expired session" })
+
+            const participantId = await getParticipantIdFromState(state)
+            if (!participantId) return res.status(404).json({ message: "Participant not found" })
+
+            const user = await UserModel.findById(participantId)
+            if (!user) return res.status(404).json({ message: "Participant not found" })
+
+            const body = req.body || {}
+
+            const firstName = asString(body.firstName)
+            const middleName = asString(body.middleName)
+            const lastName = asString(body.lastName)
+            const name = asString(body.name) || composeName(firstName, middleName, lastName)
+
+            const tcNumber = asString(body.tcNumber || body.studentId)
+            const mobileNumber = asString(body.mobileNumber || body.phone)
+            const incomingDepartmentId = asString(body.departmentId || body.department)
+
+            const smsUpdates = typeof body.smsUpdates === "boolean" ? Boolean(body.smsUpdates) : undefined
+
+            // Basic validation (frontend sends required fields)
+            if (!firstName) return res.status(400).json({ message: "firstName is required" })
+            if (!lastName) return res.status(400).json({ message: "lastName is required" })
+            if (!mobileNumber) return res.status(400).json({ message: "mobileNumber is required" })
+            if (!incomingDepartmentId) return res.status(400).json({ message: "departmentId is required" })
+
+            // 🔒 Department lock behavior: once saved, do not allow changing (prevents abuse/spam)
+            const currentDept = user.departmentId ? String(user.departmentId) : ""
+            const requestedDept = incomingDepartmentId
+            const deptToUse = currentDept || requestedDept
+
+            const deptObjId = safeObjectId(deptToUse)
+            if (!deptObjId) return res.status(400).json({ message: "Invalid departmentId" })
+
+            user.firstName = firstName
+            user.middleName = middleName || undefined
+            user.lastName = lastName
+            user.name = name
+
+            user.mobileNumber = mobileNumber
+            user.phone = mobileNumber // keep alias
+
+            user.departmentId = deptObjId
+
+            // If this participant is a STUDENT, keep tcNumber + studentId synchronized
+            if (user.role === "STUDENT" || user.type === "STUDENT") {
+                if (!tcNumber) return res.status(400).json({ message: "tcNumber is required for students" })
+                user.tcNumber = tcNumber
+                user.studentId = tcNumber
+            }
+
+            // Optional preference (safe even if older clients don’t send it)
+            if (smsUpdates !== undefined) {
+                ;(user as any).smsUpdates = smsUpdates
+            }
+
+            await user.save()
+
+            return res.json({
+                ok: true,
+                participant: user.toObject(),
+                departmentLocked: Boolean(currentDept) && currentDept !== requestedDept,
+            })
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to update profile"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
     },
 
     logoutParticipant: async (req: Request, res: Response) => {
@@ -419,7 +558,9 @@ export const publicController = {
     // Handy lookup for student side (optional)
     findActiveByStudent: async (req: Request, res: Response) => {
         const { departmentId, studentId } = req.query as any
-        if (!departmentId || !studentId) return res.status(400).json({ message: "departmentId and studentId are required" })
+        if (!departmentId || !studentId) {
+            return res.status(400).json({ message: "departmentId and studentId are required" })
+        }
 
         const ticket = await TicketModel.findOne({
             department: String(departmentId),

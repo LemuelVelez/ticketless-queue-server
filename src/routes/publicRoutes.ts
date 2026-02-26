@@ -22,6 +22,11 @@ router.post("/auth/login/guest", publicController.loginAlumniVisitor) // alias
 
 router.get("/auth/session", publicController.participantSession)
 router.post("/auth/session", publicController.participantSession)
+
+// ✅ NEW: participant profile update (used by student/alumni profile pages)
+router.patch("/auth/me", publicController.updateParticipantProfile)
+router.patch("/auth/profile", publicController.updateParticipantProfile) // alias
+
 router.post("/auth/logout", publicController.logoutParticipant)
 
 // Queue

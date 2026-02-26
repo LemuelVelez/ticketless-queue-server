@@ -33,6 +33,9 @@ export type UserDoc = {
     phone?: string // alias
     departmentId?: Types.ObjectId
 
+    // ✅ Participant preferences
+    smsUpdates?: boolean
+
     // ✅ Avatar fields
     avatarKey?: string
     avatarUrl?: string
@@ -124,6 +127,9 @@ const UserSchema = new Schema<UserDoc>(
                 return isParticipantRole(this.role) || isParticipantRole(this.type)
             },
         },
+
+        // ✅ Participant preferences
+        smsUpdates: { type: Boolean, default: true },
 
         // ✅ Avatar fields
         avatarKey: { type: String },
