@@ -9,7 +9,6 @@ import { TicketModel, type TicketStatus } from "../models/Ticket"
 import { UserModel } from "../models/User"
 
 import {
-    buildAccountName,
     verifyParticipantSession,
     type ParticipantDoc,
     type ParticipantType,
@@ -132,6 +131,19 @@ function joinList(items: string[], max = 6) {
     if (!clean.length) return ""
     if (clean.length <= max) return clean.join(", ")
     return `${clean.slice(0, max).join(", ")} +${clean.length - max} more`
+}
+
+function buildPersonFullName(personLike: any): string {
+    const name = String(personLike?.name ?? "").trim()
+    if (name) return name
+
+    const composed = [personLike?.firstName, personLike?.middleName, personLike?.lastName]
+        .map((x) => String(x ?? "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+
+    return composed
 }
 
 function buildTicketWhereToGo(params: {
@@ -372,7 +384,12 @@ export type JoinQueueResult = {
     staffAssigned?: string
     staffAssignedId?: string
 
+    // ✅ participant full name (Student / Alumni-Visitor / Guest)
+    participantFullName: string
+
+    // ✅ now also used as a friendly display name
     accountName: string
+
     nameOfPersonInCharge?: string
 
     participantType?: QueueJoinParticipantType
@@ -427,7 +444,11 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     const anyP = participant as any
 
     const participantType = ((anyP.type || anyP.role || "GUEST") as string).toUpperCase() as QueueJoinParticipantType
-    const accountName = buildAccountName(participant)
+
+    // ✅ Display full name for Student / Alumni-Visitor / Guest
+    const participantFullName = buildPersonFullName(anyP)
+    const accountName = participantFullName || buildPersonFullName(participant) || "Participant"
+
     const dateKey = getDateKeyManila()
 
     const settings = await SettingModel.findOne({})
@@ -537,6 +558,7 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         meta: {
             participantId: participant._id.toString(),
             participantType,
+            participantFullName,
             accountName,
             departmentId: selectedDepartmentId.toString(),
             transactionKeys: input.transactionKeys,
@@ -607,7 +629,9 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         staffAssigned: staffAssignedName,
         staffAssignedId,
 
+        participantFullName,
         accountName,
+
         nameOfPersonInCharge: staffAssignedName,
 
         participantType,
@@ -669,9 +693,11 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
               number: windowNumber,
           }).select("name number enabled")
 
-    const selection = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id }).select(
-        "participantType transactionLabels"
-    )
+    const selection = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id })
+        .populate({ path: "participant", select: "name firstName middleName lastName" })
+        .select("participant participantType transactionLabels")
+
+    const participantFullName = buildPersonFullName((selection as any)?.participant)
 
     const guidance = buildTicketWhereToGo({
         status: ticket.status,
@@ -693,6 +719,9 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
         windowNumber,
         status: ticket.status,
         voiceAnnouncement,
+
+        // ✅ participant full name (Student / Alumni-Visitor / Guest)
+        participantFullName,
 
         // ✅ extra details (safe, additive)
         departmentName: department?.name,
