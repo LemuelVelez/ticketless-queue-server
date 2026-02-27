@@ -9,6 +9,7 @@ import { TicketModel } from "../models/Ticket"
 import { UserModel } from "../models/User"
 
 import {
+    buildVoiceAnnouncement,
     getDateKeyManila,
     getDepartmentWindowAssignments,
     TicketTransactionSelectionModel,
@@ -83,6 +84,139 @@ function participantTypeLabel(value: ParticipantType | null | undefined): string
     if (value === "ALUMNI_VISITOR") return "Alumni / Visitor"
     if (value === "GUEST") return "Guest"
     return null
+}
+
+type TicketGuidanceDetails = {
+    whereToGo: string
+    participantTypeLabel: string
+    departmentName?: string | null
+    departmentCode?: string | null
+    transactionManager?: string | null
+    windowNumber?: number | null
+    windowName?: string | null
+    staffName?: string | null
+    servedDepartments: string[]
+    transactionLabels: string[]
+}
+
+function titleCaseWords(input?: string) {
+    const s = String(input || "").trim()
+    if (!s) return ""
+    return s
+        .toLowerCase()
+        .split(/[\s_]+/g)
+        .filter(Boolean)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ")
+}
+
+function joinList(items: string[], max = 6) {
+    const clean = (items || []).map((x) => String(x || "").trim()).filter(Boolean)
+    if (!clean.length) return ""
+    if (clean.length <= max) return clean.join(", ")
+    return `${clean.slice(0, max).join(", ")} +${clean.length - max} more`
+}
+
+function buildTicketWhereToGo(params: {
+    status: string
+    queueNumber: number
+    participantType?: ParticipantType | null
+    departmentName?: string | null
+    departmentCode?: string | null
+    transactionManager?: string | null
+    windowNumber?: number | null
+    windowName?: string | null
+    staffName?: string | null
+    servedDepartments?: string[]
+    transactionLabels?: string[]
+}): TicketGuidanceDetails {
+    const pLabel = participantTypeLabel(params.participantType || null) || "Participant"
+
+    const deptLabel = params.departmentName
+        ? params.departmentCode
+            ? `${params.departmentName} (${params.departmentCode})`
+            : params.departmentName
+        : ""
+
+    const officeLabel = params.transactionManager ? titleCaseWords(params.transactionManager) : ""
+
+    const windowLabel = params.windowName
+        ? params.windowNumber
+            ? `${params.windowName} (Window ${params.windowNumber})`
+            : params.windowName
+        : params.windowNumber
+          ? `Window ${params.windowNumber}`
+          : ""
+
+    const served = joinList(params.servedDepartments || [])
+    const tx = joinList(params.transactionLabels || [])
+
+    const staffLine = params.staffName ? `Staff in charge: ${params.staffName}.` : ""
+    const servedLine = served ? `This window serves: ${served}.` : ""
+    const txLine = tx ? `Transactions: ${tx}.` : ""
+
+    const normalizedStatus = String(params.status || "").toUpperCase()
+    const statusLine =
+        normalizedStatus === "CALLED"
+            ? "Proceed now."
+            : normalizedStatus === "WAITING"
+              ? "When your number is called, proceed."
+              : "Proceed when instructed."
+
+    // If no window is assigned yet, give a clearer instruction.
+    if (!windowLabel) {
+        const where = [
+            `${statusLine}`,
+            "Please check the display monitor for your assigned window.",
+            deptLabel ? `Department: ${deptLabel}.` : "",
+            officeLabel ? `Office: ${officeLabel}.` : "",
+            txLine,
+            staffLine,
+        ]
+            .map((x) => String(x || "").trim())
+            .filter(Boolean)
+            .join(" ")
+
+        return {
+            whereToGo: where,
+            participantTypeLabel: pLabel,
+            departmentName: params.departmentName ?? null,
+            departmentCode: params.departmentCode ?? null,
+            transactionManager: params.transactionManager ?? null,
+            windowNumber: params.windowNumber ?? null,
+            windowName: params.windowName ?? null,
+            staffName: params.staffName ?? null,
+            servedDepartments: params.servedDepartments || [],
+            transactionLabels: params.transactionLabels || [],
+        }
+    }
+
+    const where = [
+        `${statusLine}`,
+        `Go to ${windowLabel}.`,
+        deptLabel ? `Department: ${deptLabel}.` : "",
+        officeLabel ? `Office: ${officeLabel}.` : "",
+        servedLine,
+        txLine,
+        staffLine,
+        `Queue number: ${params.queueNumber}.`,
+    ]
+        .map((x) => String(x || "").trim())
+        .filter(Boolean)
+        .join(" ")
+
+    return {
+        whereToGo: where,
+        participantTypeLabel: pLabel,
+        departmentName: params.departmentName ?? null,
+        departmentCode: params.departmentCode ?? null,
+        transactionManager: params.transactionManager ?? null,
+        windowNumber: params.windowNumber ?? null,
+        windowName: params.windowName ?? null,
+        staffName: params.staffName ?? null,
+        servedDepartments: params.servedDepartments || [],
+        transactionLabels: params.transactionLabels || [],
+    }
 }
 
 function humanizeTransactionKey(value: string) {
@@ -186,10 +320,10 @@ function resolveQueuePurpose(ticket: any): string | null {
             .map((item: any) =>
                 String(
                     item?.label ??
-                    item?.name ??
-                    item?.title ??
-                    item?.transactionLabel ??
-                    "",
+                        item?.name ??
+                        item?.title ??
+                        item?.transactionLabel ??
+                        "",
                 ).trim(),
             )
             .filter(Boolean)
@@ -224,7 +358,9 @@ function resolveQueuePurpose(ticket: any): string | null {
     ]
 
     for (const candidate of keyArrayCandidates) {
-        const keys = extractStringArray(candidate).map((k) => humanizeTransactionKey(k)).filter(Boolean)
+        const keys = extractStringArray(candidate)
+            .map((k) => humanizeTransactionKey(k))
+            .filter(Boolean)
         if (keys.length) return uniqueStringIds(keys).join(" • ")
     }
 
@@ -414,28 +550,28 @@ async function enrichTickets(tickets: any[]) {
 
     const [departmentRows, windowRows, participantRows, transactionSelectionRows] = await Promise.all([
         departmentIds.length
-            ? DepartmentModel.find({ _id: { $in: departmentIds } }).select("_id name code").lean()
+            ? DepartmentModel.find({ _id: { $in: departmentIds } }).select("_id name code transactionManager").lean()
             : Promise.resolve([] as any[]),
         windowIds.length
             ? ServiceWindowModel.find({ _id: { $in: windowIds } }).select("_id name number").lean()
             : Promise.resolve([] as any[]),
         studentIds.length
             ? UserModel.find({
-                $or: [{ studentId: { $in: studentIds } }, { tcNumber: { $in: studentIds } }],
-            })
-                // ✅ include fullName/displayName for compatibility with schemas that use them
-                .select("_id name firstName middleName lastName fullName displayName role type studentId tcNumber")
-                .lean()
+                  $or: [{ studentId: { $in: studentIds } }, { tcNumber: { $in: studentIds } }],
+              })
+                  // ✅ include fullName/displayName for compatibility with schemas that use them
+                  .select("_id name firstName middleName lastName fullName displayName role type studentId tcNumber")
+                  .lean()
             : Promise.resolve([] as any[]),
         ticketIds.length
             ? (TicketTransactionSelectionModel as any)
-                .find({
-                    ticket: { $in: ticketIds.map((id) => asObjectIdOrString(id)) },
-                })
-                .select("ticket participant participantType transactionKeys transactionLabels")
-                // ✅ align with queue.service.ts populate fields so full names resolve reliably
-                .populate({ path: "participant", select: "name firstName middleName lastName fullName displayName" })
-                .lean()
+                  .find({
+                      ticket: { $in: ticketIds.map((id) => asObjectIdOrString(id)) },
+                  })
+                  .select("ticket participant participantType transactionKeys transactionLabels")
+                  // ✅ align with queue.service.ts populate fields so full names resolve reliably
+                  .populate({ path: "participant", select: "name firstName middleName lastName fullName displayName" })
+                  .lean()
             : Promise.resolve([] as any[]),
     ])
 
@@ -454,16 +590,11 @@ async function enrichTickets(tickets: any[]) {
     const participantNameByIdentity = new Map<string, string>()
 
     for (const row of participantRows as any[]) {
-        const normalized =
-            normalizeParticipantType(row?.type) ||
-            normalizeParticipantType(row?.role)
+        const normalized = normalizeParticipantType(row?.type) || normalizeParticipantType(row?.role)
 
         const fullName = buildPersonFullName(row)
 
-        const keys = uniqueStringIds([
-            String(row?.studentId ?? ""),
-            String(row?.tcNumber ?? ""),
-        ])
+        const keys = uniqueStringIds([String(row?.studentId ?? ""), String(row?.tcNumber ?? "")])
 
         for (const key of keys) {
             if (normalized) participantTypeByIdentity.set(key, normalized)
@@ -509,10 +640,7 @@ async function enrichTickets(tickets: any[]) {
             existing.participantFullName = selectionName
         }
 
-        existing.transactionKeys = uniqueStringIds([
-            ...existing.transactionKeys,
-            ...extractStringArray(row?.transactionKeys),
-        ])
+        existing.transactionKeys = uniqueStringIds([...existing.transactionKeys, ...extractStringArray(row?.transactionKeys)])
 
         existing.transactionLabels = uniqueStringIds([
             ...existing.transactionLabels,
@@ -521,6 +649,8 @@ async function enrichTickets(tickets: any[]) {
 
         txSelectionByTicketId.set(tid, existing)
     }
+
+    const assignments = getDepartmentWindowAssignments()
 
     return plainTickets.map((t: any) => {
         const id = normalizeIdString(t?._id)
@@ -550,49 +680,45 @@ async function enrichTickets(tickets: any[]) {
         const explicitParticipantType =
             normalizeParticipantType(
                 t?.participantType ??
-                t?.transactions?.participantType ??
-                t?.meta?.participantType ??
-                t?.participant ??
-                t?.userType ??
-                t?.role,
+                    t?.transactions?.participantType ??
+                    t?.meta?.participantType ??
+                    t?.participant ??
+                    t?.userType ??
+                    t?.role,
             ) || null
 
         const participantType =
-            explicitParticipantType ||
-            txSelection?.participantType ||
-            (studentId ? participantTypeByIdentity.get(studentId) || null : null)
+            explicitParticipantType || txSelection?.participantType || (studentId ? participantTypeByIdentity.get(studentId) || null : null)
 
         const ticketLabelRaw = String(t?.participantLabel ?? "").trim()
-        const ticketLabelCandidate = isLikelyHumanName(ticketLabelRaw, studentId) ? ticketLabelRaw : ""
+        const ticketLabelCandidate = ticketLabelRaw
 
-        // ✅ full name priority:
-        // 1) TicketTransactionSelection participant (Alumni/Guest/Student)
+        // ✅ participant display name priority (align with queue.service.ts):
+        // 1) TicketTransactionSelection participant full name
         // 2) Ticket.participantLabel (now persisted on joinQueue)
         // 3) UserModel name lookup (Student)
-        const participantFullName =
+        const participantDisplay =
             firstNonEmptyText([
                 txSelection?.participantFullName,
                 ticketLabelCandidate,
                 studentId ? participantNameByIdentity.get(studentId) : "",
-            ]) || null
+            ]) || ""
+
+        // Keep a "human" value if available, but never blank-out the display.
+        const participantFullName = participantDisplay.trim() ? participantDisplay.trim() : null
+        const participantFullNameHuman =
+            participantFullName && isLikelyHumanName(participantFullName, studentId) ? participantFullName : null
 
         const transactionsPayload = {
             ...(t?.transactions && typeof t.transactions === "object" ? t.transactions : {}),
             participantType: participantType || null,
             participantTypeLabel: participantTypeLabel(participantType || null),
             transactionKey:
-                firstNonEmptyText([
-                    t?.transactions?.transactionKey,
-                    t?.transactionKey,
-                    mergedTransactionKeys[0],
-                ]) || null,
+                firstNonEmptyText([t?.transactions?.transactionKey, t?.transactionKey, mergedTransactionKeys[0]]) || null,
             transactionKeys: mergedTransactionKeys,
             transactionLabel:
-                firstNonEmptyText([
-                    t?.transactions?.transactionLabel,
-                    t?.transactionLabel,
-                    mergedTransactionLabels[0],
-                ]) || null,
+                firstNonEmptyText([t?.transactions?.transactionLabel, t?.transactionLabel, mergedTransactionLabels[0]]) ||
+                null,
             transactionLabels: mergedTransactionLabels,
             labels: mergedTransactionLabels,
         }
@@ -606,21 +732,68 @@ async function enrichTickets(tickets: any[]) {
             transactions: transactionsPayload,
         })
 
+        const depName = dep?.name ? String(dep.name) : null
+        const depCode = dep?.code ? String(dep.code) : null
+        const transactionManager = dep?.transactionManager ? String(dep.transactionManager) : null
+
+        const computedWindowNumberRaw =
+            typeof t?.windowNumber === "number"
+                ? Number(t.windowNumber)
+                : typeof win?.number === "number"
+                  ? Number(win.number)
+                  : Number((win as any)?.number ?? NaN)
+
+        const windowNumber = Number.isFinite(computedWindowNumberRaw) && computedWindowNumberRaw > 0 ? computedWindowNumberRaw : null
+        const windowName = win?.name ? String(win.name) : null
+
+        const servedDepartments =
+            windowNumber && Array.isArray((assignments as any)[windowNumber])
+                ? uniqueStringIds((assignments as any)[windowNumber].map((x: any) => String(x ?? "").trim().toUpperCase()))
+                : []
+
+        const guidance = buildTicketWhereToGo({
+            status: String(t?.status ?? ""),
+            queueNumber: Number(t?.queueNumber ?? 0),
+            participantType: participantType || null,
+            departmentName: depName,
+            departmentCode: depCode,
+            transactionManager,
+            windowNumber,
+            windowName,
+            staffName: null,
+            servedDepartments,
+            transactionLabels: mergedTransactionLabels,
+        })
+
+        const voiceAnnouncement =
+            String(t?.status ?? "").toUpperCase() === "CALLED" && windowNumber
+                ? buildVoiceAnnouncement(Number(t?.queueNumber ?? 0), windowNumber)
+                : undefined
+
         return {
             ...t,
             id: id || "",
             departmentId,
-            departmentName: dep?.name ? String(dep.name) : null,
-            departmentCode: dep?.code ? String(dep.code) : null,
+            departmentName: depName,
+            departmentCode: depCode,
+            transactionManager,
+
             windowId,
-            windowName: win?.name ? String(win.name) : null,
+            windowName,
+            windowNumber,
 
             participantType: participantType || null,
 
-            // ✅ expose full name directly (best for UI)
+            // ✅ explicit identifier (can be student id OR mobile for alumni/guest)
+            participantIdentifier: studentId || null,
+
+            // ✅ expose display name directly (aligned with queue.service.ts semantics)
             participantFullName,
 
-            // ✅ participantLabel is what most UIs already render -> prefer full name
+            // ✅ useful extra (human-only)
+            participantFullNameHuman,
+
+            // ✅ participantLabel is what most UIs already render -> prefer display
             participantLabel:
                 firstNonEmptyText([
                     participantFullName || "",
@@ -630,6 +803,10 @@ async function enrichTickets(tickets: any[]) {
                     participantTypeLabel(participantType || null),
                 ]) || null,
 
+            // ✅ align with queue.service.ts return naming for UI convenience
+            accountName:
+                firstNonEmptyText([participantFullName || "", t?.participantLabel, studentId]) || null,
+
             transactionKeys: mergedTransactionKeys,
             selectedTransactionKeys: mergedTransactionKeys,
             transactionLabels: mergedTransactionLabels,
@@ -638,18 +815,22 @@ async function enrichTickets(tickets: any[]) {
             transactions: transactionsPayload,
             transactionSelections: txSelection
                 ? [
-                    {
-                        ticket: id || null,
-                        participant: txSelection.participantId,
-                        participantType: txSelection.participantType,
-                        participantFullName: txSelection.participantFullName,
-                        transactionKeys: txSelection.transactionKeys,
-                        transactionLabels: txSelection.transactionLabels,
-                    },
-                ]
+                      {
+                          ticket: id || null,
+                          participant: txSelection.participantId,
+                          participantType: txSelection.participantType,
+                          participantFullName: txSelection.participantFullName,
+                          transactionKeys: txSelection.transactionKeys,
+                          transactionLabels: txSelection.transactionLabels,
+                      },
+                  ]
                 : t?.transactionSelections ?? [],
 
             queuePurpose: queuePurpose || null,
+
+            // ✅ new: service-aligned guidance + voice announcement (safe additive fields)
+            guidance,
+            voiceAnnouncement,
         }
     })
 }
@@ -659,10 +840,8 @@ async function resolveStaffScope(req: Request) {
 
     const staffUser = base.staffId
         ? await UserModel.findById(base.staffId)
-            .select(
-                "_id name email role active assignedDepartment assignedDepartments assignedWindow assignedTransactionManager",
-            )
-            .lean()
+              .select("_id name email role active assignedDepartment assignedDepartments assignedWindow assignedTransactionManager")
+              .lean()
         : null
 
     const fromToken = uniqueStringIds([...base.assignedDepartmentIds, base.departmentId || ""])
@@ -689,8 +868,8 @@ async function resolveStaffScope(req: Request) {
 
     let window = resolvedWindowId
         ? await ServiceWindowModel.findById(resolvedWindowId)
-            .select("_id name number enabled department departmentIds")
-            .lean()
+              .select("_id name number enabled department departmentIds")
+              .lean()
         : null
 
     // Fallback: when a window is not explicitly assigned but there are enabled matching windows,
@@ -700,10 +879,7 @@ async function resolveStaffScope(req: Request) {
 
         const candidateWindows = await ServiceWindowModel.find({
             enabled: true,
-            $or: [
-                { department: { $in: departmentObjectIds } },
-                { departmentIds: { $in: departmentObjectIds } },
-            ],
+            $or: [{ department: { $in: departmentObjectIds } }, { departmentIds: { $in: departmentObjectIds } }],
         })
             .select("_id name number enabled department departmentIds")
             .sort({ number: 1, _id: 1 })
@@ -712,9 +888,7 @@ async function resolveStaffScope(req: Request) {
         const candidates = candidateWindows as any[]
         if (candidates.length) {
             const primaryDeptId = assignedDepartmentIds[0] || ""
-            const matchingPrimary = primaryDeptId
-                ? candidates.filter((w) => extractWindowDepartmentIds(w).includes(primaryDeptId))
-                : []
+            const matchingPrimary = primaryDeptId ? candidates.filter((w) => extractWindowDepartmentIds(w).includes(primaryDeptId)) : []
 
             // Prefer windows that explicitly handle the primary department first.
             const picked = (matchingPrimary.length ? matchingPrimary : candidates)[0]
@@ -736,13 +910,13 @@ async function resolveStaffScope(req: Request) {
     const [assignedDepartmentRows, handledDepartmentRows] = await Promise.all([
         resolvedAssignedDepartmentIds.length
             ? DepartmentModel.find({ _id: { $in: resolvedAssignedDepartmentIds } })
-                .select("_id name code transactionManager enabled")
-                .lean()
+                  .select("_id name code transactionManager enabled")
+                  .lean()
             : Promise.resolve([] as any[]),
         handledDepartmentIds.length
             ? DepartmentModel.find({ _id: { $in: handledDepartmentIds } })
-                .select("_id name code transactionManager enabled")
-                .lean()
+                  .select("_id name code transactionManager enabled")
+                  .lean()
             : Promise.resolve([] as any[]),
     ])
 
@@ -759,13 +933,7 @@ async function resolveStaffScope(req: Request) {
     const assignedDepartments = resolvedAssignedDepartmentIds.map((id) => {
         const row = assignedDepartmentMap.get(id) || handledDepartmentMap.get(id)
         if (!row) {
-            return {
-                id,
-                name: "—",
-                code: null,
-                transactionManager: null,
-                enabled: true,
-            }
+            return { id, name: "—", code: null, transactionManager: null, enabled: true }
         }
         return mapDepartmentPayload(row)
     })
@@ -773,13 +941,7 @@ async function resolveStaffScope(req: Request) {
     const handledDepartments = handledDepartmentIds.map((id) => {
         const row = handledDepartmentMap.get(id) || assignedDepartmentMap.get(id)
         if (!row) {
-            return {
-                id,
-                name: "—",
-                code: null,
-                transactionManager: null,
-                enabled: true,
-            }
+            return { id, name: "—", code: null, transactionManager: null, enabled: true }
         }
         return mapDepartmentPayload(row)
     })
@@ -809,6 +971,10 @@ async function resolveStaffScope(req: Request) {
 }
 
 export const staffController = {
+    windowAssignments: async (_req: Request, res: Response) => {
+        return res.json({ assignments: getDepartmentWindowAssignments() })
+    },
+
     myAssignment: async (req: Request, res: Response) => {
         const scope = await resolveStaffScope(req)
 
@@ -837,9 +1003,7 @@ export const staffController = {
 
         const settings = await SettingModel.findOne({}).lean()
         const upNextCountRaw = Number((settings as any)?.upNextCount ?? 5)
-        const upNextCount = Number.isFinite(upNextCountRaw)
-            ? Math.max(1, Math.min(20, Math.floor(upNextCountRaw)))
-            : 5
+        const upNextCount = Number.isFinite(upNextCountRaw) ? Math.max(1, Math.min(20, Math.floor(upNextCountRaw))) : 5
 
         const nowServingQuery: any = {
             department: { $in: scope.handledDepartmentObjectIds },
@@ -880,10 +1044,7 @@ export const staffController = {
 
         const boardWindowRowsRaw = await ServiceWindowModel.find({
             enabled: true,
-            $or: [
-                { department: { $in: scope.handledDepartmentObjectIds } },
-                { departmentIds: { $in: scope.handledDepartmentObjectIds } },
-            ],
+            $or: [{ department: { $in: scope.handledDepartmentObjectIds } }, { departmentIds: { $in: scope.handledDepartmentObjectIds } }],
         })
             .select("_id name number enabled department departmentIds")
             .sort({ number: 1, name: 1, _id: 1 })
@@ -922,7 +1083,7 @@ export const staffController = {
             .select("_id queueNumber department window windowNumber calledAt studentId participantType participantLabel")
             .lean()
 
-        // ✅ enrich once so we can show participant full names across the board
+        // ✅ enrich once so we can show participant full names across the board (+ guidance/voiceAnnouncement)
         const boardCalledEnriched = await enrichTickets(boardCalledRows as any[])
         const boardCalledById = new Map<string, any>()
         for (const row of boardCalledEnriched as any[]) {
@@ -946,8 +1107,7 @@ export const staffController = {
         const boardWindows = boardWindowRows.map((row: any) => {
             const win = mapWindowPayload(row)
             const windowId = win?.id || ""
-            const windowNumber =
-                typeof win?.number === "number" && Number.isFinite(win.number) ? Number(win.number) : 0
+            const windowNumber = typeof win?.number === "number" && Number.isFinite(win.number) ? Number(win.number) : 0
 
             const windowDepartmentIds = uniqueStringIds([
                 ...(Array.isArray(win?.departmentIds) ? win!.departmentIds : []),
@@ -985,17 +1145,19 @@ export const staffController = {
                 departments,
                 nowServing: called
                     ? {
-                        id: String((called as any)?._id || ""),
-                        queueNumber: Number((called as any)?.queueNumber || 0),
-                        departmentId: calledDepartmentId || null,
-                        departmentName: calledDepartment?.name ? String(calledDepartment.name) : null,
-                        departmentCode: calledDepartment?.code ? String(calledDepartment.code) : null,
-                        participantFullName: (calledEnriched as any)?.participantFullName ?? null,
-                        participantLabel: (calledEnriched as any)?.participantLabel ?? null,
-                        participantType: (calledEnriched as any)?.participantType ?? null,
-                        participantTypeLabel: (calledEnriched as any)?.transactions?.participantTypeLabel ?? null,
-                        calledAt: (called as any)?.calledAt ? new Date((called as any).calledAt).toISOString() : null,
-                    }
+                          id: String((called as any)?._id || ""),
+                          queueNumber: Number((called as any)?.queueNumber || 0),
+                          departmentId: calledDepartmentId || null,
+                          departmentName: calledDepartment?.name ? String(calledDepartment.name) : null,
+                          departmentCode: calledDepartment?.code ? String(calledDepartment.code) : null,
+                          participantFullName: (calledEnriched as any)?.participantFullName ?? null,
+                          participantLabel: (calledEnriched as any)?.participantLabel ?? null,
+                          participantType: (calledEnriched as any)?.participantType ?? null,
+                          participantTypeLabel: (calledEnriched as any)?.transactions?.participantTypeLabel ?? null,
+                          calledAt: (called as any)?.calledAt ? new Date((called as any).calledAt).toISOString() : null,
+                          guidance: (calledEnriched as any)?.guidance ?? null,
+                          voiceAnnouncement: (calledEnriched as any)?.voiceAnnouncement ?? null,
+                      }
                     : null,
             }
         })
@@ -1011,30 +1173,31 @@ export const staffController = {
             window: mapWindowPayload(scope.window),
             nowServing: nowServingEnriched
                 ? {
-                    id: String((nowServingEnriched as any).id || ""),
-                    queueNumber: Number((nowServingEnriched as any).queueNumber || 0),
-                    departmentId: (nowServingEnriched as any).departmentId || null,
-                    departmentName: (nowServingEnriched as any).departmentName || null,
-                    departmentCode: (nowServingEnriched as any).departmentCode || null,
-                    windowId: (nowServingEnriched as any).windowId || null,
-                    windowName:
-                        (nowServingEnriched as any).windowName ||
-                        (scope.window ? String((scope.window as any).name || "") : null) ||
-                        null,
-                    windowNumber:
-                        typeof (nowServingEnriched as any).windowNumber === "number"
-                            ? Number((nowServingEnriched as any).windowNumber)
-                            : typeof scope.windowNumber === "number"
+                      id: String((nowServingEnriched as any).id || ""),
+                      queueNumber: Number((nowServingEnriched as any).queueNumber || 0),
+                      departmentId: (nowServingEnriched as any).departmentId || null,
+                      departmentName: (nowServingEnriched as any).departmentName || null,
+                      departmentCode: (nowServingEnriched as any).departmentCode || null,
+                      transactionManager: (nowServingEnriched as any).transactionManager || null,
+                      windowId: (nowServingEnriched as any).windowId || null,
+                      windowName:
+                          (nowServingEnriched as any).windowName ||
+                          (scope.window ? String((scope.window as any).name || "") : null) ||
+                          null,
+                      windowNumber:
+                          typeof (nowServingEnriched as any).windowNumber === "number"
+                              ? Number((nowServingEnriched as any).windowNumber)
+                              : typeof scope.windowNumber === "number"
                                 ? scope.windowNumber
                                 : null,
-                    participantFullName: (nowServingEnriched as any).participantFullName ?? null,
-                    participantLabel: (nowServingEnriched as any).participantLabel ?? null,
-                    participantType: (nowServingEnriched as any).participantType ?? null,
-                    participantTypeLabel: (nowServingEnriched as any)?.transactions?.participantTypeLabel ?? null,
-                    calledAt: (nowServingEnriched as any).calledAt
-                        ? new Date((nowServingEnriched as any).calledAt).toISOString()
-                        : null,
-                }
+                      participantFullName: (nowServingEnriched as any).participantFullName ?? null,
+                      participantLabel: (nowServingEnriched as any).participantLabel ?? null,
+                      participantType: (nowServingEnriched as any).participantType ?? null,
+                      participantTypeLabel: (nowServingEnriched as any)?.transactions?.participantTypeLabel ?? null,
+                      calledAt: (nowServingEnriched as any).calledAt ? new Date((nowServingEnriched as any).calledAt).toISOString() : null,
+                      guidance: (nowServingEnriched as any)?.guidance ?? null,
+                      voiceAnnouncement: (nowServingEnriched as any)?.voiceAnnouncement ?? null,
+                  }
                 : null,
             upNext: upNextEnriched.map((row: any) => ({
                 id: String(row.id || row._id),
@@ -1042,10 +1205,12 @@ export const staffController = {
                 departmentId: row.departmentId || null,
                 departmentName: row.departmentName || null,
                 departmentCode: row.departmentCode || null,
+                transactionManager: row.transactionManager || null,
                 participantFullName: row.participantFullName ?? null,
                 participantLabel: row.participantLabel ?? null,
                 participantType: row.participantType ?? null,
                 participantTypeLabel: row?.transactions?.participantTypeLabel ?? null,
+                guidance: row?.guidance ?? null,
             })),
             board: {
                 transactionManager: scope.assignedTransactionManager || null,
@@ -1381,12 +1546,7 @@ export const staffController = {
 
         const waitMsExpr = {
             $cond: [
-                {
-                    $and: [
-                        { $ne: ["$calledAt", null] },
-                        { $ne: ["$waitingSince", null] },
-                    ],
-                },
+                { $and: [{ $ne: ["$calledAt", null] }, { $ne: ["$waitingSince", null] }] },
                 { $subtract: ["$calledAt", "$waitingSince"] },
                 null,
             ],
@@ -1394,12 +1554,7 @@ export const staffController = {
 
         const serviceMsExpr = {
             $cond: [
-                {
-                    $and: [
-                        { $ne: ["$servedAt", null] },
-                        { $ne: ["$calledAt", null] },
-                    ],
-                },
+                { $and: [{ $ne: ["$servedAt", null] }, { $ne: ["$calledAt", null] }] },
                 { $subtract: ["$servedAt", "$calledAt"] },
                 null,
             ],
@@ -1415,20 +1570,8 @@ export const staffController = {
             {
                 $facet: {
                     total: [{ $count: "count" }],
-                    byStatus: [
-                        { $group: { _id: "$status", count: { $sum: 1 } } },
-                        { $sort: { _id: 1 } },
-                    ],
-                    timings: [
-                        { $project: { waitMs: waitMsExpr, serviceMs: serviceMsExpr } },
-                        {
-                            $group: {
-                                _id: null,
-                                avgWaitMs: { $avg: "$waitMs" },
-                                avgServiceMs: { $avg: "$serviceMs" },
-                            },
-                        },
-                    ],
+                    byStatus: [{ $group: { _id: "$status", count: { $sum: 1 } } }, { $sort: { _id: 1 } }],
+                    timings: [{ $project: { waitMs: waitMsExpr, serviceMs: serviceMsExpr } }, { $group: { _id: null, avgWaitMs: { $avg: "$waitMs" }, avgServiceMs: { $avg: "$serviceMs" } } }],
                     byDepartment: [
                         {
                             $group: {
@@ -1443,14 +1586,7 @@ export const staffController = {
                                 avgServiceMs: { $avg: serviceMsExpr },
                             },
                         },
-                        {
-                            $lookup: {
-                                from: "departments",
-                                localField: "_id",
-                                foreignField: "_id",
-                                as: "department",
-                            },
-                        },
+                        { $lookup: { from: "departments", localField: "_id", foreignField: "_id", as: "department" } },
                         { $unwind: { path: "$department", preserveNullAndEmptyArrays: true } },
                         {
                             $project: {
@@ -1476,13 +1612,7 @@ export const staffController = {
         const total = agg?.total?.[0]?.count ?? 0
 
         const byStatusArr: Array<{ _id: string; count: number }> = agg?.byStatus ?? []
-        const byStatus: Record<string, number> = {
-            WAITING: 0,
-            CALLED: 0,
-            HOLD: 0,
-            OUT: 0,
-            SERVED: 0,
-        }
+        const byStatus: Record<string, number> = { WAITING: 0, CALLED: 0, HOLD: 0, OUT: 0, SERVED: 0 }
         for (const row of byStatusArr) byStatus[row._id] = row.count
 
         const timingRow = agg?.timings?.[0] ?? null
@@ -1505,12 +1635,7 @@ export const staffController = {
 
         return res.json({
             range: { from, to },
-            totals: {
-                total,
-                byStatus,
-                avgWaitMs,
-                avgServiceMs,
-            },
+            totals: { total, byStatus, avgWaitMs, avgServiceMs },
             departments,
             context: {
                 window: mapWindowPayload(scope.window),
@@ -1539,12 +1664,7 @@ export const staffController = {
 
         const rows = await TicketModel.aggregate([
             { $match: match },
-            {
-                $group: {
-                    _id: { dateKey: "$dateKey", status: "$status" },
-                    count: { $sum: 1 },
-                },
-            },
+            { $group: { _id: { dateKey: "$dateKey", status: "$status" }, count: { $sum: 1 } } },
             { $sort: { "_id.dateKey": 1 } },
         ]).exec()
 
@@ -1558,15 +1678,7 @@ export const staffController = {
             if (!dateKey) continue
 
             if (!byDate.has(dateKey)) {
-                byDate.set(dateKey, {
-                    dateKey,
-                    total: 0,
-                    waiting: 0,
-                    called: 0,
-                    hold: 0,
-                    out: 0,
-                    served: 0,
-                })
+                byDate.set(dateKey, { dateKey, total: 0, waiting: 0, called: 0, hold: 0, out: 0, served: 0 })
             }
 
             const obj = byDate.get(dateKey)

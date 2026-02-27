@@ -30,6 +30,9 @@ function normalizeSenderName(raw: unknown) {
 // Assignment
 router.get("/me/assignment", staffController.myAssignment)
 
+// ✅ Department-to-window assignment map (aligns with queue.service.ts routing behavior)
+router.get("/queue/window-assignments", staffController.windowAssignments)
+
 // ✅ Staff display snapshot (backend-integrated source for presenter/monitor UI)
 router.get("/display/snapshot", staffController.displaySnapshot)
 
@@ -100,12 +103,7 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
         // Sendername: prefer payload.senderName then env
         const senderFromPayload = normalizeSenderName(payload?.senderName)
         const senderFromEnv = normalizeSenderName(
-            readEnvKey(
-                "SEMAPHORE_SENDERNAME",
-                "SEMAPHORE_SENDER",
-                "semaphore_sendername",
-                "semaphore_sender",
-            ),
+            readEnvKey("SEMAPHORE_SENDERNAME", "SEMAPHORE_SENDER", "semaphore_sendername", "semaphore_sender"),
         )
         const sendername = senderFromPayload || senderFromEnv
 
@@ -122,9 +120,7 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
         }
 
         // If UI doesn't send message, still allow but make it obvious
-        const finalMessage =
-            message ||
-            `Queue Update: You are being called now. Please proceed to your assigned window.`
+        const finalMessage = message || `Queue Update: You are being called now. Please proceed to your assigned window.`
 
         const actorId = String((req as any)?.user?.id ?? "").trim() || undefined
 
