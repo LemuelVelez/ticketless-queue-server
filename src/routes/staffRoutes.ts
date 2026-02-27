@@ -23,6 +23,13 @@ router.get("/queue/hold", staffController.listHold)
 router.get("/queue/out", staffController.listOut)
 router.get("/queue/history", staffController.listHistory)
 
+// ✅ Explicit “full” aliases (kept consistent with snapshot-full/state-full)
+router.get("/queue/waiting-full", staffController.listWaiting)
+router.get("/queue/hold-full", staffController.listHold)
+router.get("/queue/out-full", staffController.listOut)
+router.get("/queue/history-full", staffController.listHistory)
+router.get("/queue/current-called-full", staffController.currentCalledForWindow)
+
 /**
  * ✅ CENTRALIZED REAL-TIME QUEUE (Critical Foundation)
  * One unified queue state shared across all staff/windows:
