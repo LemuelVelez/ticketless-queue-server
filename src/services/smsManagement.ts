@@ -110,6 +110,11 @@ export type SendSmsToQueuedUserResult =
           provider: "semaphore"
           reliability: SmsReliabilityInfo
           providerResponse: SemaphoreMessageResponse[]
+          /**
+           * Present when the provider request failed but we intentionally did NOT throw,
+           * so API routes won't return HTTP 500.
+           */
+          error?: string
       }
 
 export type TicketStatusSmsResult = SendSmsToQueuedUserResult & {
@@ -160,6 +165,18 @@ function isAdvanceNoticeGloballyEnabled() {
         process.env.queue_sms_advance_notice_enabled || process.env.QUEUE_SMS_ADVANCE_NOTICE_ENABLED,
         false
     )
+}
+
+function sleep(ms: number) {
+    return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function isRetryableHttpStatus(status?: number) {
+    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+}
+
+function clamp(n: number, min: number, max: number) {
+    return Math.max(min, Math.min(max, n))
 }
 
 /**
@@ -248,9 +265,16 @@ function mapDeliveryStatus(status?: SemaphoreMessageStatus): SmsDeliveryStatus {
     return "UNKNOWN"
 }
 
+type PostSemaphoreOptions = {
+    maxAttempts?: number
+    initialBackoffMs?: number
+    maxBackoffMs?: number
+}
+
 async function postSemaphore(
     url: string,
-    payload: Record<string, string>
+    payload: Record<string, string>,
+    options: PostSemaphoreOptions = {}
 ): Promise<SemaphoreMessageResponse[]> {
     if (typeof (globalThis as any).fetch !== "function") {
         throw new Error(
@@ -258,37 +282,78 @@ async function postSemaphore(
         )
     }
 
-    const body = new URLSearchParams(payload)
+    const maxAttempts = clamp(Number(options.maxAttempts ?? 3), 1, 5)
+    const initialBackoffMs = clamp(Number(options.initialBackoffMs ?? 600), 100, 10_000)
+    const maxBackoffMs = clamp(Number(options.maxBackoffMs ?? 8000), 1000, 60_000)
 
-    const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body,
-    })
+    let lastErr: any
 
-    const text = await res.text()
-    let json: any
-    try {
-        json = text ? JSON.parse(text) : null
-    } catch {
-        json = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const body = new URLSearchParams(payload)
+
+            const res = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                body,
+            })
+
+            const text = await res.text()
+            let json: any
+            try {
+                json = text ? JSON.parse(text) : null
+            } catch {
+                json = null
+            }
+
+            if (!res.ok) {
+                const retryAfter = res.headers.get("retry-after")
+                const msg =
+                    (json && (json.message || json.error)) ||
+                    `Semaphore request failed (${res.status}).${
+                        retryAfter ? ` Retry-After: ${retryAfter}s.` : ""
+                    }`
+                const err = new Error(msg)
+                ;(err as any).status = res.status
+                ;(err as any).data = json ?? text
+                ;(err as any).retryAfter = retryAfter ? Number(retryAfter) : undefined
+                ;(err as any).attempt = attempt
+                ;(err as any).maxAttempts = maxAttempts
+                throw err
+            }
+
+            // Semaphore commonly returns an array of message objects on success.
+            if (Array.isArray(json)) return json as SemaphoreMessageResponse[]
+
+            // Some variants/endpoints may return a single object; normalize it to an array.
+            if (json && typeof json === "object" && (json.message_id || json.status || json.recipient)) {
+                return [json as SemaphoreMessageResponse]
+            }
+
+            return []
+        } catch (e: any) {
+            lastErr = e
+
+            const status = Number(e?.status || 0) || undefined
+            const retryAfterSec =
+                typeof e?.retryAfter === "number" && Number.isFinite(e.retryAfter) ? e.retryAfter : undefined
+
+            const shouldRetry = attempt < maxAttempts && (status ? isRetryableHttpStatus(status) : false)
+
+            if (!shouldRetry) throw e
+
+            const backoff = Math.min(
+                maxBackoffMs,
+                retryAfterSec !== undefined
+                    ? clamp(retryAfterSec * 1000, 500, maxBackoffMs)
+                    : initialBackoffMs * Math.pow(2, attempt - 1)
+            )
+
+            await sleep(backoff)
+        }
     }
 
-    if (!res.ok) {
-        const retryAfter = res.headers.get("retry-after")
-        const msg =
-            (json && (json.message || json.error)) ||
-            `Semaphore request failed (${res.status}).${retryAfter ? ` Retry-After: ${retryAfter}s.` : ""}`
-        const err = new Error(msg)
-        ;(err as any).status = res.status
-        ;(err as any).data = json ?? text
-        ;(err as any).retryAfter = retryAfter ? Number(retryAfter) : undefined
-        throw err
-    }
-
-    // Semaphore returns an array of message objects on success
-    if (!Array.isArray(json)) return []
-    return json as SemaphoreMessageResponse[]
+    throw lastErr || new Error("Semaphore request failed.")
 }
 
 /**
@@ -364,7 +429,8 @@ export async function sendSms(
         const payload: Record<string, string> = {
             apikey: apiKey,
             number: chunk.join(","),
-            message: String(message),
+            // normalize line breaks (safer for providers)
+            message: String(message).replace(/\r\n/g, "\n"),
         }
 
         if (senderName) payload.sendername = senderName
@@ -374,7 +440,12 @@ export async function sendSms(
 
         let r: SemaphoreMessageResponse[] = []
         try {
-            r = await postSemaphore(url, payload)
+            r = await postSemaphore(url, payload, {
+                // handle transient Semaphore 5xx/rate issues without crashing API routes immediately
+                maxAttempts: 3,
+                initialBackoffMs: 600,
+                maxBackoffMs: 8000,
+            })
         } catch (e: any) {
             await maybeAuditLog({
                 actor: opts.actor,
@@ -391,6 +462,8 @@ export async function sendSms(
                     errorMessage: String(e?.message || "Unknown error"),
                     httpStatus: e?.status ?? null,
                     retryAfter: e?.retryAfter ?? null,
+                    attempt: e?.attempt ?? null,
+                    maxAttempts: e?.maxAttempts ?? null,
                     providerErrorData: e?.data ?? null,
                     ...opts.meta,
                 },
@@ -437,7 +510,10 @@ export async function sendSms(
                 supportedNetworkSummary: supportedSummary,
                 responsePreview,
                 ...(unsupportedPreview.length
-                    ? { unsupportedNetworkPreview: unsupportedPreview, unsupportedNetworkCount: supportedSummary.unsupported }
+                    ? {
+                          unsupportedNetworkPreview: unsupportedPreview,
+                          unsupportedNetworkCount: supportedSummary.unsupported,
+                      }
                     : {}),
                 ...opts.meta,
             },
@@ -560,11 +636,25 @@ function buildReliabilityInfoFromProvider(
     }
 }
 
+function buildFailedReliabilityInfo(): SmsReliabilityInfo {
+    return {
+        deliveryStatus: "FAILED",
+        providerNetwork: undefined,
+        supportedNetwork: null,
+        providerMessageId: undefined,
+        rawStatus: undefined,
+    }
+}
+
 /**
  * Staff helper: Send a custom message to the currently queued participant (by ticketId).
  * - Uses ticket.phone first, else resolves via UserModel
  * - Respects smsUpdates=false when user can be resolved (default)
  * - Adds reliability info: status/network/support
+ *
+ * IMPORTANT CHANGE:
+ * - If Semaphore/provider request fails, we return a structured result with `error`
+ *   instead of throwing, so API routes won't respond with HTTP 500.
  */
 export async function sendSmsToQueuedUser(params: {
     ticketId: string
@@ -609,33 +699,65 @@ export async function sendSmsToQueuedUser(params: {
         : DEFAULT_SUPPORTED_NETWORK_TOKENS
     ).map((x) => String(x).toUpperCase().trim())
 
-    const resp = await sendSms(resolved.number, message, options)
-    const reliability = buildReliabilityInfoFromProvider(resp, supportedTokens)
+    try {
+        const resp = await sendSms(resolved.number, message, options)
+        const reliability = buildReliabilityInfoFromProvider(resp, supportedTokens)
 
-    // If unsupported/unknown, create a focused audit entry (helps UI filters)
-    if (reliability.supportedNetwork === false || reliability.supportedNetwork === null) {
+        // If unsupported/unknown, create a focused audit entry (helps UI filters)
+        if (reliability.supportedNetwork === false || reliability.supportedNetwork === null) {
+            await maybeAuditLog({
+                actor: options.actor,
+                action: "SMS_UNSUPPORTED_OR_UNKNOWN_NETWORK",
+                entityType: "TICKET",
+                entityId: ticketId,
+                meta: {
+                    provider: "semaphore",
+                    providerNetwork: reliability.providerNetwork ?? null,
+                    supportedNetwork: reliability.supportedNetwork,
+                    deliveryStatus: reliability.deliveryStatus,
+                    providerMessageId: reliability.providerMessageId ?? null,
+                },
+            })
+        }
+
+        return {
+            skipped: false,
+            sentTo: resolved.number,
+            provider: "semaphore",
+            reliability,
+            providerResponse: resp,
+        } as const
+    } catch (e: any) {
+        const errorMessage = String(e?.message || "SMS provider request failed")
+
         await maybeAuditLog({
             actor: options.actor,
-            action: "SMS_UNSUPPORTED_OR_UNKNOWN_NETWORK",
+            action: "SMS_PROVIDER_REQUEST_FAILED",
             entityType: "TICKET",
             entityId: ticketId,
             meta: {
                 provider: "semaphore",
-                providerNetwork: reliability.providerNetwork ?? null,
-                supportedNetwork: reliability.supportedNetwork,
-                deliveryStatus: reliability.deliveryStatus,
-                providerMessageId: reliability.providerMessageId ?? null,
+                sentToMasked: maskMobileNumber(resolved.number),
+                errorMessage,
+                httpStatus: e?.status ?? null,
+                retryAfter: e?.retryAfter ?? null,
+                attempt: e?.attempt ?? null,
+                maxAttempts: e?.maxAttempts ?? null,
+                providerErrorData: e?.data ?? null,
+                ...(options.meta || {}),
             },
         })
-    }
 
-    return {
-        skipped: false,
-        sentTo: resolved.number,
-        provider: "semaphore",
-        reliability,
-        providerResponse: resp,
-    } as const
+        // Return (do NOT throw) -> avoids API 500 and lets UI show a friendly toast.
+        return {
+            skipped: false,
+            sentTo: resolved.number,
+            provider: "semaphore",
+            reliability: buildFailedReliabilityInfo(),
+            providerResponse: [],
+            error: errorMessage,
+        } as const
+    }
 }
 
 /**
@@ -681,7 +803,7 @@ export async function sendTicketStatusSms(params: {
         windowNumber: windowNo,
     })
 
-    // Send to CURRENT ticket
+    // Send to CURRENT ticket (never throws for provider failures now)
     const currentResult = await sendSmsToQueuedUser({
         ticketId,
         message: msg,
@@ -690,7 +812,12 @@ export async function sendTicketStatusSms(params: {
 
     // Optional: Advance notice to NEXT ticket (only meaningful when calling current)
     const advanceEnabled = isAdvanceNoticeGloballyEnabled()
-    const shouldAttemptAdvance = advanceEnabled && status === "CALLED"
+
+    // If current was skipped (opt-out) OR provider failed, do NOT attempt advance notice.
+    const currentProviderFailed =
+        !currentResult.skipped && typeof (currentResult as any).error === "string" && !!(currentResult as any).error
+
+    const shouldAttemptAdvance = advanceEnabled && status === "CALLED" && !currentResult.skipped && !currentProviderFailed
 
     let advanceNotice:
         | {
@@ -767,8 +894,11 @@ export async function sendTicketStatusSms(params: {
                 relatedCurrentQueueNumber: ticket.queueNumber,
                 nextQueueNumber: nextTicket.queueNumber,
                 nextTicketId: String((nextTicket as any)._id),
-                // keep it light: the detailed provider logging is already inside sendSms()
-                outcome: (nextResult as any)?.skipped ? "skipped" : "sent",
+                outcome: (nextResult as any)?.skipped
+                    ? "skipped"
+                    : (nextResult as any)?.error
+                      ? "failed"
+                      : "sent",
             },
         })
 
