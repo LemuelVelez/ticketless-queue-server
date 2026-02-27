@@ -11,19 +11,91 @@ import { UserModel } from "../models/User"
  * - POST https://api.semaphore.co/api/v4/messages
  * - Params: apikey, number (comma-separated), message, sendername (optional)
  * - Note: Messages that START with the word "TEST" are silently ignored by Semaphore.
- * - Limits: /messages is rate-limited; /priority and /otp are not. (See Semaphore docs.)
+ * - Limits: /messages is rate-limited (120/min); /priority and /otp are not.
+ *
+ * Related API (from docs):
+ * - GET  https://api.semaphore.co/api/v4/messages            (retrieve messages)
+ * - GET  https://api.semaphore.co/api/v4/messages/{id}       (retrieve single message)
+ * - GET  https://api.semaphore.co/api/v4/account             (account info; rate-limited)
  *
  * Response includes:
  * - network: recipient phone number's network
  * - status: Queued | Pending | Sent | Failed | Refunded
  */
-const SEMAPHORE_MESSAGES_URL = "https://api.semaphore.co/api/v4/messages"
-const SEMAPHORE_PRIORITY_URL = "https://api.semaphore.co/api/v4/priority"
-const SEMAPHORE_OTP_URL = "https://api.semaphore.co/api/v4/otp"
+
+// We keep BOTH hosts because Semaphore docs/examples sometimes show semaphore.co and api.semaphore.co.
+// Primary should be api.semaphore.co per docs.
+const DEFAULT_SEMAPHORE_BASE_URLS = ["https://api.semaphore.co", "https://semaphore.co"]
+const SEMAPHORE_API_V4_PREFIX = "/api/v4"
+
+const SEMAPHORE_PATH_MESSAGES = "/messages"
+const SEMAPHORE_PATH_PRIORITY = "/priority"
+const SEMAPHORE_PATH_OTP = "/otp"
+const SEMAPHORE_PATH_ACCOUNT = "/account"
 
 // Semaphore says it supports all PH mobile networks (Globe, Smart, Sun, Dito).
 // Network values returned by API can vary in casing/format, so we match loosely.
 const DEFAULT_SUPPORTED_NETWORK_TOKENS = ["GLOBE", "SMART", "SUN", "DITO", "TM", "TNT"]
+
+/**
+ * Hardening goals (prevents 502 Bad Gateway in proxy/dev-server setups):
+ * 1) Never allow this service to hang indefinitely:
+ *    - Add request timeouts for Semaphore fetch()
+ *    - Add timeouts for audit-log writes (Mongo can hang when unhealthy)
+ * 2) Avoid throwing from common, user-facing flows:
+ *    - sendSmsToQueuedUser() and sendTicketStatusSms() return structured errors instead of throwing
+ *      so controllers/routes won't accidentally crash or leave unhandled promise rejections.
+ */
+
+function clamp(n: number, min: number, max: number) {
+    return Math.max(min, Math.min(max, n))
+}
+
+function parseIntHeader(v: string | null) {
+    if (!v) return undefined
+    const n = Number(v)
+    return Number.isFinite(n) ? n : undefined
+}
+
+function getSemaphoreRequestTimeoutMs() {
+    const raw =
+        process.env.semaphore_request_timeout_ms ||
+        process.env.SEMAPHORE_REQUEST_TIMEOUT_MS ||
+        process.env.SEMAPHORE_TIMEOUT_MS
+    // Default: 15s (fast fail so reverse proxies/dev proxies don’t timeout into 502)
+    return clamp(Number(raw ?? 15_000), 3000, 60_000)
+}
+
+function getAuditLogTimeoutMs() {
+    const raw = process.env.audit_log_timeout_ms || process.env.AUDIT_LOG_TIMEOUT_MS
+    // Default: 800ms (audit logs must never block the API route)
+    return clamp(Number(raw ?? 800), 100, 5000)
+}
+
+function getDbQueryTimeoutMs() {
+    const raw = process.env.mongo_query_timeout_ms || process.env.MONGO_QUERY_TIMEOUT_MS
+    // Default: 5s (avoid indefinite hangs on unhealthy Mongo)
+    return clamp(Number(raw ?? 5000), 1000, 30_000)
+}
+
+function sleep(ms: number) {
+    return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string) {
+    let t: any
+    const timeout = new Promise<never>((_, reject) => {
+        t = setTimeout(() => {
+            const err: any = new Error(message)
+            err.code = "ETIMEDOUT"
+            reject(err)
+        }, ms)
+    })
+
+    return Promise.race([promise, timeout]).finally(() => {
+        if (t) clearTimeout(t)
+    }) as Promise<T>
+}
 
 export type ActorRef = {
     id?: string | Types.ObjectId
@@ -48,6 +120,12 @@ export type SemaphoreMessageResponse = {
     created_at: string
     updated_at: string
     code?: number | string
+}
+
+export type SemaphoreRateLimitInfo = {
+    limit?: number
+    remaining?: number
+    retryAfter?: number
 }
 
 export type SendSmsOptions = {
@@ -102,7 +180,14 @@ export type SmsReliabilityInfo = {
 export type SendSmsToQueuedUserResult =
     | {
           skipped: true
-          reason: "opted_out"
+          reason:
+              | "opted_out"
+              | "ticket_not_found"
+              | "no_recipient"
+              | "invalid_number"
+              | "message_not_allowed"
+              | "internal_error"
+          error?: string
       }
     | {
           skipped: false
@@ -111,8 +196,8 @@ export type SendSmsToQueuedUserResult =
           reliability: SmsReliabilityInfo
           providerResponse: SemaphoreMessageResponse[]
           /**
-           * Present when the provider request failed but we intentionally did NOT throw,
-           * so API routes won't return HTTP 500.
+           * Present when the provider request failed (or other non-fatal issue) but we intentionally did NOT throw,
+           * so API routes won't crash or time out into HTTP 502.
            */
           error?: string
       }
@@ -134,7 +219,8 @@ export type TicketStatusSmsResult = SendSmsToQueuedUserResult & {
  * - semaphore_api_key
  *
  * OPTIONAL ENV:
- * - semaphore_sendername (recommended: starting July 1, 2024 users can no longer send from "Semaphore" sender name)
+ * - semaphore_sendername (recommended: beginning July 1, 2024 users can no longer send from "Semaphore" sender name)
+ * - semaphore_base_url (optional override, e.g. https://api.semaphore.co)
  * - queue_sms_advance_notice_enabled (true/false)  -> global toggle for advance notice SMS
  */
 function getSemaphoreApiKey(): string {
@@ -152,6 +238,34 @@ function getDefaultSenderName(): string | undefined {
     return name || undefined
 }
 
+function getSemaphoreBaseUrls(): string[] {
+    const envBase =
+        (process.env.semaphore_base_url || process.env.SEMAPHORE_BASE_URL || "").trim() || undefined
+
+    const bases = [envBase, ...DEFAULT_SEMAPHORE_BASE_URLS].filter(Boolean) as string[]
+
+    // de-dupe while preserving order
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const b of bases) {
+        const normalized = String(b).trim().replace(/\/+$/, "")
+        if (!normalized) continue
+        if (seen.has(normalized)) continue
+        seen.add(normalized)
+        out.push(normalized)
+    }
+    return out
+}
+
+function buildSemaphoreEndpoint(baseUrl: string, pathAfterV4: string) {
+    const base = String(baseUrl || "").trim().replace(/\/+$/, "")
+    if (!base) return ""
+    // If user provides a URL that already contains /api/v4, don't duplicate it.
+    if (/\/api\/v4$/i.test(base)) return `${base}${pathAfterV4}`
+    if (/\/api$/i.test(base)) return `${base}/v4${pathAfterV4}`
+    return `${base}${SEMAPHORE_API_V4_PREFIX}${pathAfterV4}`
+}
+
 function parseBooleanEnv(value: string | undefined, defaultValue = false) {
     if (!value) return defaultValue
     const v = value.trim().toLowerCase()
@@ -167,16 +281,27 @@ function isAdvanceNoticeGloballyEnabled() {
     )
 }
 
-function sleep(ms: number) {
-    return new Promise<void>((resolve) => setTimeout(resolve, ms))
-}
-
 function isRetryableHttpStatus(status?: number) {
-    return status === 429 || status === 500 || status === 502 || status === 503 || status === 504
+    return (
+        status === 408 ||
+        status === 429 ||
+        status === 500 ||
+        status === 502 ||
+        status === 503 ||
+        status === 504
+    )
 }
 
-function clamp(n: number, min: number, max: number) {
-    return Math.max(min, Math.min(max, n))
+function isRetryableNetworkError(e: any) {
+    const name = String(e?.name || "")
+    const code = String(e?.code || "")
+    const msg = String(e?.message || "")
+    // Abort/timeout or common transient network issues
+    if (name === "AbortError") return true
+    if (code === "ETIMEDOUT" || code === "ECONNRESET" || code === "EAI_AGAIN" || code === "ENOTFOUND")
+        return true
+    if (/network error/i.test(msg)) return true
+    return false
 }
 
 /**
@@ -207,7 +332,7 @@ export function normalizePhilippinesMobileNumber(input: string): string {
         return `63${cleaned}`
     }
 
-    // If it's already digits but unknown format, return as-is (Semaphore may still accept, but best to store PH formats)
+    // If it's already digits but unknown format, return as-is
     return cleaned
 }
 
@@ -269,13 +394,40 @@ type PostSemaphoreOptions = {
     maxAttempts?: number
     initialBackoffMs?: number
     maxBackoffMs?: number
+    timeoutMs?: number
+}
+
+type PostSemaphoreResult = {
+    messages: SemaphoreMessageResponse[]
+    endpointUsed: string
+    rateLimit?: SemaphoreRateLimitInfo
+}
+
+function extractRateLimitInfo(headers: Headers): SemaphoreRateLimitInfo | undefined {
+    const limit = parseIntHeader(headers.get("x-ratelimit-limit"))
+    const remaining = parseIntHeader(headers.get("x-ratelimit-remaining"))
+    const retryAfter = parseIntHeader(headers.get("retry-after"))
+    if (limit === undefined && remaining === undefined && retryAfter === undefined) return undefined
+    return { limit, remaining, retryAfter }
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+    const controller = new AbortController()
+    const t = setTimeout(() => controller.abort(), timeoutMs)
+
+    try {
+        const res = await fetch(url, { ...init, signal: controller.signal })
+        return res
+    } finally {
+        clearTimeout(t)
+    }
 }
 
 async function postSemaphore(
-    url: string,
+    urlCandidates: string[],
     payload: Record<string, string>,
     options: PostSemaphoreOptions = {}
-): Promise<SemaphoreMessageResponse[]> {
+): Promise<PostSemaphoreResult> {
     if (typeof (globalThis as any).fetch !== "function") {
         throw new Error(
             "Global fetch() is not available in this Node runtime. Upgrade to Node 18+ or add a fetch polyfill."
@@ -285,75 +437,239 @@ async function postSemaphore(
     const maxAttempts = clamp(Number(options.maxAttempts ?? 3), 1, 5)
     const initialBackoffMs = clamp(Number(options.initialBackoffMs ?? 600), 100, 10_000)
     const maxBackoffMs = clamp(Number(options.maxBackoffMs ?? 8000), 1000, 60_000)
+    const timeoutMs = clamp(Number(options.timeoutMs ?? getSemaphoreRequestTimeoutMs()), 3000, 60_000)
 
     let lastErr: any
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-            const body = new URLSearchParams(payload)
+        let lastAttemptRateLimit: SemaphoreRateLimitInfo | undefined
 
-            const res = await fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body,
-            })
-
-            const text = await res.text()
-            let json: any
+        for (const url of urlCandidates) {
             try {
-                json = text ? JSON.parse(text) : null
-            } catch {
-                json = null
+                const body = new URLSearchParams(payload)
+
+                const res = await fetchWithTimeout(
+                    url,
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                        body,
+                    },
+                    timeoutMs
+                )
+
+                const rateLimit = extractRateLimitInfo(res.headers)
+                lastAttemptRateLimit = rateLimit || lastAttemptRateLimit
+
+                const text = await res.text()
+                let json: any
+                try {
+                    json = text ? JSON.parse(text) : null
+                } catch {
+                    json = null
+                }
+
+                if (!res.ok) {
+                    const msg =
+                        (json && (json.message || json.error)) ||
+                        `Semaphore request failed (${res.status}).${
+                            rateLimit?.retryAfter ? ` Retry-After: ${rateLimit.retryAfter}s.` : ""
+                        }`
+
+                    const err: any = new Error(msg)
+                    err.status = res.status
+                    err.data = json ?? text
+                    err.retryAfter = rateLimit?.retryAfter
+                    err.rateLimit = rateLimit
+                    err.attempt = attempt
+                    err.maxAttempts = maxAttempts
+                    err.endpoint = url
+                    throw err
+                }
+
+                // Semaphore commonly returns an array of message objects on success.
+                if (Array.isArray(json)) {
+                    return { messages: json as SemaphoreMessageResponse[], endpointUsed: url, rateLimit }
+                }
+
+                // Some variants may return a single object; normalize it to an array.
+                if (json && typeof json === "object" && (json.message_id || json.status || json.recipient)) {
+                    return { messages: [json as SemaphoreMessageResponse], endpointUsed: url, rateLimit }
+                }
+
+                return { messages: [], endpointUsed: url, rateLimit }
+            } catch (e: any) {
+                lastErr = e
+                // If this candidate failed due to network/timeout, try the next candidate in the same attempt.
+                if (isRetryableNetworkError(e)) continue
+                // If it failed due to 404/host mismatch, try next candidate too.
+                if (Number(e?.status) === 404) continue
+                // Otherwise: stop iterating candidates and use retry/backoff if eligible.
+                break
             }
-
-            if (!res.ok) {
-                const retryAfter = res.headers.get("retry-after")
-                const msg =
-                    (json && (json.message || json.error)) ||
-                    `Semaphore request failed (${res.status}).${
-                        retryAfter ? ` Retry-After: ${retryAfter}s.` : ""
-                    }`
-                const err = new Error(msg)
-                ;(err as any).status = res.status
-                ;(err as any).data = json ?? text
-                ;(err as any).retryAfter = retryAfter ? Number(retryAfter) : undefined
-                ;(err as any).attempt = attempt
-                ;(err as any).maxAttempts = maxAttempts
-                throw err
-            }
-
-            // Semaphore commonly returns an array of message objects on success.
-            if (Array.isArray(json)) return json as SemaphoreMessageResponse[]
-
-            // Some variants/endpoints may return a single object; normalize it to an array.
-            if (json && typeof json === "object" && (json.message_id || json.status || json.recipient)) {
-                return [json as SemaphoreMessageResponse]
-            }
-
-            return []
-        } catch (e: any) {
-            lastErr = e
-
-            const status = Number(e?.status || 0) || undefined
-            const retryAfterSec =
-                typeof e?.retryAfter === "number" && Number.isFinite(e.retryAfter) ? e.retryAfter : undefined
-
-            const shouldRetry = attempt < maxAttempts && (status ? isRetryableHttpStatus(status) : false)
-
-            if (!shouldRetry) throw e
-
-            const backoff = Math.min(
-                maxBackoffMs,
-                retryAfterSec !== undefined
-                    ? clamp(retryAfterSec * 1000, 500, maxBackoffMs)
-                    : initialBackoffMs * Math.pow(2, attempt - 1)
-            )
-
-            await sleep(backoff)
         }
+
+        const status = Number(lastErr?.status || 0) || undefined
+        const retryAfterSec =
+            typeof lastErr?.retryAfter === "number" && Number.isFinite(lastErr.retryAfter)
+                ? lastErr.retryAfter
+                : undefined
+
+        const retryable =
+            attempt < maxAttempts &&
+            ((status ? isRetryableHttpStatus(status) : false) || isRetryableNetworkError(lastErr))
+
+        if (!retryable) throw lastErr
+
+        const backoff = Math.min(
+            maxBackoffMs,
+            retryAfterSec !== undefined
+                ? clamp(retryAfterSec * 1000, 500, maxBackoffMs)
+                : initialBackoffMs * Math.pow(2, attempt - 1)
+        )
+
+        await sleep(backoff)
     }
 
     throw lastErr || new Error("Semaphore request failed.")
+}
+
+/**
+ * GET helpers (applies Semaphore docs):
+ * - list messages
+ * - get message by id
+ * - get account details
+ */
+export type ListSemaphoreMessagesParams = {
+    limit?: number
+    page?: number
+    startDate?: string // YYYY-MM-DD
+    endDate?: string // YYYY-MM-DD
+    network?: string // lowercase in docs, but we pass as-is
+    status?: string // lowercase in docs, but we pass as-is
+}
+
+async function getSemaphore(
+    urlCandidates: string[],
+    params: Record<string, string>,
+    options: { maxAttempts?: number; initialBackoffMs?: number; maxBackoffMs?: number; timeoutMs?: number } = {}
+): Promise<{ json: any; endpointUsed: string; rateLimit?: SemaphoreRateLimitInfo }> {
+    if (typeof (globalThis as any).fetch !== "function") {
+        throw new Error(
+            "Global fetch() is not available in this Node runtime. Upgrade to Node 18+ or add a fetch polyfill."
+        )
+    }
+
+    const maxAttempts = clamp(Number(options.maxAttempts ?? 2), 1, 5)
+    const initialBackoffMs = clamp(Number(options.initialBackoffMs ?? 600), 100, 10_000)
+    const maxBackoffMs = clamp(Number(options.maxBackoffMs ?? 8000), 1000, 60_000)
+    const timeoutMs = clamp(Number(options.timeoutMs ?? getSemaphoreRequestTimeoutMs()), 3000, 60_000)
+
+    let lastErr: any
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        for (const urlBase of urlCandidates) {
+            try {
+                const qs = new URLSearchParams(params)
+                const url = `${urlBase}?${qs.toString()}`
+                const res = await fetchWithTimeout(url, { method: "GET" }, timeoutMs)
+                const rateLimit = extractRateLimitInfo(res.headers)
+
+                const text = await res.text()
+                let json: any
+                try {
+                    json = text ? JSON.parse(text) : null
+                } catch {
+                    json = null
+                }
+
+                if (!res.ok) {
+                    const msg =
+                        (json && (json.message || json.error)) ||
+                        `Semaphore request failed (${res.status}).${
+                            rateLimit?.retryAfter ? ` Retry-After: ${rateLimit.retryAfter}s.` : ""
+                        }`
+                    const err: any = new Error(msg)
+                    err.status = res.status
+                    err.data = json ?? text
+                    err.retryAfter = rateLimit?.retryAfter
+                    err.rateLimit = rateLimit
+                    err.attempt = attempt
+                    err.maxAttempts = maxAttempts
+                    err.endpoint = url
+                    throw err
+                }
+
+                return { json, endpointUsed: urlBase, rateLimit }
+            } catch (e: any) {
+                lastErr = e
+                if (isRetryableNetworkError(e)) continue
+                if (Number(e?.status) === 404) continue
+                break
+            }
+        }
+
+        const status = Number(lastErr?.status || 0) || undefined
+        const retryAfterSec =
+            typeof lastErr?.retryAfter === "number" && Number.isFinite(lastErr.retryAfter)
+                ? lastErr.retryAfter
+                : undefined
+
+        const retryable =
+            attempt < maxAttempts &&
+            ((status ? isRetryableHttpStatus(status) : false) || isRetryableNetworkError(lastErr))
+
+        if (!retryable) throw lastErr
+
+        const backoff = Math.min(
+            maxBackoffMs,
+            retryAfterSec !== undefined
+                ? clamp(retryAfterSec * 1000, 500, maxBackoffMs)
+                : initialBackoffMs * Math.pow(2, attempt - 1)
+        )
+
+        await sleep(backoff)
+    }
+
+    throw lastErr || new Error("Semaphore request failed.")
+}
+
+export async function listSemaphoreMessages(params: ListSemaphoreMessagesParams = {}) {
+    const apiKey = getSemaphoreApiKey()
+    const bases = getSemaphoreBaseUrls()
+    const urls = bases.map((b) => buildSemaphoreEndpoint(b, SEMAPHORE_PATH_MESSAGES)).filter(Boolean)
+
+    const q: Record<string, string> = { apikey: apiKey }
+    if (params.limit !== undefined) q.limit = String(clamp(Number(params.limit), 1, 1000))
+    if (params.page !== undefined) q.page = String(Math.max(1, Number(params.page)))
+    if (params.startDate) q.startDate = String(params.startDate)
+    if (params.endDate) q.endDate = String(params.endDate)
+    if (params.network) q.network = String(params.network)
+    if (params.status) q.status = String(params.status)
+
+    const { json } = await getSemaphore(urls, q, { maxAttempts: 2 })
+    return Array.isArray(json) ? (json as SemaphoreMessageResponse[]) : []
+}
+
+export async function getSemaphoreMessageById(id: string | number) {
+    const apiKey = getSemaphoreApiKey()
+    const bases = getSemaphoreBaseUrls()
+    const suffix = `${SEMAPHORE_PATH_MESSAGES}/${encodeURIComponent(String(id))}`
+    const urls = bases.map((b) => buildSemaphoreEndpoint(b, suffix)).filter(Boolean)
+
+    const { json } = await getSemaphore(urls, { apikey: apiKey }, { maxAttempts: 2 })
+    // API returns a single message object
+    if (json && typeof json === "object") return json as SemaphoreMessageResponse
+    return null
+}
+
+export async function getSemaphoreAccount() {
+    const apiKey = getSemaphoreApiKey()
+    const bases = getSemaphoreBaseUrls()
+    const urls = bases.map((b) => buildSemaphoreEndpoint(b, SEMAPHORE_PATH_ACCOUNT)).filter(Boolean)
+
+    const { json } = await getSemaphore(urls, { apikey: apiKey }, { maxAttempts: 2 })
+    return json
 }
 
 /**
@@ -402,7 +718,15 @@ export async function sendSms(
     const chunks: string[][] = []
     for (let i = 0; i < normalized.length; i += 1000) chunks.push(normalized.slice(i, i + 1000))
 
-    const url = opts.otp ? SEMAPHORE_OTP_URL : opts.priority ? SEMAPHORE_PRIORITY_URL : SEMAPHORE_MESSAGES_URL
+    const bases = getSemaphoreBaseUrls()
+    const endpointPath = opts.otp
+        ? SEMAPHORE_PATH_OTP
+        : opts.priority
+          ? SEMAPHORE_PATH_PRIORITY
+          : SEMAPHORE_PATH_MESSAGES
+
+    const urlCandidates = bases.map((b) => buildSemaphoreEndpoint(b, endpointPath)).filter(Boolean)
+
     const supportedTokens = (opts.supportedNetworkTokens?.length
         ? opts.supportedNetworkTokens
         : DEFAULT_SUPPORTED_NETWORK_TOKENS
@@ -438,13 +762,14 @@ export async function sendSms(
             payload.code = String(opts.otpCode)
         }
 
-        let r: SemaphoreMessageResponse[] = []
+        let result: PostSemaphoreResult
         try {
-            r = await postSemaphore(url, payload, {
+            result = await postSemaphore(urlCandidates, payload, {
                 // handle transient Semaphore 5xx/rate issues without crashing API routes immediately
                 maxAttempts: 3,
                 initialBackoffMs: 600,
                 maxBackoffMs: 8000,
+                timeoutMs: getSemaphoreRequestTimeoutMs(),
             })
         } catch (e: any) {
             await maybeAuditLog({
@@ -454,16 +779,18 @@ export async function sendSms(
                 entityId: opts.entityId,
                 meta: {
                     provider: "semaphore",
-                    endpoint: url,
+                    endpointsTried: urlCandidates,
                     recipientsCount: chunk.length,
                     recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber),
                     messageLen: String(message).length,
                     senderName: senderName ?? null,
                     errorMessage: String(e?.message || "Unknown error"),
                     httpStatus: e?.status ?? null,
+                    rateLimit: e?.rateLimit ?? null,
                     retryAfter: e?.retryAfter ?? null,
                     attempt: e?.attempt ?? null,
                     maxAttempts: e?.maxAttempts ?? null,
+                    endpointUsed: e?.endpoint ?? null,
                     providerErrorData: e?.data ?? null,
                     ...opts.meta,
                 },
@@ -471,6 +798,7 @@ export async function sendSms(
             throw e
         }
 
+        const r = result.messages
         responses.push(...r)
 
         const statusSummary = summarizeStatuses(r)
@@ -501,7 +829,9 @@ export async function sendSms(
             entityId: opts.entityId,
             meta: {
                 provider: "semaphore",
-                endpoint: url,
+                endpointUsed: result.endpointUsed,
+                endpointsTried: urlCandidates,
+                rateLimit: result.rateLimit ?? null,
                 recipientsCount: chunk.length,
                 recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber),
                 messageLen: String(message).length,
@@ -528,7 +858,7 @@ export async function sendSms(
                 entityId: opts.entityId,
                 meta: {
                     provider: "semaphore",
-                    endpoint: url,
+                    endpointUsed: result.endpointUsed,
                     supportedNetworkSummary: supportedSummary,
                     unsupportedNetworkPreview: unsupportedPreview,
                 },
@@ -570,18 +900,25 @@ async function maybeAuditLog(args: {
     entityId?: string | Types.ObjectId
     meta?: Record<string, unknown>
 }) {
+    // NEVER let audit logging block SMS routes; Mongo can hang and cause proxy/dev-server 502s.
+    const timeoutMs = getAuditLogTimeoutMs()
+
     try {
-        await AuditLogModel.create({
-            actor: args.actor?.id ? new Types.ObjectId(String(args.actor.id)) : undefined,
-            actorRole: args.actor?.role,
-            action: args.action,
-            entityType: args.entityType,
-            entityId: args.entityId ? new Types.ObjectId(String(args.entityId)) : undefined,
-            meta: args.meta,
-            createdAt: new Date(),
-        })
+        await withTimeout(
+            AuditLogModel.create({
+                actor: args.actor?.id ? new Types.ObjectId(String(args.actor.id)) : undefined,
+                actorRole: args.actor?.role,
+                action: args.action,
+                entityType: args.entityType,
+                entityId: args.entityId ? new Types.ObjectId(String(args.entityId)) : undefined,
+                meta: args.meta,
+                createdAt: new Date(),
+            }),
+            timeoutMs,
+            "Audit log write timed out"
+        )
     } catch {
-        // Don't block SMS sending if audit logging fails
+        // Don't block SMS sending if audit logging fails or times out
     }
 }
 
@@ -590,30 +927,36 @@ async function resolveRecipientFromTicket(
     respectOptOut: boolean
 ): Promise<{ number: string; userId?: string; optedOut?: boolean } | null> {
     // 1) Ticket phone has priority (guest/manual entry)
-    if (ticket.phone) {
-        const num = normalizePhilippinesMobileNumber(ticket.phone)
+    if ((ticket as any).phone) {
+        const num = normalizePhilippinesMobileNumber(String((ticket as any).phone))
         if (num) return { number: num }
     }
 
     // 2) Attempt to resolve from UserModel (participant record)
-    const user = await UserModel.findOne({
-        $or: [{ tcNumber: ticket.studentId }, { studentId: ticket.studentId }],
-    })
-        .select({ _id: 1, smsUpdates: 1, mobileNumber: 1, phone: 1 })
-        .lean()
+    const dbTimeoutMs = getDbQueryTimeoutMs()
+    const user = await withTimeout(
+        UserModel.findOne({
+            $or: [{ tcNumber: (ticket as any).studentId }, { studentId: (ticket as any).studentId }],
+        })
+            .select({ _id: 1, smsUpdates: 1, mobileNumber: 1, phone: 1 })
+            .lean()
+            .exec(),
+        dbTimeoutMs,
+        "User lookup timed out"
+    )
 
     if (!user) return null
 
-    const optedOut = user.smsUpdates === false
+    const optedOut = (user as any).smsUpdates === false
     if (respectOptOut && optedOut) {
-        return { number: "", userId: String(user._id), optedOut: true }
+        return { number: "", userId: String((user as any)._id), optedOut: true }
     }
 
-    const candidate = String(user.mobileNumber || user.phone || "")
+    const candidate = String((user as any).mobileNumber || (user as any).phone || "")
     const normalized = normalizePhilippinesMobileNumber(candidate)
     if (!normalized) return null
 
-    return { number: normalized, userId: String(user._id), optedOut }
+    return { number: normalized, userId: String((user as any)._id), optedOut }
 }
 
 function buildReliabilityInfoFromProvider(
@@ -652,9 +995,9 @@ function buildFailedReliabilityInfo(): SmsReliabilityInfo {
  * - Respects smsUpdates=false when user can be resolved (default)
  * - Adds reliability info: status/network/support
  *
- * IMPORTANT CHANGE:
- * - If Semaphore/provider request fails, we return a structured result with `error`
- *   instead of throwing, so API routes won't respond with HTTP 500.
+ * IMPORTANT:
+ * - This function is hardened to avoid throwing for common cases (prevents API crashes/timeouts -> 502).
+ * - It returns structured results with `error` instead.
  */
 export async function sendSmsToQueuedUser(params: {
     ticketId: string
@@ -669,12 +1012,72 @@ export async function sendSmsToQueuedUser(params: {
         entityId: ticketId,
     }
 
-    const ticket = await TicketModel.findById(ticketId).lean()
-    if (!ticket) throw new Error("Ticket not found.")
+    // Validate message early so routes don’t crash
+    try {
+        ensureMessageAllowed(message)
+    } catch (e: any) {
+        const errorMessage = String(e?.message || "Message not allowed")
+        await maybeAuditLog({
+            actor: options.actor,
+            action: "SMS_MESSAGE_NOT_ALLOWED",
+            entityType: "TICKET",
+            entityId: ticketId,
+            meta: {
+                provider: "semaphore",
+                errorMessage,
+            },
+        })
+        return { skipped: true, reason: "message_not_allowed", error: errorMessage } as const
+    }
 
-    const resolved = await resolveRecipientFromTicket(ticket, options.respectOptOut !== false)
+    const dbTimeoutMs = getDbQueryTimeoutMs()
 
-    if (!resolved) throw new Error("No recipient phone number found for this ticket.")
+    let ticket: any | null
+    try {
+        ticket = await withTimeout(
+            TicketModel.findById(ticketId).lean().exec(),
+            dbTimeoutMs,
+            "Ticket lookup timed out"
+        )
+    } catch (e: any) {
+        const errorMessage = String(e?.message || "Ticket lookup failed")
+        await maybeAuditLog({
+            actor: options.actor,
+            action: "SMS_TICKET_LOOKUP_FAILED",
+            entityType: "TICKET",
+            entityId: ticketId,
+            meta: { errorMessage },
+        })
+        return { skipped: true, reason: "internal_error", error: errorMessage } as const
+    }
+
+    if (!ticket) {
+        return { skipped: true, reason: "ticket_not_found", error: "Ticket not found." } as const
+    }
+
+    let resolved: { number: string; userId?: string; optedOut?: boolean } | null = null
+    try {
+        resolved = await resolveRecipientFromTicket(ticket, options.respectOptOut !== false)
+    } catch (e: any) {
+        const errorMessage = String(e?.message || "Recipient resolution failed")
+        await maybeAuditLog({
+            actor: options.actor,
+            action: "SMS_RECIPIENT_RESOLUTION_FAILED",
+            entityType: "TICKET",
+            entityId: ticketId,
+            meta: { errorMessage },
+        })
+        return { skipped: true, reason: "internal_error", error: errorMessage } as const
+    }
+
+    if (!resolved) {
+        return {
+            skipped: true,
+            reason: "no_recipient",
+            error: "No recipient phone number found for this ticket.",
+        } as const
+    }
+
     if (resolved.optedOut) {
         await maybeAuditLog({
             actor: options.actor,
@@ -692,7 +1095,13 @@ export async function sendSmsToQueuedUser(params: {
         } as const
     }
 
-    if (!resolved.number) throw new Error("No valid recipient phone number found for this ticket.")
+    if (!resolved.number) {
+        return {
+            skipped: true,
+            reason: "invalid_number",
+            error: "No valid recipient phone number found for this ticket.",
+        } as const
+    }
 
     const supportedTokens = (options.supportedNetworkTokens?.length
         ? options.supportedNetworkTokens
@@ -740,15 +1149,17 @@ export async function sendSmsToQueuedUser(params: {
                 sentToMasked: maskMobileNumber(resolved.number),
                 errorMessage,
                 httpStatus: e?.status ?? null,
+                rateLimit: e?.rateLimit ?? null,
                 retryAfter: e?.retryAfter ?? null,
                 attempt: e?.attempt ?? null,
                 maxAttempts: e?.maxAttempts ?? null,
+                endpointUsed: e?.endpoint ?? null,
                 providerErrorData: e?.data ?? null,
                 ...(options.meta || {}),
             },
         })
 
-        // Return (do NOT throw) -> avoids API 500 and lets UI show a friendly toast.
+        // Return (do NOT throw) -> avoids API 500/timeout and lets UI show a friendly toast.
         return {
             skipped: false,
             sentTo: resolved.number,
@@ -767,12 +1178,10 @@ export async function sendSmsToQueuedUser(params: {
  * - When sending SMS for the current live queue (usually status=CALLED),
  *   automatically notify the NEXT WAITING ticket (smallest queueNumber > current.queueNumber).
  * - Toggle priority:
- *    1) explicit param options.meta.advanceNoticeEnabled (boolean) is NOT used (we keep it simple)
- *    2) env queue_sms_advance_notice_enabled = true/false (global toggle)
+ *    1) env queue_sms_advance_notice_enabled = true/false (global toggle)
  *
- * Reliability Checks:
- * - Network supported/unknown is logged (uses provider response `network`)
- * - Provider response preview + status summary are logged by sendSms()
+ * HARDENED:
+ * - returns structured results instead of throwing (prevents route crashes -> 502)
  */
 export async function sendTicketStatusSms(params: {
     ticketId: string
@@ -787,10 +1196,45 @@ export async function sendTicketStatusSms(params: {
         entityId: ticketId,
     }
 
-    const ticket = await TicketModel.findById(ticketId).lean()
-    if (!ticket) throw new Error("Ticket not found.")
+    const dbTimeoutMs = getDbQueryTimeoutMs()
 
-    const dept = await DepartmentModel.findById(ticket.department).select({ name: 1, code: 1 }).lean()
+    let ticket: any | null
+    try {
+        ticket = await withTimeout(
+            TicketModel.findById(ticketId).lean().exec(),
+            dbTimeoutMs,
+            "Ticket lookup timed out"
+        )
+    } catch (e: any) {
+        const errorMessage = String(e?.message || "Ticket lookup failed")
+        return {
+            skipped: true,
+            reason: "internal_error",
+            error: errorMessage,
+            advanceNotice: { enabled: isAdvanceNoticeGloballyEnabled(), attempted: false },
+        } as const
+    }
+
+    if (!ticket) {
+        return {
+            skipped: true,
+            reason: "ticket_not_found",
+            error: "Ticket not found.",
+            advanceNotice: { enabled: isAdvanceNoticeGloballyEnabled(), attempted: false },
+        } as const
+    }
+
+    let dept: any | null = null
+    try {
+        dept = await withTimeout(
+            DepartmentModel.findById(ticket.department).select({ name: 1, code: 1 }).lean().exec(),
+            dbTimeoutMs,
+            "Department lookup timed out"
+        )
+    } catch {
+        dept = null
+    }
+
     const deptLabel = dept?.name || dept?.code || "your office"
 
     const q = ticket.queueNumber
@@ -813,11 +1257,12 @@ export async function sendTicketStatusSms(params: {
     // Optional: Advance notice to NEXT ticket (only meaningful when calling current)
     const advanceEnabled = isAdvanceNoticeGloballyEnabled()
 
-    // If current was skipped (opt-out) OR provider failed, do NOT attempt advance notice.
+    // If current was skipped OR provider failed, do NOT attempt advance notice.
     const currentProviderFailed =
         !currentResult.skipped && typeof (currentResult as any).error === "string" && !!(currentResult as any).error
 
-    const shouldAttemptAdvance = advanceEnabled && status === "CALLED" && !currentResult.skipped && !currentProviderFailed
+    const shouldAttemptAdvance =
+        advanceEnabled && status === "CALLED" && !currentResult.skipped && !currentProviderFailed
 
     let advanceNotice:
         | {
@@ -839,14 +1284,19 @@ export async function sendTicketStatusSms(params: {
     }
 
     try {
-        const nextTicket = await TicketModel.findOne({
-            department: ticket.department,
-            dateKey: ticket.dateKey,
-            status: "WAITING",
-            queueNumber: { $gt: ticket.queueNumber },
-        })
-            .sort({ queueNumber: 1 })
-            .lean()
+        const nextTicket = await withTimeout(
+            TicketModel.findOne({
+                department: ticket.department,
+                dateKey: ticket.dateKey,
+                status: "WAITING",
+                queueNumber: { $gt: ticket.queueNumber },
+            })
+                .sort({ queueNumber: 1 })
+                .lean()
+                .exec(),
+            dbTimeoutMs,
+            "Next ticket lookup timed out"
+        )
 
         if (!nextTicket) {
             advanceNotice = {
@@ -894,11 +1344,7 @@ export async function sendTicketStatusSms(params: {
                 relatedCurrentQueueNumber: ticket.queueNumber,
                 nextQueueNumber: nextTicket.queueNumber,
                 nextTicketId: String((nextTicket as any)._id),
-                outcome: (nextResult as any)?.skipped
-                    ? "skipped"
-                    : (nextResult as any)?.error
-                      ? "failed"
-                      : "sent",
+                outcome: (nextResult as any)?.skipped ? "skipped" : (nextResult as any)?.error ? "failed" : "sent",
             },
         })
 
