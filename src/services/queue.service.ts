@@ -108,6 +108,133 @@ function normalizeKey(input?: string) {
     return (input || "").trim().toUpperCase()
 }
 
+function titleCaseWords(input?: string) {
+    const s = String(input || "").trim()
+    if (!s) return ""
+    return s
+        .toLowerCase()
+        .split(/[\s_]+/g)
+        .filter(Boolean)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ")
+}
+
+function participantTypeLabel(t?: string) {
+    const type = String(t || "").toUpperCase()
+    if (type === "STUDENT") return "Student"
+    if (type === "ALUMNI_VISITOR") return "Alumni / Visitor"
+    if (type === "GUEST") return "Guest"
+    return "Participant"
+}
+
+function joinList(items: string[], max = 6) {
+    const clean = (items || []).map((x) => String(x || "").trim()).filter(Boolean)
+    if (!clean.length) return ""
+    if (clean.length <= max) return clean.join(", ")
+    return `${clean.slice(0, max).join(", ")} +${clean.length - max} more`
+}
+
+function buildTicketWhereToGo(params: {
+    status: TicketStatus
+    queueNumber: number
+    participantType?: string
+    departmentName?: string
+    departmentCode?: string
+    transactionManager?: string
+    windowNumber?: number
+    windowName?: string
+    staffName?: string
+    servedDepartments?: string[]
+    transactionLabels?: string[]
+}) {
+    const pLabel = participantTypeLabel(params.participantType)
+
+    const deptLabel = params.departmentName
+        ? params.departmentCode
+            ? `${params.departmentName} (${params.departmentCode})`
+            : params.departmentName
+        : ""
+
+    const officeLabel = params.transactionManager ? titleCaseWords(params.transactionManager) : ""
+
+    const windowLabel = params.windowName
+        ? params.windowNumber
+            ? `${params.windowName} (Window ${params.windowNumber})`
+            : params.windowName
+        : params.windowNumber
+          ? `Window ${params.windowNumber}`
+          : ""
+
+    const served = joinList(params.servedDepartments || [])
+    const tx = joinList(params.transactionLabels || [])
+
+    const staffLine = params.staffName ? `Staff in charge: ${params.staffName}.` : ""
+    const servedLine = served ? `This window serves: ${served}.` : ""
+    const txLine = tx ? `Transactions: ${tx}.` : ""
+
+    const statusLine =
+        params.status === "CALLED"
+            ? "Proceed now."
+            : params.status === "WAITING"
+              ? "When your number is called, proceed."
+              : "Proceed when instructed."
+
+    // If no window is assigned yet, give a clearer instruction.
+    if (!windowLabel) {
+        const where = [
+            `${statusLine}`,
+            "Please check the display monitor for your assigned window.",
+            deptLabel ? `Department: ${deptLabel}.` : "",
+            officeLabel ? `Office: ${officeLabel}.` : "",
+            txLine,
+            staffLine,
+        ]
+            .map((x) => String(x || "").trim())
+            .filter(Boolean)
+            .join(" ")
+
+        return {
+            whereToGo: where,
+            participantTypeLabel: pLabel,
+            departmentName: params.departmentName,
+            departmentCode: params.departmentCode,
+            transactionManager: params.transactionManager,
+            windowNumber: params.windowNumber,
+            windowName: params.windowName,
+            staffName: params.staffName,
+            servedDepartments: params.servedDepartments || [],
+            transactionLabels: params.transactionLabels || [],
+        }
+    }
+
+    const where = [
+        `${statusLine}`,
+        `Go to ${windowLabel}.`,
+        deptLabel ? `Department: ${deptLabel}.` : "",
+        officeLabel ? `Office: ${officeLabel}.` : "",
+        servedLine,
+        txLine,
+        staffLine,
+        `Queue number: ${params.queueNumber}.`,
+    ]
+        .map((x) => String(x || "").trim())
+        .filter(Boolean)
+        .join(" ")
+
+    return {
+        whereToGo: where,
+        participantTypeLabel: pLabel,
+        departmentName: params.departmentName,
+        departmentCode: params.departmentCode,
+        transactionManager: params.transactionManager,
+        windowNumber: params.windowNumber,
+        windowName: params.windowName,
+        staffName: params.staffName,
+        servedDepartments: params.servedDepartments || [],
+        transactionLabels: params.transactionLabels || [],
+    }
+}
+
 async function resolveDepartmentGroupForRouting(departmentId: Types.ObjectId) {
     const department = await DepartmentModel.findById(departmentId)
     if (!department || !department.enabled) {
@@ -214,15 +341,47 @@ export type JoinQueueInput = {
     phone?: string
 }
 
+export type TicketGuidanceDetails = {
+    whereToGo: string
+    participantTypeLabel: string
+    departmentName?: string
+    departmentCode?: string
+    transactionManager?: string
+    windowNumber?: number
+    windowName?: string
+    staffName?: string
+    servedDepartments: string[]
+    transactionLabels: string[]
+}
+
 export type JoinQueueResult = {
     ticketId: string
     queueNumber: number
     dateKey: string
     status: TicketStatus
+
+    // ✅ user-friendly details (names > ids)
+    departmentName?: string
+    departmentCode?: string
+    transactionManager?: string
+
     windowNumber?: number
+    windowName?: string
+
+    // kept for compatibility, but now returns a display value (name)
     staffAssigned?: string
+    staffAssignedId?: string
+
     accountName: string
     nameOfPersonInCharge?: string
+
+    participantType?: QueueJoinParticipantType
+    transactionKeys?: string[]
+    transactionLabels?: string[]
+
+    // ✅ single “ready-to-display” guidance string + structured details
+    guidance: TicketGuidanceDetails
+
     canPresentDirectlyToDisplayMonitor: boolean
     voiceAnnouncement?: string
 }
@@ -390,21 +549,73 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         },
     })
 
+    let effectiveStatus: TicketStatus = ticket.status
     let voiceAnnouncement: string | undefined
+
     if (input.presentDirectlyToDisplayMonitor) {
         const called = await presentDirectlyToDisplayMonitor(ticket._id.toString())
+        effectiveStatus = called.status
         voiceAnnouncement = called.voiceAnnouncement
     }
+
+    // ✅ Resolve friendly names for UI (names > ids)
+    const department = await DepartmentModel.findById(selectedDepartmentId).select("name code transactionManager enabled")
+    const servedDepts = routing.handledDepartmentIds?.length
+        ? await DepartmentModel.find({ _id: { $in: routing.handledDepartmentIds }, enabled: true })
+              .select("name code")
+              .sort({ name: 1 })
+        : []
+
+    const servedDepartments = (servedDepts || [])
+        .map((d) => String((d as any).code || (d as any).name || "").trim())
+        .filter(Boolean)
+
+    const windowName = routing.window?.name
+    const windowNumber = routing.window?.number
+
+    const staffAssignedId = routing.staff?._id?.toString()
+    const staffAssignedName = routing.staff?.name
+
+    const guidance = buildTicketWhereToGo({
+        status: effectiveStatus,
+        queueNumber: ticket.queueNumber,
+        participantType,
+        departmentName: department?.name,
+        departmentCode: department?.code,
+        transactionManager: department?.transactionManager,
+        windowNumber,
+        windowName,
+        staffName: staffAssignedName,
+        servedDepartments,
+        transactionLabels: selectedTransactionLabels,
+    })
 
     return {
         ticketId: ticket._id.toString(),
         queueNumber: ticket.queueNumber,
         dateKey: ticket.dateKey,
-        status: input.presentDirectlyToDisplayMonitor ? "CALLED" : ticket.status,
-        windowNumber: routing.window?.number,
-        staffAssigned: routing.staff?._id?.toString(),
+        status: effectiveStatus,
+
+        departmentName: department?.name,
+        departmentCode: department?.code,
+        transactionManager: department?.transactionManager,
+
+        windowNumber,
+        windowName,
+
+        // ✅ user-friendly (name), plus explicit id if needed
+        staffAssigned: staffAssignedName,
+        staffAssignedId,
+
         accountName,
-        nameOfPersonInCharge: routing.staff?.name,
+        nameOfPersonInCharge: staffAssignedName,
+
+        participantType,
+        transactionKeys: input.transactionKeys,
+        transactionLabels: selectedTransactionLabels,
+
+        guidance,
+
         canPresentDirectlyToDisplayMonitor: true,
         voiceAnnouncement,
     }
@@ -448,12 +659,49 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
         },
     })
 
+    // ✅ Add friendly “where to go” details for display clients
+    const department = await DepartmentModel.findById(ticket.department).select("name code transactionManager enabled")
+    const windowDoc = ticket.window
+        ? await ServiceWindowModel.findById(ticket.window).select("name number enabled")
+        : await ServiceWindowModel.findOne({
+              enabled: true,
+              department: ticket.department,
+              number: windowNumber,
+          }).select("name number enabled")
+
+    const selection = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id }).select(
+        "participantType transactionLabels"
+    )
+
+    const guidance = buildTicketWhereToGo({
+        status: ticket.status,
+        queueNumber: ticket.queueNumber,
+        participantType: (ticket as any).participantType || selection?.participantType,
+        departmentName: department?.name,
+        departmentCode: department?.code,
+        transactionManager: department?.transactionManager,
+        windowNumber: windowDoc?.number || windowNumber,
+        windowName: windowDoc?.name,
+        staffName: undefined,
+        servedDepartments: [],
+        transactionLabels: selection?.transactionLabels || [],
+    })
+
     return {
         ticketId: ticket._id.toString(),
         queueNumber: ticket.queueNumber,
         windowNumber,
         status: ticket.status,
         voiceAnnouncement,
+
+        // ✅ extra details (safe, additive)
+        departmentName: department?.name,
+        departmentCode: department?.code,
+        transactionManager: department?.transactionManager,
+        windowName: windowDoc?.name,
+        participantType: (ticket as any).participantType || selection?.participantType,
+        transactionLabels: selection?.transactionLabels || [],
+        guidance,
     }
 }
 
