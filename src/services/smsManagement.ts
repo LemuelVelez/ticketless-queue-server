@@ -215,26 +215,40 @@ export type TicketStatusSmsResult = SendSmsToQueuedUserResult & {
 }
 
 /**
- * REQUIRED ENV:
+ * REQUIRED ENV (supports common variants):
  * - semaphore_api_key
- *
- * OPTIONAL ENV:
- * - semaphore_sendername (recommended: beginning July 1, 2024 users can no longer send from "Semaphore" sender name)
- * - semaphore_base_url (optional override, e.g. https://api.semaphore.co)
- * - queue_sms_advance_notice_enabled (true/false)  -> global toggle for advance notice SMS
+ * - SEMAPHORE_API_KEY
+ * - SEMAPHORE_APIKEY
+ * - SEMAPHORE_KEY
  */
 function getSemaphoreApiKey(): string {
-    const key = (process.env.semaphore_api_key || process.env.SEMAPHORE_API_KEY || "").trim()
+    const candidates = [
+        process.env.semaphore_api_key,
+        process.env.SEMAPHORE_API_KEY,
+        process.env.SEMAPHORE_APIKEY,
+        process.env.SEMAPHORE_KEY,
+        process.env.semaphore_apikey,
+        process.env.semaphore_key,
+    ]
+        .map((v) => String(v ?? "").trim())
+        .filter(Boolean)
+
+    const key = candidates[0] || ""
     if (!key) {
         throw new Error(
-            "Missing Semaphore API key. Set env var `semaphore_api_key` (or `SEMAPHORE_API_KEY`)."
+            "Missing Semaphore API key. Set env var `SEMAPHORE_API_KEY` (or `semaphore_api_key`)."
         )
     }
     return key
 }
 
 function getDefaultSenderName(): string | undefined {
-    const name = (process.env.semaphore_sendername || process.env.SEMAPHORE_SENDERNAME || "").trim()
+    const name = (
+        process.env.semaphore_sendername ||
+        process.env.SEMAPHORE_SENDERNAME ||
+        process.env.SEMAPHORE_SENDER ||
+        process.env.semaphore_sender
+    ).trim()
     return name || undefined
 }
 
@@ -926,9 +940,10 @@ async function resolveRecipientFromTicket(
     ticket: TicketDoc,
     respectOptOut: boolean
 ): Promise<{ number: string; userId?: string; optedOut?: boolean } | null> {
-    // 1) Ticket phone has priority (guest/manual entry)
-    if ((ticket as any).phone) {
-        const num = normalizePhilippinesMobileNumber(String((ticket as any).phone))
+    // 1) Ticket phone/mobileNumber has priority (guest/manual entry)
+    const ticketPhoneCandidate = String((ticket as any).phone || (ticket as any).mobileNumber || "").trim()
+    if (ticketPhoneCandidate) {
+        const num = normalizePhilippinesMobileNumber(ticketPhoneCandidate)
         if (num) return { number: num }
     }
 
@@ -991,7 +1006,7 @@ function buildFailedReliabilityInfo(): SmsReliabilityInfo {
 
 /**
  * Staff helper: Send a custom message to the currently queued participant (by ticketId).
- * - Uses ticket.phone first, else resolves via UserModel
+ * - Uses ticket.phone/mobileNumber first, else resolves via UserModel
  * - Respects smsUpdates=false when user can be resolved (default)
  * - Adds reliability info: status/network/support
  *
@@ -1188,6 +1203,7 @@ export async function sendTicketStatusSms(params: {
     status: "CALLED" | "HOLD" | "OUT" | "SERVED"
     options?: Omit<SendSmsOptions, "entityType" | "entityId">
 }): Promise<TicketStatusSmsResult> {
+    // (rest of file unchanged)
     const { ticketId, status } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
@@ -1247,17 +1263,13 @@ export async function sendTicketStatusSms(params: {
         windowNumber: windowNo,
     })
 
-    // Send to CURRENT ticket (never throws for provider failures now)
     const currentResult = await sendSmsToQueuedUser({
         ticketId,
         message: msg,
         options,
     })
 
-    // Optional: Advance notice to NEXT ticket (only meaningful when calling current)
     const advanceEnabled = isAdvanceNoticeGloballyEnabled()
-
-    // If current was skipped OR provider failed, do NOT attempt advance notice.
     const currentProviderFailed =
         !currentResult.skipped && typeof (currentResult as any).error === "string" && !!(currentResult as any).error
 
@@ -1368,7 +1380,6 @@ export async function sendTicketStatusSms(params: {
             },
         })
 
-        // Do NOT fail the main SMS if advance notice fails
         return { ...(currentResult as any), advanceNotice }
     }
 }

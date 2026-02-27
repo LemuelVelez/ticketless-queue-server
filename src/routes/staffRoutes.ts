@@ -4,7 +4,7 @@ import { requireAuth, requireRole } from "../controllers/middlewares"
 import { staffController } from "../controllers/staffController"
 import { smsController } from "../controllers/smsController"
 import { QueueManagementController } from "../controllers/queueManagement"
-import { TicketModel } from "../models/Ticket"
+import { sendSmsToQueuedUser } from "../services/smsManagement"
 
 const router = Router()
 
@@ -25,113 +25,6 @@ function normalizeSenderName(raw: unknown) {
     // Keep it strict to prevent provider rejections.
     const cleaned = s.replace(/[^a-z0-9]/gi, "")
     return cleaned.slice(0, 11)
-}
-
-function normalizeMobileNumberPH(raw: unknown) {
-    const s0 = String(raw ?? "").trim()
-    if (!s0) return ""
-
-    // remove spaces, dashes, parentheses
-    let s = s0.replace(/[^\d+]/g, "")
-    if (!s) return ""
-
-    // +63XXXXXXXXXX -> 63XXXXXXXXXX
-    if (s.startsWith("+63")) s = s.slice(1)
-
-    // 63 9XXXXXXXXX -> 639XXXXXXXXX
-    if (s.startsWith("63") && s.length === 12 && s[2] === "9") return s
-
-    // 09XXXXXXXXX -> 639XXXXXXXXX (Semaphore accepts 639... per docs examples)
-    if (s.startsWith("09") && s.length === 11) return `639${s.slice(2)}`
-
-    // 9XXXXXXXXX -> 639XXXXXXXXX
-    if (s.startsWith("9") && s.length === 10) return `639${s}`
-
-    // Already 639XXXXXXXXX
-    if (s.startsWith("639") && s.length === 12) return s
-
-    // Fallback: return digits-only
-    return s
-}
-
-function isLikelyValidPHMobile(num: string) {
-    // Most reliable format in Semaphore examples: 639xxxxxxxxx
-    return /^639\d{9}$/.test(num)
-}
-
-async function semaphoreSendMessage(args: {
-    apikey: string
-    number: string
-    message: string
-    sendername: string
-    priority?: boolean
-    otp?: boolean
-    otpCode?: string | number
-}) {
-    const url = args.otp
-        ? "https://api.semaphore.co/api/v4/otp"
-        : args.priority
-          ? "https://api.semaphore.co/api/v4/priority"
-          : "https://api.semaphore.co/api/v4/messages"
-
-    const params = new URLSearchParams()
-    params.set("apikey", args.apikey)
-    params.set("number", args.number)
-    params.set("message", args.message)
-    params.set("sendername", args.sendername)
-
-    // OTP optional code param (Semaphore supports a `code` parameter for OTP)
-    if (args.otp && args.otpCode !== undefined && args.otpCode !== null && String(args.otpCode).trim()) {
-        params.set("code", String(args.otpCode).trim())
-    }
-
-    const res = await fetch(url, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            Accept: "application/json",
-        },
-        body: params.toString(),
-    })
-
-    const text = await res.text()
-    let json: any = text
-    try {
-        json = JSON.parse(text)
-    } catch {
-        // keep raw text
-    }
-
-    return { ok: res.ok, status: res.status, data: json }
-}
-
-function extractSemaphoreReliability(providerResponse: any) {
-    // Semaphore returns an array of message objects for send endpoints.
-    const first = Array.isArray(providerResponse) ? providerResponse[0] : providerResponse
-    const statusRaw = String(first?.status ?? "").trim()
-    const networkRaw = String(first?.network ?? "").trim()
-    const messageIdRaw = first?.message_id
-
-    const deliveryStatus = statusRaw ? statusRaw.toUpperCase() : "UNKNOWN"
-    const providerNetwork = networkRaw || undefined
-
-    // Supported networks check requested by your UI (GLOBE/SMART).
-    const supported =
-        providerNetwork
-            ? ["GLOBE", "SMART"].includes(providerNetwork.toUpperCase())
-            : null
-
-    const providerMessageId =
-        Number.isFinite(Number(messageIdRaw)) ? Number(messageIdRaw) : undefined
-
-    return {
-        reliability: {
-            deliveryStatus,
-            providerNetwork,
-            supportedNetwork: supported,
-            providerMessageId,
-        },
-    }
 }
 
 // Assignment
@@ -189,8 +82,8 @@ router.post("/tickets/:id/sms-status", smsController.sendTicketStatus)
 
 /**
  * ✅ FIX: Primary endpoint used by UI: /staff/tickets/:id/sms
- * - Uses correct Semaphore endpoint + form-urlencoded payload
- * - Requires a real sendername (avoid default "Semaphore" which may be blocked)
+ * - Now uses centralized smsManagement service (single source of truth)
+ * - Fixes false "SEMAPHORE_API_KEY is missing" by supporting multiple env key variants
  * - Returns 200 with ok=false on provider failure to avoid browser "Failed to load resource"
  */
 router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
@@ -201,30 +94,19 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
             return res.status(400).json({ ok: false, error: "Missing ticket id" })
         }
 
-        const apikey = readEnvKey("SEMAPHORE_API_KEY", "SEMAPHORE_APIKEY", "SEMAPHORE_KEY")
-        if (!apikey) {
-            res.setHeader("X-Error-Message", "SEMAPHORE_API_KEY is missing on server")
-            return res.status(500).json({ ok: false, error: "SEMAPHORE_API_KEY is missing on server" })
-        }
-
         const payload = (req.body || {}) as any
         const message = String(payload?.message ?? "").trim()
 
-        // Semaphore silently ignores messages starting with "TEST" (docs behavior).
-        if (message && /^test\b/i.test(message)) {
-            return res.json({
-                ok: false,
-                provider: "semaphore",
-                ticketId,
-                outcome: "skipped",
-                reason: 'Message starts with "TEST" (Semaphore ignores these).',
-                result: { skipped: true, reason: "test_prefix" },
-            })
-        }
-
         // Sendername: prefer payload.senderName then env
         const senderFromPayload = normalizeSenderName(payload?.senderName)
-        const senderFromEnv = normalizeSenderName(readEnvKey("SEMAPHORE_SENDERNAME", "SEMAPHORE_SENDER"))
+        const senderFromEnv = normalizeSenderName(
+            readEnvKey(
+                "SEMAPHORE_SENDERNAME",
+                "SEMAPHORE_SENDER",
+                "semaphore_sendername",
+                "semaphore_sender",
+            ),
+        )
         const sendername = senderFromPayload || senderFromEnv
 
         // Important: avoid defaulting to "Semaphore" (can be blocked). If empty, fail fast with guidance.
@@ -234,100 +116,85 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
                 provider: "semaphore",
                 ticketId,
                 outcome: "failed",
-                reason: "Sender name is missing. Set SEMAPHORE_SENDERNAME or pass senderName from UI.",
+                reason: "Sender name is missing. Set SEMAPHORE_SENDERNAME (or semaphore_sendername) or pass senderName from UI.",
                 error: "sendername_missing",
-            })
-        }
-
-        const ticket = await TicketModel.findById(ticketId)
-            .select("_id queueNumber phone mobileNumber studentId participantLabel participantFullName")
-            .lean()
-
-        if (!ticket) {
-            return res.json({
-                ok: false,
-                provider: "semaphore",
-                ticketId,
-                outcome: "failed",
-                reason: "Ticket not found.",
-                error: "ticket_not_found",
-            })
-        }
-
-        const rawNumber =
-            String((ticket as any)?.phone ?? "").trim() ||
-            String((ticket as any)?.mobileNumber ?? "").trim()
-
-        const number = normalizeMobileNumberPH(rawNumber)
-
-        if (!number || !isLikelyValidPHMobile(number)) {
-            return res.json({
-                ok: false,
-                provider: "semaphore",
-                ticketId,
-                outcome: "failed",
-                reason: "Ticket has no valid mobile number.",
-                error: "invalid_number",
-                number: rawNumber || null,
             })
         }
 
         // If UI doesn't send message, still allow but make it obvious
         const finalMessage =
             message ||
-            `Queue Update: You are being called now. Ticket #${Number((ticket as any)?.queueNumber ?? 0) || "—"}.`
+            `Queue Update: You are being called now. Please proceed to your assigned window.`
 
-        const provider = await semaphoreSendMessage({
-            apikey,
-            number,
+        const actorId = String((req as any)?.user?.id ?? "").trim() || undefined
+
+        const result = await sendSmsToQueuedUser({
+            ticketId,
             message: finalMessage,
-            sendername,
-            priority: Boolean(payload?.priority),
-            otp: Boolean(payload?.otp),
-            otpCode: payload?.otpCode,
+            options: {
+                senderName: sendername,
+                priority: Boolean(payload?.priority),
+                otp: Boolean(payload?.otp),
+                otpCode: payload?.otpCode,
+                actor: actorId ? { id: actorId, role: "STAFF" } : undefined,
+                meta: { source: "/staff/tickets/:id/sms" },
+            },
         })
 
-        // Provider failed => return 200 with ok=false (no 502 spam in browser)
-        if (!provider.ok) {
+        // Skipped cases: opted out, no recipient, invalid, ticket not found, message not allowed, internal error
+        if ((result as any).skipped) {
+            const reason = String((result as any).reason || "skipped")
+            const errMsg = String((result as any).error || "")
+            if (errMsg) res.setHeader("X-Error-Message", errMsg)
+
+            return res.json({
+                ok: false,
+                provider: "semaphore",
+                ticketId,
+                outcome: "skipped",
+                reason,
+                error: errMsg || undefined,
+            })
+        }
+
+        const providerError = String((result as any).error || "").trim()
+        if (providerError) {
+            res.setHeader("X-Error-Message", providerError)
             return res.json({
                 ok: false,
                 provider: "semaphore",
                 ticketId,
                 outcome: "failed",
-                reason: "Semaphore rejected the request.",
-                number,
+                reason: providerError,
                 error: "provider_error",
                 result: {
-                    httpStatus: provider.status,
-                    providerResponse: provider.data,
-                    ...extractSemaphoreReliability(provider.data),
+                    sentTo: (result as any).sentTo,
+                    reliability: (result as any).reliability,
+                    providerResponse: (result as any).providerResponse,
                 },
             })
         }
 
-        const reliabilityPack = extractSemaphoreReliability(provider.data)
-        const deliveryStatus = String(reliabilityPack?.reliability?.deliveryStatus ?? "UNKNOWN").toUpperCase()
-        const outcome = deliveryStatus === "FAILED" ? "failed" : "sent"
-
         return res.json({
-            ok: outcome === "sent",
+            ok: true,
             provider: "semaphore",
             ticketId,
-            outcome,
-            number,
+            outcome: "sent",
+            number: (result as any).sentTo,
             result: {
-                providerResponse: provider.data,
-                ...reliabilityPack,
+                reliability: (result as any).reliability,
+                providerResponse: (result as any).providerResponse,
             },
         })
     } catch (err: any) {
         // Never throw 502 here; keep UI stable with ok=false.
+        const msg = String(err?.message || "Server error")
         return res.json({
             ok: false,
             provider: "semaphore",
             outcome: "failed",
             error: "server_error",
-            reason: String(err?.message || "Server error"),
+            reason: msg,
         })
     }
 })
