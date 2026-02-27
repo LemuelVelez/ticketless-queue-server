@@ -37,9 +37,24 @@ export type ParticipantAuthUser = {
     departmentCode?: string
 }
 
+function readSessionToken(req: Request) {
+    // ✅ Compatibility with proxies/CDNs that strip Authorization
+    // Frontend mirrors Bearer token into X-Session-Token.
+    return (
+        req.header("x-session-token") ||
+        req.header("X-Session-Token") ||
+        req.header("x-sessiontoken") ||
+        req.header("X-SessionToken") ||
+        ""
+    ).trim()
+}
+
 function readBearerToken(req: Request) {
-    const auth = req.header("authorization") || req.header("Authorization") || ""
-    return auth.startsWith("Bearer ") ? auth.slice(7).trim() : ""
+    const auth = (req.header("authorization") || req.header("Authorization") || "").trim()
+    if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim()
+
+    // ✅ Fallback: accept X-Session-Token as the token
+    return readSessionToken(req)
 }
 
 function readOptionalString(value: unknown): string | undefined {
@@ -84,15 +99,15 @@ function fromJwtPayload(payload: Record<string, unknown>): ParticipantAuthUser |
         typeof payload.tcNumber === "string"
             ? payload.tcNumber
             : typeof payload.studentId === "string"
-                ? payload.studentId
-                : undefined
+              ? payload.studentId
+              : undefined
 
     const mobileNumber =
         typeof payload.mobileNumber === "string"
             ? payload.mobileNumber
             : typeof payload.phone === "string"
-                ? payload.phone
-                : undefined
+              ? payload.phone
+              : undefined
 
     return {
         id: participantId,
@@ -159,10 +174,16 @@ export function corsMiddleware(req: Request, res: Response, next: NextFunction) 
 export function requireAuth(req: Request, res: Response, next: NextFunction) {
     try {
         const token = readBearerToken(req)
-        if (!token) return res.status(401).json({ message: "Missing token" })
+        if (!token) {
+            res.setHeader("X-Error-Message", "Missing token")
+            return res.status(401).json({ message: "Missing token" })
+        }
 
         const secret = process.env.JWT_SECRET
-        if (!secret) return res.status(500).json({ message: "JWT_SECRET missing" })
+        if (!secret) {
+            res.setHeader("X-Error-Message", "JWT_SECRET missing")
+            return res.status(500).json({ message: "JWT_SECRET missing" })
+        }
 
         const payload = verifyToken(token, secret) as Record<string, unknown>
 
@@ -177,9 +198,9 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 
         const assignedDepartmentsFromToken = readStringArray(
             payload.assignedDepartments ??
-            payload.assignedDepartmentIds ??
-            payload.departmentIds ??
-            payload.departments,
+                payload.assignedDepartmentIds ??
+                payload.departmentIds ??
+                payload.departments
         )
 
         const assignedDepartments = assignedDepartment
@@ -198,24 +219,28 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
             readOptionalString(payload.assignedManager) ||
             readOptionalString(payload.manager)
 
-            ; (req as any).user = {
-                id,
-                role,
-                name: payload.name as string | undefined,
-                email: payload.email as string | undefined,
-                avatarKey: payload.avatarKey as string | undefined,
-                avatarUrl: payload.avatarUrl as string | undefined,
+        ;(req as any).user = {
+            id,
+            role,
+            name: payload.name as string | undefined,
+            email: payload.email as string | undefined,
+            avatarKey: payload.avatarKey as string | undefined,
+            avatarUrl: payload.avatarUrl as string | undefined,
 
-                assignedDepartment,
-                assignedDepartments,
-                assignedWindow,
-                assignedTransactionManager,
-            } satisfies AuthUser
+            assignedDepartment,
+            assignedDepartments,
+            assignedWindow,
+            assignedTransactionManager,
+        } satisfies AuthUser
 
-        if (!(req as any).user.id) return res.status(401).json({ message: "Invalid token" })
+        if (!(req as any).user.id) {
+            res.setHeader("X-Error-Message", "Invalid token")
+            return res.status(401).json({ message: "Invalid token" })
+        }
 
         next()
     } catch {
+        res.setHeader("X-Error-Message", "Invalid/expired token")
         return res.status(401).json({ message: "Invalid/expired token" })
     }
 }
@@ -223,7 +248,10 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 export async function requireParticipantAuth(req: Request, res: Response, next: NextFunction) {
     try {
         const token = readBearerToken(req)
-        if (!token) return res.status(401).json({ message: "Missing participant token" })
+        if (!token) {
+            res.setHeader("X-Error-Message", "Missing participant token")
+            return res.status(401).json({ message: "Missing participant token" })
+        }
 
         let participant: ParticipantAuthUser | null = null
 
@@ -256,12 +284,14 @@ export async function requireParticipantAuth(req: Request, res: Response, next: 
         }
 
         if (!participant) {
+            res.setHeader("X-Error-Message", "Invalid/expired participant token")
             return res.status(401).json({ message: "Invalid/expired participant token" })
         }
 
-        ; (req as any).participant = participant satisfies ParticipantAuthUser
+        ;(req as any).participant = participant satisfies ParticipantAuthUser
         next()
     } catch {
+        res.setHeader("X-Error-Message", "Invalid/expired participant token")
         return res.status(401).json({ message: "Invalid/expired participant token" })
     }
 }
@@ -269,13 +299,20 @@ export async function requireParticipantAuth(req: Request, res: Response, next: 
 export function requireRole(...roles: UserRole[]) {
     return (req: Request, res: Response, next: NextFunction) => {
         const user = (req as any).user as AuthUser | undefined
-        if (!user) return res.status(401).json({ message: "Unauthorized" })
-        if (!roles.includes(user.role)) return res.status(403).json({ message: "Forbidden" })
+        if (!user) {
+            res.setHeader("X-Error-Message", "Unauthorized")
+            return res.status(401).json({ message: "Unauthorized" })
+        }
+        if (!roles.includes(user.role)) {
+            res.setHeader("X-Error-Message", "Forbidden")
+            return res.status(403).json({ message: "Forbidden" })
+        }
         next()
     }
 }
 
 export function notFoundHandler(_req: Request, res: Response) {
+    res.setHeader("X-Error-Message", "Not found")
     res.status(404).json({ message: "Not found" })
 }
 
@@ -286,5 +323,6 @@ export function errorHandler(err: any, _req: Request, res: Response, _next: Next
 
     const status = Number(err?.status || 500)
     const message = err?.message || "Server error"
+    res.setHeader("X-Error-Message", String(message))
     res.status(status).json({ message })
 }
