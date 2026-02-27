@@ -36,8 +36,11 @@ router.get("/queue/window-assignments", staffController.windowAssignments)
 // ✅ Staff display snapshot (backend-integrated source for presenter/monitor UI)
 router.get("/display/snapshot", staffController.displaySnapshot)
 
-// ✅ Alias endpoint (explicit “full” snapshot; includes participant full names)
+// ✅ Alias endpoint (explicit “full” snapshot; includes participant full names + student id/mobile display fields)
 router.get("/display/snapshot-full", staffController.displaySnapshot)
+
+// ✅ New alias for UIs that want an explicit “participants-enriched” name
+router.get("/display/snapshot-participants", staffController.displaySnapshot)
 
 // Queue lists
 router.get("/queue/waiting", staffController.listWaiting)
