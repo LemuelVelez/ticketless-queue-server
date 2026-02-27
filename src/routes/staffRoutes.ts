@@ -14,6 +14,9 @@ router.get("/me/assignment", staffController.myAssignment)
 // ✅ Staff display snapshot (backend-integrated source for presenter/monitor UI)
 router.get("/display/snapshot", staffController.displaySnapshot)
 
+// ✅ Alias endpoint (explicit “full” snapshot; includes participant full names)
+router.get("/display/snapshot-full", staffController.displaySnapshot)
+
 // Queue lists
 router.get("/queue/waiting", staffController.listWaiting)
 router.get("/queue/hold", staffController.listHold)

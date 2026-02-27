@@ -117,6 +117,19 @@ function firstNonEmptyText(candidates: unknown[]): string {
     return ""
 }
 
+function buildPersonFullName(personLike: any): string {
+    const name = String(personLike?.name ?? "").trim()
+    if (name) return name
+
+    const composed = [personLike?.firstName, personLike?.middleName, personLike?.lastName]
+        .map((x) => String(x ?? "").trim())
+        .filter(Boolean)
+        .join(" ")
+        .trim()
+
+    return composed
+}
+
 function resolveQueuePurpose(ticket: any): string | null {
     // 1) Array label candidates (most readable)
     const arrayLabelCandidates = [
@@ -386,14 +399,16 @@ async function enrichTickets(tickets: any[]) {
             ? UserModel.find({
                 $or: [{ studentId: { $in: studentIds } }, { tcNumber: { $in: studentIds } }],
             })
-                .select("_id role type studentId tcNumber")
+                .select("_id name firstName middleName lastName role type studentId tcNumber")
                 .lean()
             : Promise.resolve([] as any[]),
         ticketIds.length
-            ? TicketTransactionSelectionModel.find({
-                ticket: { $in: ticketIds.map((id) => asObjectIdOrString(id)) },
-            })
-                .select("ticket participantType transactionKeys transactionLabels")
+            ? (TicketTransactionSelectionModel as any)
+                .find({
+                    ticket: { $in: ticketIds.map((id) => asObjectIdOrString(id)) },
+                })
+                .select("ticket participant participantType transactionKeys transactionLabels")
+                .populate({ path: "participant", select: "name firstName middleName lastName" })
                 .lean()
             : Promise.resolve([] as any[]),
     ])
@@ -408,13 +423,16 @@ async function enrichTickets(tickets: any[]) {
         windowMap.set(String(row._id), row)
     }
 
+    // ✅ Identity -> participant type AND full name (Students often live here)
     const participantTypeByIdentity = new Map<string, ParticipantType>()
+    const participantNameByIdentity = new Map<string, string>()
+
     for (const row of participantRows as any[]) {
         const normalized =
             normalizeParticipantType(row?.type) ||
             normalizeParticipantType(row?.role)
 
-        if (!normalized) continue
+        const fullName = buildPersonFullName(row)
 
         const keys = uniqueStringIds([
             String(row?.studentId ?? ""),
@@ -422,7 +440,8 @@ async function enrichTickets(tickets: any[]) {
         ])
 
         for (const key of keys) {
-            participantTypeByIdentity.set(key, normalized)
+            if (normalized) participantTypeByIdentity.set(key, normalized)
+            if (fullName) participantNameByIdentity.set(key, fullName)
         }
     }
 
@@ -432,6 +451,8 @@ async function enrichTickets(tickets: any[]) {
             participantType: ParticipantType | null
             transactionKeys: string[]
             transactionLabels: string[]
+            participantId: string | null
+            participantFullName: string | null
         }
     >()
 
@@ -443,11 +464,23 @@ async function enrichTickets(tickets: any[]) {
             participantType: null as ParticipantType | null,
             transactionKeys: [] as string[],
             transactionLabels: [] as string[],
+            participantId: null as string | null,
+            participantFullName: null as string | null,
         }
 
         const p = normalizeParticipantType(row?.participantType)
         if (!existing.participantType && p) {
             existing.participantType = p
+        }
+
+        const participantId = normalizeIdString(row?.participant) || normalizeIdString(row?.participant?._id)
+        if (!existing.participantId && participantId) {
+            existing.participantId = participantId
+        }
+
+        const selectionName = buildPersonFullName(row?.participant)
+        if (!existing.participantFullName && selectionName) {
+            existing.participantFullName = selectionName
         }
 
         existing.transactionKeys = uniqueStringIds([
@@ -503,6 +536,15 @@ async function enrichTickets(tickets: any[]) {
             txSelection?.participantType ||
             (studentId ? participantTypeByIdentity.get(studentId) || null : null)
 
+        // ✅ full name priority:
+        // 1) TicketTransactionSelection participant (Alumni/Guest/Student)
+        // 2) UserModel name lookup (Student)
+        const participantFullName =
+            firstNonEmptyText([
+                txSelection?.participantFullName,
+                studentId ? participantNameByIdentity.get(studentId) : "",
+            ]) || null
+
         const transactionsPayload = {
             ...(t?.transactions && typeof t.transactions === "object" ? t.transactions : {}),
             participantType: participantType || null,
@@ -543,8 +585,14 @@ async function enrichTickets(tickets: any[]) {
             windowName: win?.name ? String(win.name) : null,
 
             participantType: participantType || null,
+
+            // ✅ expose full name directly (best for UI)
+            participantFullName,
+
+            // ✅ participantLabel is what most UIs already render -> prefer full name
             participantLabel:
                 firstNonEmptyText([
+                    participantFullName || "",
                     t?.participantLabel,
                     t?.transactions?.participantTypeLabel,
                     t?.meta?.participantLabel,
@@ -561,7 +609,9 @@ async function enrichTickets(tickets: any[]) {
                 ? [
                     {
                         ticket: id || null,
+                        participant: txSelection.participantId,
                         participantType: txSelection.participantType,
+                        participantFullName: txSelection.participantFullName,
                         transactionKeys: txSelection.transactionKeys,
                         transactionLabels: txSelection.transactionLabels,
                     },
@@ -773,7 +823,7 @@ export const staffController = {
 
         const nowServingDoc = await TicketModel.findOne(nowServingQuery)
             .sort({ calledAt: -1, updatedAt: -1 })
-            .select("_id queueNumber department window windowNumber calledAt")
+            .select("_id queueNumber department window windowNumber calledAt studentId participantType participantLabel")
             .lean()
 
         const upNextDocs = await TicketModel.find({
@@ -783,7 +833,7 @@ export const staffController = {
         })
             .sort({ queueNumber: 1, waitingSince: 1 })
             .limit(upNextCount)
-            .select("_id queueNumber department")
+            .select("_id queueNumber department studentId participantType participantLabel")
             .lean()
 
         const [nowServingEnriched] = nowServingDoc ? await enrichTickets([nowServingDoc]) : [null]
@@ -838,8 +888,16 @@ export const staffController = {
             status: "CALLED",
         })
             .sort({ calledAt: -1, updatedAt: -1 })
-            .select("_id queueNumber department window windowNumber calledAt")
+            .select("_id queueNumber department window windowNumber calledAt studentId participantType participantLabel")
             .lean()
+
+        // ✅ enrich once so we can show participant full names across the board
+        const boardCalledEnriched = await enrichTickets(boardCalledRows as any[])
+        const boardCalledById = new Map<string, any>()
+        for (const row of boardCalledEnriched as any[]) {
+            const tid = normalizeIdString(row?.id ?? row?._id)
+            if (tid) boardCalledById.set(tid, row)
+        }
 
         const latestCalledByWindowKey = new Map<string, any>()
         for (const row of boardCalledRows as any[]) {
@@ -882,6 +940,9 @@ export const staffController = {
                 (calledKeyByNumber ? latestCalledByWindowKey.get(calledKeyByNumber) : null) ||
                 null
 
+            const calledId = normalizeIdString((called as any)?._id)
+            const calledEnriched = calledId ? boardCalledById.get(calledId) || null : null
+
             const calledDepartmentId = normalizeIdString((called as any)?.department)
             const calledDepartment = calledDepartmentId ? handledDepartmentMap.get(calledDepartmentId) : null
 
@@ -898,6 +959,10 @@ export const staffController = {
                         departmentId: calledDepartmentId || null,
                         departmentName: calledDepartment?.name ? String(calledDepartment.name) : null,
                         departmentCode: calledDepartment?.code ? String(calledDepartment.code) : null,
+                        participantFullName: (calledEnriched as any)?.participantFullName ?? null,
+                        participantLabel: (calledEnriched as any)?.participantLabel ?? null,
+                        participantType: (calledEnriched as any)?.participantType ?? null,
+                        participantTypeLabel: (calledEnriched as any)?.transactions?.participantTypeLabel ?? null,
                         calledAt: (called as any)?.calledAt ? new Date((called as any).calledAt).toISOString() : null,
                     }
                     : null,
@@ -931,6 +996,10 @@ export const staffController = {
                             : typeof scope.windowNumber === "number"
                                 ? scope.windowNumber
                                 : null,
+                    participantFullName: (nowServingEnriched as any).participantFullName ?? null,
+                    participantLabel: (nowServingEnriched as any).participantLabel ?? null,
+                    participantType: (nowServingEnriched as any).participantType ?? null,
+                    participantTypeLabel: (nowServingEnriched as any)?.transactions?.participantTypeLabel ?? null,
                     calledAt: (nowServingEnriched as any).calledAt
                         ? new Date((nowServingEnriched as any).calledAt).toISOString()
                         : null,
@@ -942,6 +1011,10 @@ export const staffController = {
                 departmentId: row.departmentId || null,
                 departmentName: row.departmentName || null,
                 departmentCode: row.departmentCode || null,
+                participantFullName: row.participantFullName ?? null,
+                participantLabel: row.participantLabel ?? null,
+                participantType: row.participantType ?? null,
+                participantTypeLabel: row?.transactions?.participantTypeLabel ?? null,
             })),
             board: {
                 transactionManager: scope.assignedTransactionManager || null,
