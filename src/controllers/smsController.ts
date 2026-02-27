@@ -7,6 +7,8 @@ import {
     normalizePhilippinesMobileNumber,
     type ActorRef,
     type SendSmsOptions,
+    type SendSmsToQueuedUserResult,
+    type TicketStatusSmsResult,
 } from "../services/smsManagement"
 
 type SendSemaphoreSmsInput = {
@@ -19,7 +21,7 @@ type SmsControllerType = {
     sendSms: (req: Request, res: Response) => Promise<Response>
     sendTicketCalled: (req: Request, res: Response) => Promise<Response>
     sendTicketStatus: (req: Request, res: Response) => Promise<Response>
-    // ✅ New unified alias: /tickets/:id/sms
+    // ✅ Unified: /tickets/:id/sms
     sendTicketSms: (req: Request, res: Response) => Promise<Response>
 }
 
@@ -82,21 +84,71 @@ function summarizeStatuses(items: Array<{ status?: string }> = []) {
     return out
 }
 
-function extractProviderError(result: any): string | undefined {
-    if (!result || typeof result !== "object") return undefined
-    if (result.skipped === false && typeof result.error === "string" && result.error.trim()) {
-        return result.error.trim()
-    }
-    return undefined
-}
-
 function computeOutcome(result: any): "sent" | "skipped" | "failed" | "unknown" {
     if (!result || typeof result !== "object") return "unknown"
     if (result.skipped === true) return "skipped"
-    const err = extractProviderError(result)
-    if (err) return "failed"
+    if (result.skipped === false && typeof result.error === "string" && result.error.trim()) return "failed"
     if (result.skipped === false) return "sent"
     return "unknown"
+}
+
+function skippedReasonToHttpStatus(reason: string | undefined) {
+    if (!reason) return 400
+    if (reason === "opted_out") return 200
+    if (reason === "ticket_not_found") return 404
+    if (reason === "internal_error") return 500
+    // no_recipient | invalid_number | message_not_allowed
+    return 400
+}
+
+function respondTicketSms(
+    res: Response,
+    ctx: { ticketId: string; status?: string },
+    result: SendSmsToQueuedUserResult | TicketStatusSmsResult
+): Response {
+    const outcome = computeOutcome(result as any)
+
+    // ✅ New service behavior: it returns structured "skipped" results (no throw).
+    // Controller must map those to proper HTTP responses.
+    if ((result as any).skipped === true) {
+        const reason = String((result as any).reason || "unknown")
+        const httpStatus = skippedReasonToHttpStatus(reason)
+        const ok = httpStatus === 200 // only opted_out becomes ok=true
+
+        return res.status(httpStatus).json({
+            ok,
+            provider: "semaphore",
+            ticketId: ctx.ticketId,
+            status: ctx.status,
+            outcome,
+            reason,
+            error: (result as any).error,
+            result,
+        })
+    }
+
+    // Provider failure (upstream) -> HTTP 502 but include structured payload for UI
+    if ((result as any).skipped === false && typeof (result as any).error === "string" && (result as any).error.trim()) {
+        return res.status(502).json({
+            ok: false,
+            provider: "semaphore",
+            ticketId: ctx.ticketId,
+            status: ctx.status,
+            outcome,
+            error: (result as any).error,
+            result,
+        })
+    }
+
+    // Sent successfully
+    return res.status(200).json({
+        ok: true,
+        provider: "semaphore",
+        ticketId: ctx.ticketId,
+        status: ctx.status,
+        outcome,
+        result,
+    })
 }
 
 /**
@@ -124,13 +176,7 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
     try {
         const body = (req.body || {}) as any
 
-        const rawNumbers =
-            body.numbers ??
-            body.number ??
-            body.phone ??
-            body.mobileNumber ??
-            ""
-
+        const rawNumbers = body.numbers ?? body.number ?? body.phone ?? body.mobileNumber ?? ""
         const message = String(body.message ?? "").trim()
         const senderNameRaw = String(body.senderName ?? "").trim()
         const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
@@ -217,28 +263,7 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
                   options,
               })
 
-        const providerError = extractProviderError(result as any)
-        const outcome = computeOutcome(result as any)
-
-        // ✅ Provider failures should not become HTTP 500; return 502 for upstream failure.
-        if (providerError) {
-            return res.status(502).json({
-                ok: false,
-                provider: "semaphore",
-                ticketId: id,
-                outcome,
-                error: providerError,
-                result,
-            })
-        }
-
-        return res.status(200).json({
-            ok: true,
-            provider: "semaphore",
-            ticketId: id,
-            outcome,
-            result,
-        })
+        return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : "CALLED" }, result)
     } catch (error: any) {
         return res.status(inferHttpStatus(error)).json({
             ok: false,
@@ -248,7 +273,7 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
 }
 
 /**
- * New unified route handler: /tickets/:id/sms-status
+ * Route handler: /tickets/:id/sms-status
  * Body:
  * - status: "CALLED" | "HOLD" | "OUT" | "SERVED"
  * - message?: custom override (if provided, it will send custom message instead of templated status SMS)
@@ -296,29 +321,7 @@ async function sendTicketStatus(req: Request, res: Response): Promise<Response> 
                   options,
               })
 
-        const providerError = extractProviderError(result as any)
-        const outcome = computeOutcome(result as any)
-
-        if (providerError) {
-            return res.status(502).json({
-                ok: false,
-                provider: "semaphore",
-                ticketId: id,
-                status,
-                outcome,
-                error: providerError,
-                result,
-            })
-        }
-
-        return res.status(200).json({
-            ok: true,
-            provider: "semaphore",
-            ticketId: id,
-            status,
-            outcome,
-            result,
-        })
+        return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : status }, result)
     } catch (error: any) {
         return res.status(inferHttpStatus(error)).json({
             ok: false,
@@ -355,8 +358,6 @@ async function sendTicketSms(req: Request, res: Response): Promise<Response> {
             })
         }
 
-        // If status not provided and message not provided, we default to CALLED.
-        // If message provided, we send custom message regardless of status (custom overrides).
         const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
             senderName: senderName || undefined,
             priority: parseBooleanInput(body.priority, false),
@@ -382,29 +383,7 @@ async function sendTicketSms(req: Request, res: Response): Promise<Response> {
                   options,
               })
 
-        const providerError = extractProviderError(result as any)
-        const outcome = computeOutcome(result as any)
-
-        if (providerError) {
-            return res.status(502).json({
-                ok: false,
-                provider: "semaphore",
-                ticketId: id,
-                status: customMessage ? undefined : status,
-                outcome,
-                error: providerError,
-                result,
-            })
-        }
-
-        return res.status(200).json({
-            ok: true,
-            provider: "semaphore",
-            ticketId: id,
-            status: customMessage ? undefined : status,
-            outcome,
-            result,
-        })
+        return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : status }, result)
     } catch (error: any) {
         return res.status(inferHttpStatus(error)).json({
             ok: false,

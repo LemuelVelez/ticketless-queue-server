@@ -54,7 +54,7 @@ router.post("/tickets/:id/served", staffController.markServed)
 router.post("/tickets/:id/hold", staffController.holdNoShow)
 router.post("/tickets/:id/return", staffController.returnFromHold)
 
-// ✅ SMS operations (Semaphore) - now powered by centralized smsManagement service
+// ✅ SMS operations (Semaphore) - powered by centralized smsManagement service
 router.post("/sms/send", smsController.sendSms)
 
 // Legacy alias: sends CALLED status (or custom message if provided)
@@ -63,7 +63,7 @@ router.post("/tickets/:id/sms-called", smsController.sendTicketCalled)
 // Unified ticket status SMS (CALLED | HOLD | OUT | SERVED) + optional custom message override
 router.post("/tickets/:id/sms-status", smsController.sendTicketStatus)
 
-// ✅ New unified alias route (best DX): status OR custom message, defaults to CALLED if none
+// ✅ Primary endpoint used by UI: status OR custom message, defaults to CALLED if none
 router.post("/tickets/:id/sms", smsController.sendTicketSms)
 
 // ✅ Staff reports (scoped to assigned department)
