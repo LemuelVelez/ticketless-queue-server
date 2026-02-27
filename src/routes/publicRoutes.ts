@@ -40,6 +40,12 @@ function on(method: "get" | "post" | "put" | "patch" | "options", path: string, 
     }
 }
 
+/**
+ * ✅ OPTIONS handler to stop CORS preflight failures on public endpoints.
+ * Especially important for:
+ * - POST /tickets/join (application/json triggers preflight)
+ * - Any request sending Authorization or X-Session-Token
+ */
 const okOptions = (_req: any, res: any) => res.sendStatus(204)
 
 /**
@@ -67,11 +73,13 @@ function stripDepartmentOverride(req: any, _res: any, next: any) {
 // --------------------
 // Departments
 // --------------------
+on("options", "/departments", okOptions)
 on("get", "/departments", publicController.listDepartments)
 
 // --------------------
 // Home overview charts
 // --------------------
+on("options", "/home/overview", okOptions)
 on("get", "/home/overview", homeController.overview)
 
 // --------------------
@@ -102,19 +110,28 @@ for (const p of ["/auth/me", "/auth/profile"] as const) {
     on("post", p, publicController.updateParticipantProfile)
 }
 
+on("options", "/auth/logout", okOptions)
 on("post", "/auth/logout", publicController.logoutParticipant)
 
 // --------------------
 // Queue (public kiosk + participant-session supported by controller)
 // --------------------
+on("options", "/tickets/join", okOptions)
 on("post", "/tickets/join", publicController.joinQueue)
+
+on("options", "/tickets", okOptions)
 on("get", "/tickets", publicController.findActiveByStudent)
+
+on("options", "/tickets/:id", okOptions)
 on("get", "/tickets/:id", publicController.getTicket)
 
 // --------------------
 // Display-monitor actions remain participant-protected
 // --------------------
+on("options", "/tickets/present", okOptions)
 on("post", "/tickets/present", requireParticipantAuth, publicController.presentToDisplayMonitor)
+
+on("options", "/tickets/present-to-display-monitor", okOptions)
 on("post", "/tickets/present-to-display-monitor", requireParticipantAuth, publicController.presentToDisplayMonitor)
 
 export default router
