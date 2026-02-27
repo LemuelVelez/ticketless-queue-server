@@ -111,14 +111,45 @@ function fromJwtPayload(payload: Record<string, unknown>): ParticipantAuthUser |
     }
 }
 
-export function corsMiddleware(req: Request, res: Response, next: NextFunction) {
-    const origin = process.env.CLIENT_ORIGIN || "*"
+function parseAllowedOrigins(raw?: string): string[] {
+    const s = String(raw ?? "").trim()
+    if (!s) return []
+    return s
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean)
+}
 
-    // If you want to allow multiple origins, expand here.
-    res.header("Access-Control-Allow-Origin", origin)
+export function corsMiddleware(req: Request, res: Response, next: NextFunction) {
+    const reqOrigin = String(req.headers.origin ?? "").trim()
+    const allowed = parseAllowedOrigins(process.env.CLIENT_ORIGIN)
+
+    let allowOrigin = ""
+
+    // ✅ If CLIENT_ORIGIN is "*" or not set, echo the requesting origin (required for credentialed requests).
+    // This fixes “Join Queue not working” in cross-origin deployments where fetch uses credentials/include.
+    if (!allowed.length || allowed.includes("*")) {
+        allowOrigin = reqOrigin || "*"
+    } else if (reqOrigin && allowed.includes(reqOrigin)) {
+        allowOrigin = reqOrigin
+    } else {
+        // fallback: pick the first configured origin (better than "*")
+        allowOrigin = allowed[0] || reqOrigin || "*"
+    }
+
+    res.header("Access-Control-Allow-Origin", allowOrigin)
     res.header("Vary", "Origin")
-    res.header("Access-Control-Allow-Credentials", "true")
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
+
+    // Only send credentials=true when origin is explicit (not "*")
+    if (allowOrigin && allowOrigin !== "*") {
+        res.header("Access-Control-Allow-Credentials", "true")
+    }
+
+    res.header(
+        "Access-Control-Allow-Headers",
+        "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Session-Token, X-SessionToken, X-Error-Message"
+    )
+    res.header("Access-Control-Expose-Headers", "X-Error-Message")
     res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
 
     if (req.method === "OPTIONS") return res.sendStatus(204)

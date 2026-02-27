@@ -650,6 +650,12 @@ export const publicController = {
 
         // New participant-session based flow
         if (sessionToken && hasModernPayload) {
+            // ✅ keep these outside try so we can return a helpful 409 response with the existing ticket
+            let lockedDepartmentId = ""
+            let departmentIdToUse = ""
+            let participantStudentId = ""
+            let profileForLookup: any = null
+
             try {
                 const state = await verifyParticipantSession(sessionToken)
                 if (!state) return res.status(401).json({ message: "Invalid or expired session" })
@@ -665,11 +671,17 @@ export const publicController = {
                     // ignore
                 }
 
+                profileForLookup = profile
+
                 // 🔒 Department is LOCKED to the participant record.
                 // Ignore any client-provided departmentId to prevent switching departments after registration.
-                const lockedDepartmentId = extractDepartmentIdFromProfileOrState(profile, state)
+                lockedDepartmentId = extractDepartmentIdFromProfileOrState(profile, state)
                 const fallbackDepartmentId = asString(body.departmentId || body.department)
-                const departmentIdToUse = lockedDepartmentId || fallbackDepartmentId
+                departmentIdToUse = lockedDepartmentId || fallbackDepartmentId
+
+                participantStudentId =
+                    asString(profile?.tcNumber || profile?.studentId) ||
+                    asString(body.studentId || body.participantId || body.tcNumber || body.idNumber)
 
                 const transactionKeys: string[] = asStringArray(body.transactionKeys)
 
@@ -703,7 +715,42 @@ export const publicController = {
                 })
             } catch (err) {
                 const message = err instanceof Error ? err.message : "Unable to join queue"
-                return res.status(knownErrorStatus(message)).json({ message })
+                const status = knownErrorStatus(message)
+
+                // ✅ UX FIX: When duplicate/active ticket happens in session-flow,
+                // return the existing active ticket so the frontend can show it (names first via populate).
+                if (status === 409) {
+                    try {
+                        const deptId = String(departmentIdToUse || "").trim()
+                        const sid = String(participantStudentId || "").trim()
+
+                        if (deptId && sid) {
+                            const existing = await TicketModel.findOne({
+                                department: deptId,
+                                dateKey: todayKey(),
+                                studentId: sid,
+                                status: { $in: ACTIVE_STATUSES as any },
+                            })
+                                .sort({ createdAt: -1 })
+                                .populate("department", "name enabled")
+
+                            if (existing) {
+                                return res.status(409).json({
+                                    message: "You already have an active ticket for today.",
+                                    ticket: existing,
+                                    departmentLocked: Boolean(lockedDepartmentId),
+                                })
+                            }
+                        }
+
+                        // fallback: if we can’t locate it, still return 409
+                        return res.status(409).json({ message })
+                    } catch {
+                        return res.status(409).json({ message })
+                    }
+                }
+
+                return res.status(status).json({ message })
             }
         }
 
