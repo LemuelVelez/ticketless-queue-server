@@ -12,10 +12,18 @@ import { UserModel } from "../models/User"
  * - Params: apikey, number (comma-separated), message, sendername (optional)
  * - Note: Messages that START with the word "TEST" are silently ignored by Semaphore.
  * - Limits: /messages is rate-limited; /priority and /otp are not. (See Semaphore docs.)
+ *
+ * Response includes:
+ * - network: recipient phone number's network
+ * - status: Queued | Pending | Sent | Failed | Refunded
  */
 const SEMAPHORE_MESSAGES_URL = "https://api.semaphore.co/api/v4/messages"
 const SEMAPHORE_PRIORITY_URL = "https://api.semaphore.co/api/v4/priority"
 const SEMAPHORE_OTP_URL = "https://api.semaphore.co/api/v4/otp"
+
+// Semaphore says it supports all PH mobile networks (Globe, Smart, Sun, Dito).
+// Network values returned by API can vary in casing/format, so we match loosely.
+const DEFAULT_SUPPORTED_NETWORK_TOKENS = ["GLOBE", "SMART", "SUN", "DITO", "TM", "TNT"]
 
 export type ActorRef = {
     id?: string | Types.ObjectId
@@ -75,6 +83,45 @@ export type SendSmsOptions = {
      * If true (default), respects a user's smsUpdates=false when user can be resolved.
      */
     respectOptOut?: boolean
+    /**
+     * Optional: override supported network tokens used for reliability checks.
+     */
+    supportedNetworkTokens?: string[]
+}
+
+export type SmsDeliveryStatus = "QUEUED" | "PENDING" | "SENT" | "FAILED" | "REFUNDED" | "UNKNOWN"
+
+export type SmsReliabilityInfo = {
+    deliveryStatus: SmsDeliveryStatus
+    providerNetwork?: string
+    supportedNetwork: boolean | null
+    providerMessageId?: number
+    rawStatus?: SemaphoreMessageStatus
+}
+
+export type SendSmsToQueuedUserResult =
+    | {
+          skipped: true
+          reason: "opted_out"
+      }
+    | {
+          skipped: false
+          sentTo: string
+          provider: "semaphore"
+          reliability: SmsReliabilityInfo
+          providerResponse: SemaphoreMessageResponse[]
+      }
+
+export type TicketStatusSmsResult = SendSmsToQueuedUserResult & {
+    advanceNotice?: {
+        enabled: boolean
+        attempted: boolean
+        // if attempted, nextTicketId is provided even when skipped/failed
+        nextTicketId?: string
+        nextQueueNumber?: number
+        result?: SendSmsToQueuedUserResult
+        error?: string
+    }
 }
 
 /**
@@ -82,7 +129,8 @@ export type SendSmsOptions = {
  * - semaphore_api_key
  *
  * OPTIONAL ENV:
- * - semaphore_sendername  (recommended: since "Semaphore" sender name is no longer allowed in many cases)
+ * - semaphore_sendername (recommended: starting July 1, 2024 users can no longer send from "Semaphore" sender name)
+ * - queue_sms_advance_notice_enabled (true/false)  -> global toggle for advance notice SMS
  */
 function getSemaphoreApiKey(): string {
     const key = (process.env.semaphore_api_key || process.env.SEMAPHORE_API_KEY || "").trim()
@@ -97,6 +145,21 @@ function getSemaphoreApiKey(): string {
 function getDefaultSenderName(): string | undefined {
     const name = (process.env.semaphore_sendername || process.env.SEMAPHORE_SENDERNAME || "").trim()
     return name || undefined
+}
+
+function parseBooleanEnv(value: string | undefined, defaultValue = false) {
+    if (!value) return defaultValue
+    const v = value.trim().toLowerCase()
+    if (["1", "true", "yes", "y", "on", "enabled"].includes(v)) return true
+    if (["0", "false", "no", "n", "off", "disabled"].includes(v)) return false
+    return defaultValue
+}
+
+function isAdvanceNoticeGloballyEnabled() {
+    return parseBooleanEnv(
+        process.env.queue_sms_advance_notice_enabled || process.env.QUEUE_SMS_ADVANCE_NOTICE_ENABLED,
+        false
+    )
 }
 
 /**
@@ -131,6 +194,11 @@ export function normalizePhilippinesMobileNumber(input: string): string {
     return cleaned
 }
 
+function isValidPhilippinesMobileNumber(normalized: string) {
+    // 63 + 10 digits
+    return /^63\d{10}$/.test(String(normalized || ""))
+}
+
 function maskMobileNumber(num: string): string {
     const n = String(num ?? "")
     if (n.length <= 4) return "****"
@@ -144,6 +212,40 @@ function ensureMessageAllowed(message: string) {
     if (/^test\b/i.test(trimmed)) {
         throw new Error('SMS message must not start with the word "TEST" (Semaphore silently ignores these).')
     }
+}
+
+function normalizeNetworkTokens(network: string | undefined | null) {
+    const raw = String(network || "").trim()
+    if (!raw) return []
+    // split by non-alphanumerics
+    return raw
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, " ")
+        .split(" ")
+        .map((t) => t.trim())
+        .filter(Boolean)
+}
+
+function checkSupportedNetwork(
+    network: string | undefined | null,
+    supportedTokens: string[]
+): { supported: boolean | null; tokens: string[] } {
+    const tokens = normalizeNetworkTokens(network)
+    if (!tokens.length) return { supported: null, tokens: [] }
+
+    const set = new Set(supportedTokens.map((x) => String(x).toUpperCase().trim()).filter(Boolean))
+    const supported = tokens.some((t) => set.has(t))
+    return { supported, tokens }
+}
+
+function mapDeliveryStatus(status?: SemaphoreMessageStatus): SmsDeliveryStatus {
+    if (!status) return "UNKNOWN"
+    if (status === "Queued") return "QUEUED"
+    if (status === "Pending") return "PENDING"
+    if (status === "Sent") return "SENT"
+    if (status === "Failed") return "FAILED"
+    if (status === "Refunded") return "REFUNDED"
+    return "UNKNOWN"
 }
 
 async function postSemaphore(
@@ -194,6 +296,11 @@ async function postSemaphore(
  * - Automatically normalizes PH numbers
  * - Supports bulk (<=1000 numbers per call, Semaphore limit)
  * - Supports priority and OTP endpoints
+ *
+ * Reliability enhancements:
+ * - Validates PH mobile number format (63 + 10 digits); filters invalid numbers and logs them
+ * - Tracks supported networks (based on Semaphore coverage), and logs unsupported/unknown
+ * - Logs per-call status summary + response preview + errors (failed requests)
  */
 export async function sendSms(
     numbers: string | string[],
@@ -206,7 +313,7 @@ export async function sendSms(
     const senderName = (opts.senderName || getDefaultSenderName() || "").trim() || undefined
 
     const list = Array.isArray(numbers) ? numbers : String(numbers ?? "").split(",")
-    const normalized = Array.from(
+    const normalizedAll = Array.from(
         new Set(
             list
                 .map((n) => normalizePhilippinesMobileNumber(String(n)))
@@ -215,15 +322,44 @@ export async function sendSms(
         )
     )
 
-    if (!normalized.length) throw new Error("No valid recipient mobile numbers provided.")
+    const invalidRecipients = normalizedAll.filter((n) => !isValidPhilippinesMobileNumber(n))
+    const normalized = normalizedAll.filter((n) => isValidPhilippinesMobileNumber(n))
+
+    if (!normalized.length) {
+        throw new Error(
+            invalidRecipients.length
+                ? "No valid PH recipient mobile numbers provided (expected 09XXXXXXXXX / +639XXXXXXXXX / 639XXXXXXXXX)."
+                : "No valid recipient mobile numbers provided."
+        )
+    }
 
     // Semaphore allows up to 1000 recipients per API call for bulk messages
     const chunks: string[][] = []
     for (let i = 0; i < normalized.length; i += 1000) chunks.push(normalized.slice(i, i + 1000))
 
     const url = opts.otp ? SEMAPHORE_OTP_URL : opts.priority ? SEMAPHORE_PRIORITY_URL : SEMAPHORE_MESSAGES_URL
+    const supportedTokens = (opts.supportedNetworkTokens?.length
+        ? opts.supportedNetworkTokens
+        : DEFAULT_SUPPORTED_NETWORK_TOKENS
+    ).map((x) => String(x).toUpperCase().trim())
 
     const responses: SemaphoreMessageResponse[] = []
+
+    // If there were invalids, log once per sendSms call (not per chunk)
+    if (invalidRecipients.length) {
+        await maybeAuditLog({
+            actor: opts.actor,
+            action: "SMS_RECIPIENT_INVALID_FORMAT",
+            entityType: opts.entityType,
+            entityId: opts.entityId,
+            meta: {
+                provider: "semaphore",
+                invalidRecipientsCount: invalidRecipients.length,
+                invalidRecipientsMasked: invalidRecipients.slice(0, 10).map(maskMobileNumber),
+            },
+        })
+    }
+
     for (const chunk of chunks) {
         const payload: Record<string, string> = {
             apikey: apiKey,
@@ -236,8 +372,53 @@ export async function sendSms(
             payload.code = String(opts.otpCode)
         }
 
-        const r = await postSemaphore(url, payload)
+        let r: SemaphoreMessageResponse[] = []
+        try {
+            r = await postSemaphore(url, payload)
+        } catch (e: any) {
+            await maybeAuditLog({
+                actor: opts.actor,
+                action: "SMS_FAILED",
+                entityType: opts.entityType,
+                entityId: opts.entityId,
+                meta: {
+                    provider: "semaphore",
+                    endpoint: url,
+                    recipientsCount: chunk.length,
+                    recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber),
+                    messageLen: String(message).length,
+                    senderName: senderName ?? null,
+                    errorMessage: String(e?.message || "Unknown error"),
+                    httpStatus: e?.status ?? null,
+                    retryAfter: e?.retryAfter ?? null,
+                    providerErrorData: e?.data ?? null,
+                    ...opts.meta,
+                },
+            })
+            throw e
+        }
+
         responses.push(...r)
+
+        const statusSummary = summarizeStatuses(r)
+        const responsePreview = r.slice(0, 10).map((x) => ({
+            recipient: maskMobileNumber(String(x?.recipient || "")),
+            status: x?.status,
+            network: x?.network,
+            message_id: x?.message_id,
+        }))
+
+        const supportedSummary = summarizeSupportedNetworks(r, supportedTokens)
+        const unsupportedPreview = r
+            .filter((x) => {
+                const chk = checkSupportedNetwork(x?.network, supportedTokens)
+                return chk.supported === false
+            })
+            .slice(0, 10)
+            .map((x) => ({
+                recipient: maskMobileNumber(String(x?.recipient || "")),
+                network: x?.network,
+            }))
 
         // Audit per API call (not per recipient) to avoid spammy logs
         await maybeAuditLog({
@@ -249,13 +430,34 @@ export async function sendSms(
                 provider: "semaphore",
                 endpoint: url,
                 recipientsCount: chunk.length,
-                recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber), // keep small
+                recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber),
                 messageLen: String(message).length,
                 senderName: senderName ?? null,
-                responseStatuses: summarizeStatuses(r),
+                statusSummary,
+                supportedNetworkSummary: supportedSummary,
+                responsePreview,
+                ...(unsupportedPreview.length
+                    ? { unsupportedNetworkPreview: unsupportedPreview, unsupportedNetworkCount: supportedSummary.unsupported }
+                    : {}),
                 ...opts.meta,
             },
         })
+
+        // If there are unsupported/unknown networks, log a specific action for easier filtering
+        if (supportedSummary.unsupported > 0 || supportedSummary.unknown > 0) {
+            await maybeAuditLog({
+                actor: opts.actor,
+                action: "SMS_NETWORK_CHECK",
+                entityType: opts.entityType,
+                entityId: opts.entityId,
+                meta: {
+                    provider: "semaphore",
+                    endpoint: url,
+                    supportedNetworkSummary: supportedSummary,
+                    unsupportedNetworkPreview: unsupportedPreview,
+                },
+            })
+        }
     }
 
     return responses
@@ -268,6 +470,21 @@ function summarizeStatuses(items: SemaphoreMessageResponse[]) {
         out[key] = (out[key] || 0) + 1
     }
     return out
+}
+
+function summarizeSupportedNetworks(items: SemaphoreMessageResponse[], supportedTokens: string[]) {
+    let supported = 0
+    let unsupported = 0
+    let unknown = 0
+
+    for (const it of items || []) {
+        const chk = checkSupportedNetwork(it?.network, supportedTokens)
+        if (chk.supported === null) unknown += 1
+        else if (chk.supported) supported += 1
+        else unsupported += 1
+    }
+
+    return { supported, unsupported, unknown }
 }
 
 async function maybeAuditLog(args: {
@@ -323,16 +540,37 @@ async function resolveRecipientFromTicket(
     return { number: normalized, userId: String(user._id), optedOut }
 }
 
+function buildReliabilityInfoFromProvider(
+    providerResponse: SemaphoreMessageResponse[],
+    supportedTokens: string[]
+): SmsReliabilityInfo {
+    const first = providerResponse?.[0]
+    const rawStatus = first?.status
+    const deliveryStatus = mapDeliveryStatus(rawStatus)
+    const providerNetwork = first?.network ? String(first.network) : undefined
+    const supported = checkSupportedNetwork(providerNetwork, supportedTokens).supported
+    const providerMessageId = typeof first?.message_id === "number" ? first.message_id : undefined
+
+    return {
+        deliveryStatus,
+        providerNetwork,
+        supportedNetwork: supported,
+        providerMessageId,
+        rawStatus,
+    }
+}
+
 /**
  * Staff helper: Send a custom message to the currently queued participant (by ticketId).
  * - Uses ticket.phone first, else resolves via UserModel
  * - Respects smsUpdates=false when user can be resolved (default)
+ * - Adds reliability info: status/network/support
  */
 export async function sendSmsToQueuedUser(params: {
     ticketId: string
     message: string
     options?: Omit<SendSmsOptions, "entityType" | "entityId">
-}) {
+}): Promise<SendSmsToQueuedUserResult> {
     const { ticketId, message } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
@@ -366,24 +604,59 @@ export async function sendSmsToQueuedUser(params: {
 
     if (!resolved.number) throw new Error("No valid recipient phone number found for this ticket.")
 
+    const supportedTokens = (options.supportedNetworkTokens?.length
+        ? options.supportedNetworkTokens
+        : DEFAULT_SUPPORTED_NETWORK_TOKENS
+    ).map((x) => String(x).toUpperCase().trim())
+
     const resp = await sendSms(resolved.number, message, options)
+    const reliability = buildReliabilityInfoFromProvider(resp, supportedTokens)
+
+    // If unsupported/unknown, create a focused audit entry (helps UI filters)
+    if (reliability.supportedNetwork === false || reliability.supportedNetwork === null) {
+        await maybeAuditLog({
+            actor: options.actor,
+            action: "SMS_UNSUPPORTED_OR_UNKNOWN_NETWORK",
+            entityType: "TICKET",
+            entityId: ticketId,
+            meta: {
+                provider: "semaphore",
+                providerNetwork: reliability.providerNetwork ?? null,
+                supportedNetwork: reliability.supportedNetwork,
+                deliveryStatus: reliability.deliveryStatus,
+                providerMessageId: reliability.providerMessageId ?? null,
+            },
+        })
+    }
+
     return {
         skipped: false,
         sentTo: resolved.number,
         provider: "semaphore",
+        reliability,
         providerResponse: resp,
     } as const
 }
 
 /**
  * Staff helper: Send a friendly status SMS based on ticket state (called/hold/out/served).
- * This is ideal for queue updates like "You are being called now".
+ *
+ * Optional Enhancement: Advance notice SMS (toggleable)
+ * - When sending SMS for the current live queue (usually status=CALLED),
+ *   automatically notify the NEXT WAITING ticket (smallest queueNumber > current.queueNumber).
+ * - Toggle priority:
+ *    1) explicit param options.meta.advanceNoticeEnabled (boolean) is NOT used (we keep it simple)
+ *    2) env queue_sms_advance_notice_enabled = true/false (global toggle)
+ *
+ * Reliability Checks:
+ * - Network supported/unknown is logged (uses provider response `network`)
+ * - Provider response preview + status summary are logged by sendSms()
  */
 export async function sendTicketStatusSms(params: {
     ticketId: string
     status: "CALLED" | "HOLD" | "OUT" | "SERVED"
     options?: Omit<SendSmsOptions, "entityType" | "entityId">
-}) {
+}): Promise<TicketStatusSmsResult> {
     const { ticketId, status } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
@@ -408,11 +681,126 @@ export async function sendTicketStatusSms(params: {
         windowNumber: windowNo,
     })
 
-    return sendSmsToQueuedUser({
+    // Send to CURRENT ticket
+    const currentResult = await sendSmsToQueuedUser({
         ticketId,
         message: msg,
         options,
     })
+
+    // Optional: Advance notice to NEXT ticket (only meaningful when calling current)
+    const advanceEnabled = isAdvanceNoticeGloballyEnabled()
+    const shouldAttemptAdvance = advanceEnabled && status === "CALLED"
+
+    let advanceNotice:
+        | {
+              enabled: boolean
+              attempted: boolean
+              nextTicketId?: string
+              nextQueueNumber?: number
+              result?: SendSmsToQueuedUserResult
+              error?: string
+          }
+        | undefined
+
+    if (!shouldAttemptAdvance) {
+        advanceNotice = {
+            enabled: advanceEnabled,
+            attempted: false,
+        }
+        return { ...(currentResult as any), advanceNotice }
+    }
+
+    try {
+        const nextTicket = await TicketModel.findOne({
+            department: ticket.department,
+            dateKey: ticket.dateKey,
+            status: "WAITING",
+            queueNumber: { $gt: ticket.queueNumber },
+        })
+            .sort({ queueNumber: 1 })
+            .lean()
+
+        if (!nextTicket) {
+            advanceNotice = {
+                enabled: true,
+                attempted: false,
+            }
+            return { ...(currentResult as any), advanceNotice }
+        }
+
+        const nextMsg = buildAdvanceNoticeMessage({
+            departmentLabel: deptLabel,
+            queueNumber: nextTicket.queueNumber,
+        })
+
+        const nextResult = await sendSmsToQueuedUser({
+            ticketId: String((nextTicket as any)._id),
+            message: nextMsg,
+            options: {
+                ...options,
+                meta: {
+                    ...(options.meta || {}),
+                    advanceNotice: true,
+                    relatedCurrentTicketId: ticketId,
+                    relatedCurrentQueueNumber: ticket.queueNumber,
+                },
+            },
+        })
+
+        advanceNotice = {
+            enabled: true,
+            attempted: true,
+            nextTicketId: String((nextTicket as any)._id),
+            nextQueueNumber: nextTicket.queueNumber,
+            result: nextResult,
+        }
+
+        await maybeAuditLog({
+            actor: options.actor,
+            action: "SMS_ADVANCE_NOTICE_SENT",
+            entityType: "TICKET",
+            entityId: String((nextTicket as any)._id),
+            meta: {
+                provider: "semaphore",
+                relatedCurrentTicketId: ticketId,
+                relatedCurrentQueueNumber: ticket.queueNumber,
+                nextQueueNumber: nextTicket.queueNumber,
+                nextTicketId: String((nextTicket as any)._id),
+                // keep it light: the detailed provider logging is already inside sendSms()
+                outcome: (nextResult as any)?.skipped ? "skipped" : "sent",
+            },
+        })
+
+        return { ...(currentResult as any), advanceNotice }
+    } catch (e: any) {
+        advanceNotice = {
+            enabled: true,
+            attempted: true,
+            error: String(e?.message || "Advance notice failed"),
+        }
+
+        await maybeAuditLog({
+            actor: options.actor,
+            action: "SMS_ADVANCE_NOTICE_FAILED",
+            entityType: "TICKET",
+            entityId: ticketId,
+            meta: {
+                provider: "semaphore",
+                errorMessage: String(e?.message || "Unknown error"),
+                status: status,
+            },
+        })
+
+        // Do NOT fail the main SMS if advance notice fails
+        return { ...(currentResult as any), advanceNotice }
+    }
+}
+
+function buildAdvanceNoticeMessage(args: { departmentLabel: string; queueNumber: number }) {
+    const dept = args.departmentLabel
+    const q = args.queueNumber
+    return `Queue Update (${dept}): Advance notice — you're next. Ticket #${q}. Please be ready.`
 }
 
 function buildTicketStatusMessage(args: {
