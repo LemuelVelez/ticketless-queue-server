@@ -19,10 +19,16 @@ import {
     validateTransactionsForParticipantInDepartment,
 } from "./registrarTransactions.service"
 
+/**
+ * Some codebases define ParticipantType without "GUEST" even if the app supports it.
+ * We safely widen here so queue join works for Student / Alumni-Visitor / Guest.
+ */
+type QueueJoinParticipantType = ParticipantType | "GUEST"
+
 type TicketTransactionSelectionDoc = {
     ticket: Types.ObjectId
     participant: Types.ObjectId
-    participantType: ParticipantType
+    participantType: QueueJoinParticipantType
     transactionKeys: string[]
     transactionLabels: string[]
     createdAt: Date
@@ -33,7 +39,10 @@ const TicketTransactionSelectionSchema = new Schema<TicketTransactionSelectionDo
     {
         ticket: { type: Schema.Types.ObjectId, ref: "Ticket", required: true, unique: true, index: true },
         participant: { type: Schema.Types.ObjectId, ref: "QueueParticipant", required: true, index: true },
-        participantType: { type: String, enum: ["STUDENT", "ALUMNI_VISITOR"], required: true },
+
+        // ✅ Allow STUDENT / ALUMNI_VISITOR / GUEST (fixes Guest join failures)
+        participantType: { type: String, enum: ["STUDENT", "ALUMNI_VISITOR", "GUEST"], required: true },
+
         transactionKeys: [{ type: String, required: true }],
         transactionLabels: [{ type: String, required: true }],
     },
@@ -90,7 +99,9 @@ export function getDateKeyManila(date = new Date()) {
 }
 
 function identifierOfParticipant(participant: mongoose.HydratedDocument<ParticipantDoc>) {
-    return participant.tcNumber || participant.mobileNumber
+    // ✅ Students usually have tcNumber; Alumni/Guest usually have mobileNumber
+    const anyP = participant as any
+    return anyP.tcNumber || anyP.studentId || anyP.mobileNumber || anyP.phone
 }
 
 function normalizeKey(input?: string) {
@@ -142,10 +153,10 @@ async function resolveWindowAndStaff(departmentId: Types.ObjectId) {
     let windowDoc =
         group.targetWindowNumber != null
             ? await ServiceWindowModel.findOne({
-                enabled: true,
-                number: group.targetWindowNumber,
-                department: { $in: group.handledDepartmentIds },
-            }).sort({ updatedAt: -1 })
+                  enabled: true,
+                  number: group.targetWindowNumber,
+                  department: { $in: group.handledDepartmentIds },
+              }).sort({ updatedAt: -1 })
             : null
 
     if (!windowDoc) {
@@ -167,7 +178,7 @@ async function resolveWindowAndStaff(departmentId: Types.ObjectId) {
     }
 
     if (windowDoc) {
-        ; (staffQuery.$or as Array<Record<string, unknown>>).unshift({ assignedWindow: windowDoc._id })
+        ;(staffQuery.$or as Array<Record<string, unknown>>).unshift({ assignedWindow: windowDoc._id })
     }
 
     const staff = await UserModel.findOne(staffQuery).sort({ updatedAt: -1, name: 1 })
@@ -241,6 +252,12 @@ async function resolveJoinDepartment(
     return requested._id
 }
 
+function participantTypeForTransactions(t: QueueJoinParticipantType) {
+    // ✅ If registrar transaction rules don’t explicitly include GUEST,
+    // treat it like Alumni/Visitor (least surprising behavior).
+    return (t === "GUEST" ? "ALUMNI_VISITOR" : t) as any
+}
+
 export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult> {
     const sessionState = await verifyParticipantSession(input.sessionToken)
     if (!sessionState) {
@@ -248,6 +265,9 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     }
 
     const { participant } = sessionState
+    const anyP = participant as any
+
+    const participantType = ((anyP.type || anyP.role || "GUEST") as string).toUpperCase() as QueueJoinParticipantType
     const accountName = buildAccountName(participant)
     const dateKey = getDateKeyManila()
 
@@ -260,8 +280,10 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
 
     const selectedDepartmentId = await resolveJoinDepartment(participant, input.departmentId)
 
+    const txType = participantTypeForTransactions(participantType)
+
     const validation = await validateTransactionsForParticipantInDepartment(
-        participant.type,
+        txType,
         selectedDepartmentId,
         input.transactionKeys || []
     )
@@ -269,21 +291,41 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         throw new Error(`Invalid transaction selection: ${validation.invalidKeys.join(", ")}`)
     }
 
-    const providedStudentId = String(input.studentId || "").trim()
+    const providedIdentifier = String(input.studentId || "").trim()
     const providedPhone = String(input.phone || "").trim()
 
-    const studentIdentifier = providedStudentId || identifierOfParticipant(participant)
-    if (!studentIdentifier) {
-        throw new Error("Student ID / identifier is required.")
+    // ✅ Identifier rules:
+    // - STUDENT: tcNumber/studentId preferred
+    // - ALUMNI_VISITOR/GUEST: mobileNumber preferred
+    const candidateStudent = String(anyP.tcNumber || anyP.studentId || "").trim()
+    const candidateMobile = String(anyP.mobileNumber || anyP.phone || "").trim()
+
+    const participantIdentifier =
+        providedIdentifier ||
+        (participantType === "STUDENT"
+            ? candidateStudent || candidateMobile
+            : candidateMobile || candidateStudent) ||
+        String(identifierOfParticipant(participant) || "").trim()
+
+    if (!participantIdentifier) {
+        if (participantType === "STUDENT") {
+            throw new Error("Student ID is required.")
+        }
+        throw new Error("Mobile number is required.")
     }
 
-    const phoneNumber = providedPhone || participant.mobileNumber || undefined
+    const phoneNumber = providedPhone || candidateMobile || undefined
+
+    // For non-students, ensure we have a phone/mobile to contact (better UX)
+    if ((participantType === "ALUMNI_VISITOR" || participantType === "GUEST") && !phoneNumber) {
+        throw new Error("Mobile number is required.")
+    }
 
     if (blockDuplicate) {
         const duplicate = await TicketModel.findOne({
             department: selectedDepartmentId,
             dateKey,
-            studentId: studentIdentifier,
+            studentId: participantIdentifier,
             status: { $in: ACTIVE_TICKET_STATUSES },
         })
 
@@ -299,8 +341,16 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         department: selectedDepartmentId,
         dateKey,
         queueNumber,
-        studentId: studentIdentifier,
+
+        // ✅ Field name stays "studentId" for backward compatibility,
+        // but now stores the participant identifier (Student ID or Mobile # for Alumni/Guest)
+        studentId: participantIdentifier,
+
         phone: phoneNumber,
+
+        // ✅ Important for staff visibility (Student / Alumni-Visitor / Guest)
+        participantType: participantType as any,
+
         status: "WAITING",
         holdAttempts: 0,
         waitingSince: new Date(),
@@ -309,14 +359,14 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     })
 
     const txLabelMap = await getTransactionLabelMapForDepartment(selectedDepartmentId, {
-        participantType: participant.type,
+        participantType: txType,
     })
     const selectedTransactionLabels = input.transactionKeys.map((key) => txLabelMap.get(key) || key)
 
     await TicketTransactionSelectionModel.create({
         ticket: ticket._id,
         participant: participant._id,
-        participantType: participant.type,
+        participantType,
         transactionKeys: input.transactionKeys,
         transactionLabels: selectedTransactionLabels,
     })
@@ -327,15 +377,16 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         entityId: ticket._id,
         meta: {
             participantId: participant._id.toString(),
-            participantType: participant.type,
+            participantType,
             accountName,
             departmentId: selectedDepartmentId.toString(),
             transactionKeys: input.transactionKeys,
-            studentId: studentIdentifier,
+            identifier: participantIdentifier,
             phone: phoneNumber,
             windowId: routing.window?._id?.toString(),
             windowNumber: routing.window?.number,
             staffId: routing.staff?._id?.toString(),
+            staffName: routing.staff?.name,
         },
     })
 

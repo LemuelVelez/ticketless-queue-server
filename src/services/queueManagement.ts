@@ -1,4 +1,4 @@
-import mongoose, { Types } from "mongoose"
+import { Types } from "mongoose"
 import { AuditLogModel } from "../models/AuditLog"
 import { DepartmentModel, type DepartmentDoc } from "../models/Department"
 import { QueueCounterModel } from "../models/QueueCounter"

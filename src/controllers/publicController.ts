@@ -433,6 +433,57 @@ export const publicController = {
         }
     },
 
+    // ✅ Guest signup (keeps same underlying logic but forces type/role to GUEST when supported)
+    signupGuest: async (req: Request, res: Response) => {
+        try {
+            const body = req.body || {}
+
+            const firstName = asString(body.firstName)
+            const middleName = asString(body.middleName)
+            const lastName = asString(body.lastName)
+
+            const mobileNumber = asString(body.mobileNumber || body.phone)
+            const pin = asString(body.pin || body.password)
+            const departmentId = asString(body.departmentId || body.department)
+
+            if (!departmentId) return res.status(400).json({ message: "departmentId is required" })
+            const deptObjId = safeObjectId(departmentId)
+            if (!deptObjId) return res.status(400).json({ message: "Invalid departmentId" })
+
+            const okDept = await ensureEnabledDepartment(deptObjId)
+            if (!okDept) return res.status(404).json({ message: "Department not found/disabled" })
+
+            const fullName = composeName(firstName, middleName, lastName)
+
+            const payload = {
+                ...body,
+
+                // ✅ force guest identity
+                type: "GUEST",
+                role: "GUEST",
+
+                firstName: optional(firstName),
+                middleName: optional(middleName),
+                lastName: optional(lastName),
+                mobileNumber: optional(mobileNumber),
+                pin: optional(pin),
+
+                departmentId: String(deptObjId),
+
+                department: optional(asString(body.department || departmentId)),
+                name: optional(asString(body.name)) || optional(fullName),
+                password: optional(asString(body.password || pin)),
+                phone: optional(asString(body.phone || mobileNumber)),
+            }
+
+            const result = await signupAlumniVisitor(payload as any)
+            return res.status(201).json(result)
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to signup guest"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
     loginStudent: async (req: Request, res: Response) => {
         try {
             const tcNumber = asString((req.body || {}).tcNumber || (req.body || {}).studentId)
@@ -451,6 +502,24 @@ export const publicController = {
     },
 
     loginAlumniVisitor: async (req: Request, res: Response) => {
+        try {
+            const mobileNumber = asString((req.body || {}).mobileNumber || (req.body || {}).phone)
+            const pin = asString((req.body || {}).pin || (req.body || {}).password)
+
+            if (!mobileNumber || !pin) {
+                return res.status(400).json({ message: "mobileNumber and pin are required" })
+            }
+
+            const result = await loginAlumniVisitor(mobileNumber, pin)
+            return res.json(result)
+        } catch (err) {
+            const message = err instanceof Error ? err.message : "Unable to login"
+            return res.status(knownErrorStatus(message)).json({ message })
+        }
+    },
+
+    // ✅ Guest login (same credential style: mobileNumber + pin)
+    loginGuest: async (req: Request, res: Response) => {
         try {
             const mobileNumber = asString((req.body || {}).mobileNumber || (req.body || {}).phone)
             const pin = asString((req.body || {}).pin || (req.body || {}).password)
@@ -653,7 +722,7 @@ export const publicController = {
             // ✅ keep these outside try so we can return a helpful 409 response with the existing ticket
             let lockedDepartmentId = ""
             let departmentIdToUse = ""
-            let participantStudentId = ""
+            let participantIdentifier = ""
             let profileForLookup: any = null
 
             try {
@@ -679,9 +748,11 @@ export const publicController = {
                 const fallbackDepartmentId = asString(body.departmentId || body.department)
                 departmentIdToUse = lockedDepartmentId || fallbackDepartmentId
 
-                participantStudentId =
+                // ✅ Use Student ID for students; Mobile # for Alumni/Guest (names > ids in UI)
+                participantIdentifier =
                     asString(profile?.tcNumber || profile?.studentId) ||
-                    asString(body.studentId || body.participantId || body.tcNumber || body.idNumber)
+                    asString(profile?.mobileNumber || profile?.phone) ||
+                    asString(body.studentId || body.participantId || body.tcNumber || body.idNumber || body.mobileNumber || body.phone)
 
                 const transactionKeys: string[] = asStringArray(body.transactionKeys)
 
@@ -693,8 +764,9 @@ export const publicController = {
                     transactionKeys,
                     presentDirectlyToDisplayMonitor: displayImmediately,
                     departmentId: optional(asString(departmentIdToUse)),
-                    studentId: optional(asString(body.studentId)),
-                    phone: optional(asString(body.phone)),
+                    // ✅ now supports Alumni/Guest identifiers too
+                    studentId: optional(asString(body.studentId || body.tcNumber || body.idNumber || body.mobileNumber || body.phone)),
+                    phone: optional(asString(body.phone || body.mobileNumber || profile?.mobileNumber || profile?.phone)),
                 })
 
                 // Backward-compatible response shape expected by existing frontend (ticket object).
@@ -722,7 +794,7 @@ export const publicController = {
                 if (status === 409) {
                     try {
                         const deptId = String(departmentIdToUse || "").trim()
-                        const sid = String(participantStudentId || "").trim()
+                        const sid = String(participantIdentifier || "").trim()
 
                         if (deptId && sid) {
                             const existing = await TicketModel.findOne({
@@ -756,11 +828,11 @@ export const publicController = {
 
         // Legacy flow fallback (departmentId + studentId)
         const departmentId = asString(body.departmentId)
-        const studentId = asString(body.studentId)
-        const phone = asString(body.phone)
+        const studentId = asString(body.studentId || body.tcNumber || body.mobileNumber || body.phone)
+        const phone = asString(body.phone || body.mobileNumber)
 
         if (!departmentId || !studentId) {
-            return res.status(400).json({ message: "departmentId and studentId are required" })
+            return res.status(400).json({ message: "departmentId and identifier are required" })
         }
 
         const dept = await DepartmentModel.findById(departmentId)

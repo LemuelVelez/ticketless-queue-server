@@ -87,11 +87,15 @@ on("get", "/home/overview", homeController.overview)
 // --------------------
 on("post", "/auth/signup/student", publicController.signupStudent)
 on("post", "/auth/signup/alumni-visitor", publicController.signupAlumniVisitor)
-on("post", "/auth/signup/guest", publicController.signupAlumniVisitor) // alias
+
+// ✅ Guest now has a dedicated controller method (forces type/role = GUEST when supported)
+on("post", "/auth/signup/guest", publicController.signupGuest)
 
 on("post", "/auth/login/student", publicController.loginStudent)
 on("post", "/auth/login/alumni-visitor", publicController.loginAlumniVisitor)
-on("post", "/auth/login/guest", publicController.loginAlumniVisitor) // alias
+
+// ✅ Guest login route
+on("post", "/auth/login/guest", publicController.loginGuest)
 
 // ✅ Session endpoint (GET/POST + PATCH/PUT for profile updates)
 on("options", "/auth/session", okOptions)
