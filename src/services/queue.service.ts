@@ -97,10 +97,58 @@ export function getDateKeyManila(date = new Date()) {
     return `${year}-${month}-${day}`
 }
 
+function looksLikePhoneNumber(input?: string) {
+    const raw = String(input || "").trim()
+    if (!raw) return false
+
+    // If it contains "@", it's almost certainly a real email address.
+    if (raw.includes("@")) return false
+
+    // Allow common phone chars; reject anything else.
+    if (!/^[\d+\-\s()]+$/.test(raw)) return false
+
+    // Require enough digits to be a real mobile number (PH typically 11, +63...).
+    const digits = raw.replace(/[^\d]/g, "")
+    return digits.length >= 10
+}
+
+function extractParticipantMobile(anyP: any) {
+    const fromFields = String(anyP?.mobileNumber || anyP?.phone || "").trim()
+    if (fromFields) return fromFields
+
+    // ✅ In this project, some participant records store the mobile number under `email`.
+    const fromEmail = String(anyP?.email || "").trim()
+    if (looksLikePhoneNumber(fromEmail)) return fromEmail
+
+    return ""
+}
+
+async function maybeBackfillParticipantMobileFromEmail(
+    participant: mongoose.HydratedDocument<ParticipantDoc>
+) {
+    const pAny = participant as any
+    const emailValue = String(pAny?.email || "").trim()
+    const emailMobile = looksLikePhoneNumber(emailValue) ? emailValue : ""
+
+    // Only backfill when the mobile fields are empty and email is clearly a phone number.
+    if (!emailMobile) return
+    if (String(pAny?.mobileNumber || "").trim() || String(pAny?.phone || "").trim()) return
+
+    try {
+        pAny.mobileNumber = emailMobile
+        pAny.phone = emailMobile
+        await participant.save()
+    } catch {
+        // Non-blocking: even if save fails due to schema/unique constraints,
+        // we still use the extracted number for queue join and display.
+    }
+}
+
 function identifierOfParticipant(participant: mongoose.HydratedDocument<ParticipantDoc>) {
     // ✅ Students usually have tcNumber; Alumni/Guest usually have mobileNumber
+    // ✅ In this project, some participants store mobile under `email` (so include it safely).
     const anyP = participant as any
-    return anyP.tcNumber || anyP.studentId || anyP.mobileNumber || anyP.phone
+    return anyP.tcNumber || anyP.studentId || extractParticipantMobile(anyP) || anyP.mobileNumber || anyP.phone
 }
 
 function normalizeKey(input?: string) {
@@ -487,7 +535,13 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     // - STUDENT: tcNumber/studentId preferred
     // - ALUMNI_VISITOR/GUEST: mobileNumber preferred
     const candidateStudent = String(anyP.tcNumber || anyP.studentId || "").trim()
-    const candidateMobile = String(anyP.mobileNumber || anyP.phone || "").trim()
+
+    // ✅ Fix: participant "mobile number" may be stored in `email` for your current data.
+    // We safely extract it (only if it looks like a phone number).
+    const candidateMobile = extractParticipantMobile(anyP)
+
+    // Optional: backfill participant.mobileNumber/phone when email holds the mobile number (non-blocking).
+    await maybeBackfillParticipantMobileFromEmail(participant)
 
     const participantIdentifier =
         providedIdentifier ||
