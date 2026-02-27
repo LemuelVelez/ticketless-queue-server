@@ -19,6 +19,8 @@ type SmsControllerType = {
     sendSms: (req: Request, res: Response) => Promise<Response>
     sendTicketCalled: (req: Request, res: Response) => Promise<Response>
     sendTicketStatus: (req: Request, res: Response) => Promise<Response>
+    // ✅ New unified alias: /tickets/:id/sms
+    sendTicketSms: (req: Request, res: Response) => Promise<Response>
 }
 
 function toErrorMessage(error: unknown): string {
@@ -80,6 +82,23 @@ function summarizeStatuses(items: Array<{ status?: string }> = []) {
     return out
 }
 
+function extractProviderError(result: any): string | undefined {
+    if (!result || typeof result !== "object") return undefined
+    if (result.skipped === false && typeof result.error === "string" && result.error.trim()) {
+        return result.error.trim()
+    }
+    return undefined
+}
+
+function computeOutcome(result: any): "sent" | "skipped" | "failed" | "unknown" {
+    if (!result || typeof result !== "object") return "unknown"
+    if (result.skipped === true) return "skipped"
+    const err = extractProviderError(result)
+    if (err) return "failed"
+    if (result.skipped === false) return "sent"
+    return "unknown"
+}
+
 /**
  * Backward-compatible helper export (in case other modules still import it).
  * Now delegates to the centralized smsManagement service.
@@ -105,7 +124,7 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
     try {
         const body = (req.body || {}) as any
 
-        const numbers =
+        const rawNumbers =
             body.numbers ??
             body.number ??
             body.phone ??
@@ -113,9 +132,14 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
             ""
 
         const message = String(body.message ?? "").trim()
-        const senderName = String(body.senderName ?? "").trim()
+        const senderNameRaw = String(body.senderName ?? "").trim()
+        const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
 
-        if (!numbers || (typeof numbers === "string" && !numbers.trim())) {
+        if (
+            !rawNumbers ||
+            (typeof rawNumbers === "string" && !rawNumbers.trim()) ||
+            (Array.isArray(rawNumbers) && rawNumbers.length === 0)
+        ) {
             return res.status(400).json({ ok: false, error: "number(s) is required" })
         }
 
@@ -138,7 +162,7 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
             meta: body.meta && typeof body.meta === "object" ? body.meta : undefined,
         }
 
-        const providerResponse = await sendSmsViaService(numbers, message, opts)
+        const providerResponse = await sendSmsViaService(rawNumbers, message, opts)
 
         return res.status(200).json({
             ok: true,
@@ -165,9 +189,10 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
         const body = (req.body || {}) as any
 
         const customMessage = String(body.message ?? "").trim()
-        const senderName = String(body.senderName ?? "").trim()
+        const senderNameRaw = String(body.senderName ?? "").trim()
+        const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
 
-        const options: SendSmsOptions = {
+        const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
             senderName: senderName || undefined,
             priority: parseBooleanInput(body.priority, false),
             otp: parseBooleanInput(body.otp, false),
@@ -192,10 +217,26 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
                   options,
               })
 
+        const providerError = extractProviderError(result as any)
+        const outcome = computeOutcome(result as any)
+
+        // ✅ Provider failures should not become HTTP 500; return 502 for upstream failure.
+        if (providerError) {
+            return res.status(502).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                outcome,
+                error: providerError,
+                result,
+            })
+        }
+
         return res.status(200).json({
             ok: true,
             provider: "semaphore",
             ticketId: id,
+            outcome,
             result,
         })
     } catch (error: any) {
@@ -219,7 +260,8 @@ async function sendTicketStatus(req: Request, res: Response): Promise<Response> 
 
         const status = String(body.status ?? "").trim().toUpperCase()
         const customMessage = String(body.message ?? "").trim()
-        const senderName = String(body.senderName ?? "").trim()
+        const senderNameRaw = String(body.senderName ?? "").trim()
+        const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
 
         const allowed = new Set(["CALLED", "HOLD", "OUT", "SERVED"])
         if (!status || !allowed.has(status)) {
@@ -229,7 +271,7 @@ async function sendTicketStatus(req: Request, res: Response): Promise<Response> 
             })
         }
 
-        const options: SendSmsOptions = {
+        const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
             senderName: senderName || undefined,
             priority: parseBooleanInput(body.priority, false),
             otp: parseBooleanInput(body.otp, false),
@@ -254,11 +296,113 @@ async function sendTicketStatus(req: Request, res: Response): Promise<Response> 
                   options,
               })
 
+        const providerError = extractProviderError(result as any)
+        const outcome = computeOutcome(result as any)
+
+        if (providerError) {
+            return res.status(502).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                status,
+                outcome,
+                error: providerError,
+                result,
+            })
+        }
+
         return res.status(200).json({
             ok: true,
             provider: "semaphore",
             ticketId: id,
             status,
+            outcome,
+            result,
+        })
+    } catch (error: any) {
+        return res.status(inferHttpStatus(error)).json({
+            ok: false,
+            error: toErrorMessage(error),
+        })
+    }
+}
+
+/**
+ * ✅ Unified alias route handler: /tickets/:id/sms
+ * Supports:
+ * - body.message (custom message)
+ * - body.status (CALLED|HOLD|OUT|SERVED)
+ * - if neither is provided: defaults to status=CALLED (matches legacy expectation)
+ */
+async function sendTicketSms(req: Request, res: Response): Promise<Response> {
+    try {
+        const { id } = req.params
+        const body = (req.body || {}) as any
+
+        const customMessage = String(body.message ?? "").trim()
+        const statusRaw = String(body.status ?? "").trim().toUpperCase()
+        const senderNameRaw = String(body.senderName ?? "").trim()
+        const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
+
+        const allowed = new Set(["CALLED", "HOLD", "OUT", "SERVED"])
+        const hasStatus = !!statusRaw
+        const status = hasStatus ? statusRaw : "CALLED"
+
+        if (hasStatus && !allowed.has(status)) {
+            return res.status(400).json({
+                ok: false,
+                error: 'status must be one of: "CALLED" | "HOLD" | "OUT" | "SERVED"',
+            })
+        }
+
+        // If status not provided and message not provided, we default to CALLED.
+        // If message provided, we send custom message regardless of status (custom overrides).
+        const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
+            senderName: senderName || undefined,
+            priority: parseBooleanInput(body.priority, false),
+            otp: parseBooleanInput(body.otp, false),
+            otpCode: body.otpCode,
+            respectOptOut: parseBooleanInput(body.respectOptOut, true),
+            supportedNetworkTokens: Array.isArray(body.supportedNetworkTokens)
+                ? body.supportedNetworkTokens
+                : undefined,
+            actor: getActorFromReq(req),
+            meta: body.meta && typeof body.meta === "object" ? body.meta : undefined,
+        }
+
+        const result = customMessage
+            ? await sendSmsToQueuedUser({
+                  ticketId: id,
+                  message: customMessage,
+                  options,
+              })
+            : await sendTicketStatusSms({
+                  ticketId: id,
+                  status: status as "CALLED" | "HOLD" | "OUT" | "SERVED",
+                  options,
+              })
+
+        const providerError = extractProviderError(result as any)
+        const outcome = computeOutcome(result as any)
+
+        if (providerError) {
+            return res.status(502).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                status: customMessage ? undefined : status,
+                outcome,
+                error: providerError,
+                result,
+            })
+        }
+
+        return res.status(200).json({
+            ok: true,
+            provider: "semaphore",
+            ticketId: id,
+            status: customMessage ? undefined : status,
+            outcome,
             result,
         })
     } catch (error: any) {
@@ -273,4 +417,5 @@ export const smsController: SmsControllerType = {
     sendSms,
     sendTicketCalled,
     sendTicketStatus,
+    sendTicketSms,
 }

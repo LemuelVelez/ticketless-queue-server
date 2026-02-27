@@ -63,6 +63,9 @@ router.post("/tickets/:id/sms-called", smsController.sendTicketCalled)
 // Unified ticket status SMS (CALLED | HOLD | OUT | SERVED) + optional custom message override
 router.post("/tickets/:id/sms-status", smsController.sendTicketStatus)
 
+// ✅ New unified alias route (best DX): status OR custom message, defaults to CALLED if none
+router.post("/tickets/:id/sms", smsController.sendTicketSms)
+
 // ✅ Staff reports (scoped to assigned department)
 router.get("/reports/summary", staffController.reportsSummary)
 router.get("/reports/timeseries", staffController.reportsTimeseries)
