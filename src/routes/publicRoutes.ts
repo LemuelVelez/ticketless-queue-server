@@ -129,6 +129,10 @@ on("get", "/tickets", publicController.findActiveByStudent)
 on("options", "/tickets/:id", okOptions)
 on("get", "/tickets/:id", publicController.getTicket)
 
+// ✅ Dedicated details alias (same handler, but clearer intent for frontend)
+on("options", "/tickets/:id/details", okOptions)
+on("get", "/tickets/:id/details", publicController.getTicket)
+
 // --------------------
 // Display-monitor actions remain participant-protected
 // --------------------

@@ -1,8 +1,10 @@
 import type { Request, Response } from "express"
 import mongoose, { Types } from "mongoose"
 
+import { AuditLogModel } from "../models/AuditLog"
 import { DepartmentModel } from "../models/Department"
 import { QueueCounterModel } from "../models/QueueCounter"
+import { ServiceWindowModel } from "../models/ServiceWindow"
 import { SettingModel } from "../models/Setting"
 import { TicketModel } from "../models/Ticket"
 import { UserModel } from "../models/User"
@@ -324,6 +326,344 @@ function extractDepartmentIdFromProfileOrState(profile: any, state: any): string
 async function ensureEnabledDepartment(deptId: Types.ObjectId): Promise<boolean> {
     const exists = await DepartmentModel.exists({ _id: deptId, enabled: true })
     return Boolean(exists)
+}
+
+/** -----------------------------
+ * ✅ Ticket “Where to go” details (names > ids)
+ * ----------------------------- */
+
+function titleCaseWords(input?: string) {
+    const s = String(input || "").trim()
+    if (!s) return ""
+    return s
+        .toLowerCase()
+        .split(/[\s_]+/g)
+        .filter(Boolean)
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ")
+}
+
+function participantTypeLabel(t?: string) {
+    const type = String(t || "").toUpperCase()
+    if (type === "STUDENT") return "Student"
+    if (type === "ALUMNI_VISITOR") return "Alumni / Visitor"
+    if (type === "GUEST") return "Guest"
+    return "Participant"
+}
+
+function joinList(items: string[], max = 6) {
+    const clean = (items || []).map((x) => String(x || "").trim()).filter(Boolean)
+    if (!clean.length) return ""
+    if (clean.length <= max) return clean.join(", ")
+    return `${clean.slice(0, max).join(", ")} +${clean.length - max} more`
+}
+
+type PublicTicketDetails = {
+    ticketId: string
+    queueNumber: number
+    dateKey: string
+    status: string
+
+    participantType?: string
+    participantTypeLabel: string
+
+    departmentName?: string
+    departmentCode?: string
+    transactionManager?: string
+    officeLabel?: string
+
+    windowNumber?: number
+    windowName?: string
+
+    staffName?: string
+
+    servedDepartments: string[]
+    transactionLabels: string[]
+
+    whereToGo: string
+}
+
+function buildWhereToGo(params: {
+    status: string
+    queueNumber: number
+    participantType?: string
+    departmentName?: string
+    departmentCode?: string
+    transactionManager?: string
+    windowNumber?: number
+    windowName?: string
+    staffName?: string
+    servedDepartments?: string[]
+    transactionLabels?: string[]
+}) {
+    const pLabel = participantTypeLabel(params.participantType)
+
+    const deptLabel = params.departmentName
+        ? params.departmentCode
+            ? `${params.departmentName} (${params.departmentCode})`
+            : params.departmentName
+        : ""
+
+    const officeLabel = params.transactionManager ? titleCaseWords(params.transactionManager) : ""
+
+    const windowLabel = params.windowName
+        ? params.windowNumber
+            ? `${params.windowName} (Window ${params.windowNumber})`
+            : params.windowName
+        : params.windowNumber
+          ? `Window ${params.windowNumber}`
+          : ""
+
+    const served = joinList(params.servedDepartments || [])
+    const tx = joinList(params.transactionLabels || [])
+
+    const staffLine = params.staffName ? `Staff in charge: ${params.staffName}.` : ""
+    const servedLine = served ? `This window serves: ${served}.` : ""
+    const txLine = tx ? `Transactions: ${tx}.` : ""
+
+    const statusUpper = String(params.status || "").toUpperCase()
+    const statusLine =
+        statusUpper === "CALLED"
+            ? "Proceed now."
+            : statusUpper === "WAITING"
+              ? "When your number is called, proceed."
+              : "Proceed when instructed."
+
+    if (!windowLabel) {
+        return {
+            whereToGo: [
+                statusLine,
+                "Please check the display monitor for your assigned window.",
+                deptLabel ? `Department: ${deptLabel}.` : "",
+                officeLabel ? `Office: ${officeLabel}.` : "",
+                txLine,
+                staffLine,
+            ]
+                .map((x) => String(x || "").trim())
+                .filter(Boolean)
+                .join(" "),
+            participantTypeLabel: pLabel,
+            officeLabel,
+        }
+    }
+
+    return {
+        whereToGo: [
+            statusLine,
+            `Go to ${windowLabel}.`,
+            deptLabel ? `Department: ${deptLabel}.` : "",
+            officeLabel ? `Office: ${officeLabel}.` : "",
+            servedLine,
+            txLine,
+            staffLine,
+            `Queue number: ${params.queueNumber}.`,
+        ]
+            .map((x) => String(x || "").trim())
+            .filter(Boolean)
+            .join(" "),
+        participantTypeLabel: pLabel,
+        officeLabel,
+    }
+}
+
+function deptDisplayToken(d: any) {
+    const code = String(d?.code || "").trim()
+    const name = String(d?.name || "").trim()
+    return code || name
+}
+
+async function resolvePublicTicketDetailsFromTicket(ticket: any): Promise<PublicTicketDetails> {
+    const ticketId = String(ticket?._id || ticket?.id || "").trim()
+    const queueNumber = Number(ticket?.queueNumber || 0)
+    const dateKey = String(ticket?.dateKey || "").trim()
+    const status = String(ticket?.status || "").trim()
+
+    // department may be populated or not
+    let department: any = null
+    if (ticket?.department && typeof ticket.department === "object" && ticket.department.name) {
+        department = ticket.department
+    } else if (ticket?.department) {
+        department = await DepartmentModel.findById(ticket.department).select("name code transactionManager enabled").lean()
+    }
+
+    const selection = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id })
+        .select("transactionLabels participantType")
+        .lean()
+
+    const participantType = String(ticket?.participantType || selection?.participantType || "").trim() || undefined
+    const transactionLabels: string[] = Array.isArray(selection?.transactionLabels) ? selection!.transactionLabels : []
+
+    // window (name + served departments)
+    let windowDoc: any = null
+    if (ticket?.window) {
+        windowDoc = await ServiceWindowModel.findById(ticket.window)
+            .select("name number enabled department departmentIds")
+            .populate("department", "name code enabled")
+            .populate("departmentIds", "name code enabled")
+            .lean()
+    } else if (ticket?.windowNumber && ticket?.department) {
+        windowDoc = await ServiceWindowModel.findOne({
+            enabled: true,
+            number: Number(ticket.windowNumber),
+            department: ticket.department,
+        })
+            .select("name number enabled department departmentIds")
+            .populate("department", "name code enabled")
+            .populate("departmentIds", "name code enabled")
+            .lean()
+    }
+
+    const windowNumber = Number(ticket?.windowNumber || windowDoc?.number || 0) || undefined
+    const windowName = String(windowDoc?.name || "").trim() || undefined
+
+    const servedDepartmentsRaw: any[] = Array.isArray(windowDoc?.departmentIds) && windowDoc.departmentIds.length
+        ? windowDoc.departmentIds
+        : windowDoc?.department
+          ? [windowDoc.department]
+          : department
+            ? [department]
+            : []
+
+    const servedDepartments = servedDepartmentsRaw.map(deptDisplayToken).filter(Boolean)
+
+    // staff name (best-effort): pull from audit meta (QUEUE_JOINED)
+    const lastJoinAudit = await AuditLogModel.findOne({
+        entityType: "Ticket",
+        entityId: ticket._id,
+        action: "QUEUE_JOINED",
+    })
+        .select("meta createdAt")
+        .sort({ createdAt: -1 })
+        .lean()
+
+    const staffName = String((lastJoinAudit as any)?.meta?.staffName || "").trim() || undefined
+
+    const departmentName = String(department?.name || "").trim() || undefined
+    const departmentCode = String(department?.code || "").trim() || undefined
+    const transactionManager = String(department?.transactionManager || "").trim() || undefined
+
+    const built = buildWhereToGo({
+        status,
+        queueNumber,
+        participantType,
+        departmentName,
+        departmentCode,
+        transactionManager,
+        windowNumber,
+        windowName,
+        staffName,
+        servedDepartments,
+        transactionLabels,
+    })
+
+    return {
+        ticketId,
+        queueNumber,
+        dateKey,
+        status,
+
+        participantType,
+        participantTypeLabel: built.participantTypeLabel,
+
+        departmentName,
+        departmentCode,
+        transactionManager,
+        officeLabel: built.officeLabel,
+
+        windowNumber,
+        windowName,
+
+        staffName,
+
+        servedDepartments,
+        transactionLabels,
+
+        whereToGo: built.whereToGo,
+    }
+}
+
+function sanitizeJoinForPublic(joined: any) {
+    if (!joined || typeof joined !== "object") return joined
+
+    // Remove id-heavy fields from the public payload (names > ids)
+    const {
+        staffAssignedId, // prefer name
+        staffAssigned, // keep (name)
+        ...rest
+    } = joined
+
+    return {
+        ...rest,
+        staffAssigned: staffAssigned || rest?.nameOfPersonInCharge, // ensure we keep the display name
+    }
+}
+
+function mapJoinToPublicTicketDetails(joined: any): PublicTicketDetails {
+    const ticketId = String(joined?.ticketId || "").trim()
+    const queueNumber = Number(joined?.queueNumber || 0)
+    const dateKey = String(joined?.dateKey || "").trim()
+    const status = String(joined?.status || "").trim()
+
+    const participantType = String(joined?.participantType || "").trim() || undefined
+    const departmentName = String(joined?.departmentName || "").trim() || undefined
+    const departmentCode = String(joined?.departmentCode || "").trim() || undefined
+    const transactionManager = String(joined?.transactionManager || "").trim() || undefined
+
+    const windowNumber = joined?.windowNumber != null ? Number(joined.windowNumber) : undefined
+    const windowName = String(joined?.windowName || "").trim() || undefined
+
+    const staffName =
+        String(joined?.nameOfPersonInCharge || joined?.staffAssigned || "").trim() || undefined
+
+    const servedDepartments: string[] = Array.isArray(joined?.guidance?.servedDepartments)
+        ? joined.guidance.servedDepartments
+        : []
+
+    const transactionLabels: string[] = Array.isArray(joined?.guidance?.transactionLabels)
+        ? joined.guidance.transactionLabels
+        : Array.isArray(joined?.transactionLabels)
+          ? joined.transactionLabels
+          : []
+
+    const whereToGo = String(joined?.guidance?.whereToGo || "").trim()
+    const officeLabel = titleCaseWords(transactionManager)
+
+    return {
+        ticketId,
+        queueNumber,
+        dateKey,
+        status,
+
+        participantType,
+        participantTypeLabel: String(joined?.guidance?.participantTypeLabel || participantTypeLabel(participantType)).trim(),
+
+        departmentName,
+        departmentCode,
+        transactionManager,
+        officeLabel,
+
+        windowNumber,
+        windowName,
+
+        staffName,
+
+        servedDepartments,
+        transactionLabels,
+
+        whereToGo: whereToGo || buildWhereToGo({
+            status,
+            queueNumber,
+            participantType,
+            departmentName,
+            departmentCode,
+            transactionManager,
+            windowNumber,
+            windowName,
+            staffName,
+            servedDepartments,
+            transactionLabels,
+        }).whereToGo,
+    }
 }
 
 export const publicController = {
@@ -723,7 +1063,6 @@ export const publicController = {
             let lockedDepartmentId = ""
             let departmentIdToUse = ""
             let participantIdentifier = ""
-            let profileForLookup: any = null
 
             try {
                 const state = await verifyParticipantSession(sessionToken)
@@ -740,15 +1079,13 @@ export const publicController = {
                     // ignore
                 }
 
-                profileForLookup = profile
-
                 // 🔒 Department is LOCKED to the participant record.
                 // Ignore any client-provided departmentId to prevent switching departments after registration.
                 lockedDepartmentId = extractDepartmentIdFromProfileOrState(profile, state)
                 const fallbackDepartmentId = asString(body.departmentId || body.department)
                 departmentIdToUse = lockedDepartmentId || fallbackDepartmentId
 
-                // ✅ Use Student ID for students; Mobile # for Alumni/Guest (names > ids in UI)
+                // ✅ Use Student ID for students; Mobile # for Alumni/Guest
                 participantIdentifier =
                     asString(profile?.tcNumber || profile?.studentId) ||
                     asString(profile?.mobileNumber || profile?.phone) ||
@@ -764,13 +1101,14 @@ export const publicController = {
                     transactionKeys,
                     presentDirectlyToDisplayMonitor: displayImmediately,
                     departmentId: optional(asString(departmentIdToUse)),
-                    // ✅ now supports Alumni/Guest identifiers too
-                    studentId: optional(asString(body.studentId || body.tcNumber || body.idNumber || body.mobileNumber || body.phone)),
+                    studentId: optional(
+                        asString(body.studentId || body.tcNumber || body.idNumber || body.mobileNumber || body.phone)
+                    ),
                     phone: optional(asString(body.phone || body.mobileNumber || profile?.mobileNumber || profile?.phone)),
                 })
 
                 // Backward-compatible response shape expected by existing frontend (ticket object).
-                const ticketDoc = await TicketModel.findById(joined.ticketId).populate("department", "name enabled")
+                const ticketDoc = await TicketModel.findById(joined.ticketId).populate("department", "name code enabled transactionManager")
 
                 const fallbackTicket = {
                     _id: joined.ticketId,
@@ -780,9 +1118,13 @@ export const publicController = {
                     windowNumber: joined.windowNumber ?? null,
                 }
 
+                const joinPublic = sanitizeJoinForPublic(joined)
+                const ticketDetails = mapJoinToPublicTicketDetails(joined)
+
                 return res.status(201).json({
                     ticket: ticketDoc ?? fallbackTicket,
-                    join: joined,
+                    join: joinPublic,
+                    ticketDetails,
                     departmentLocked: Boolean(lockedDepartmentId),
                 })
             } catch (err) {
@@ -790,7 +1132,7 @@ export const publicController = {
                 const status = knownErrorStatus(message)
 
                 // ✅ UX FIX: When duplicate/active ticket happens in session-flow,
-                // return the existing active ticket so the frontend can show it (names first via populate).
+                // return the existing active ticket + “where to go” details (names first).
                 if (status === 409) {
                     try {
                         const deptId = String(departmentIdToUse || "").trim()
@@ -804,18 +1146,19 @@ export const publicController = {
                                 status: { $in: ACTIVE_STATUSES as any },
                             })
                                 .sort({ createdAt: -1 })
-                                .populate("department", "name enabled")
+                                .populate("department", "name code enabled transactionManager")
 
                             if (existing) {
+                                const ticketDetails = await resolvePublicTicketDetailsFromTicket(existing)
                                 return res.status(409).json({
                                     message: "You already have an active ticket for today.",
                                     ticket: existing,
+                                    ticketDetails,
                                     departmentLocked: Boolean(lockedDepartmentId),
                                 })
                             }
                         }
 
-                        // fallback: if we can’t locate it, still return 409
                         return res.status(409).json({ message })
                     } catch {
                         return res.status(409).json({ message })
@@ -826,7 +1169,7 @@ export const publicController = {
             }
         }
 
-        // Legacy flow fallback (departmentId + studentId)
+        // Legacy flow fallback (departmentId + identifier)
         const departmentId = asString(body.departmentId)
         const studentId = asString(body.studentId || body.tcNumber || body.mobileNumber || body.phone)
         const phone = asString(body.phone || body.mobileNumber)
@@ -835,7 +1178,7 @@ export const publicController = {
             return res.status(400).json({ message: "departmentId and identifier are required" })
         }
 
-        const dept = await DepartmentModel.findById(departmentId)
+        const dept = await DepartmentModel.findById(departmentId).select("name code transactionManager enabled")
         if (!dept || !dept.enabled) return res.status(404).json({ message: "Department not found/disabled" })
 
         const settings = await SettingModel.findOne({})
@@ -850,12 +1193,14 @@ export const publicController = {
                 dateKey,
                 studentId: sid,
                 status: { $in: ACTIVE_STATUSES as any },
-            })
+            }).populate("department", "name code enabled transactionManager")
 
             if (existing) {
+                const ticketDetails = await resolvePublicTicketDetailsFromTicket(existing)
                 return res.status(409).json({
                     message: "Duplicate active ticket is not allowed for this department",
                     ticket: existing,
+                    ticketDetails,
                 })
             }
         }
@@ -873,7 +1218,10 @@ export const publicController = {
             waitingSince: new Date(),
         })
 
-        return res.status(201).json({ ticket })
+        const ticketPop = await TicketModel.findById(ticket._id).populate("department", "name code enabled transactionManager")
+        const ticketDetails = await resolvePublicTicketDetailsFromTicket(ticketPop || ticket)
+
+        return res.status(201).json({ ticket: ticketPop || ticket, ticketDetails })
     },
 
     presentToDisplayMonitor: async (req: Request, res: Response) => {
@@ -882,7 +1230,47 @@ export const publicController = {
 
         try {
             const ticket = await presentDirectlyToDisplayMonitor(ticketId)
-            return res.json({ ticket })
+
+            // ✅ Return a user-friendly “where to go” details object (names > ids)
+            const ticketDetails = ticket?.guidance
+                ? mapJoinToPublicTicketDetails({
+                      ticketId: ticket.ticketId,
+                      queueNumber: ticket.queueNumber,
+                      dateKey: "",
+                      status: ticket.status,
+                      departmentName: ticket.departmentName,
+                      departmentCode: ticket.departmentCode,
+                      transactionManager: ticket.transactionManager,
+                      windowNumber: ticket.windowNumber,
+                      windowName: ticket.windowName,
+                      participantType: ticket.participantType,
+                      guidance: ticket.guidance,
+                      staffAssigned: undefined,
+                      nameOfPersonInCharge: undefined,
+                  })
+                : ({
+                      ticketId: String(ticket?.ticketId || "").trim(),
+                      queueNumber: Number(ticket?.queueNumber || 0),
+                      dateKey: "",
+                      status: String(ticket?.status || "").trim(),
+                      participantType: String(ticket?.participantType || "").trim() || undefined,
+                      participantTypeLabel: participantTypeLabel(ticket?.participantType),
+                      departmentName: String(ticket?.departmentName || "").trim() || undefined,
+                      departmentCode: String(ticket?.departmentCode || "").trim() || undefined,
+                      transactionManager: String(ticket?.transactionManager || "").trim() || undefined,
+                      officeLabel: titleCaseWords(ticket?.transactionManager),
+                      windowNumber: ticket?.windowNumber != null ? Number(ticket.windowNumber) : undefined,
+                      windowName: String(ticket?.windowName || "").trim() || undefined,
+                      staffName: undefined,
+                      servedDepartments: [],
+                      transactionLabels: Array.isArray(ticket?.transactionLabels) ? ticket.transactionLabels : [],
+                      whereToGo: `Proceed now. Please proceed to Window ${ticket?.windowNumber ?? ""}.`.trim(),
+                  } as PublicTicketDetails)
+
+            return res.json({
+                ticket,
+                ticketDetails,
+            })
         } catch (err) {
             const message = err instanceof Error ? err.message : "Unable to present ticket"
             return res.status(knownErrorStatus(message)).json({ message })
@@ -892,20 +1280,24 @@ export const publicController = {
     getTicket: async (req: Request, res: Response) => {
         const { id } = req.params
 
-        const ticket = await TicketModel.findById(id).populate("department", "name enabled")
+        const ticket = await TicketModel.findById(id).populate("department", "name code enabled transactionManager")
         if (!ticket) return res.status(404).json({ message: "Ticket not found" })
 
         const transactions = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id })
             .select("transactionKeys transactionLabels participantType")
             .lean()
 
+        const ticketDetails = await resolvePublicTicketDetailsFromTicket(ticket)
+
         return res.json({
             ticket,
+            ticketDetails,
             transactions: transactions
                 ? {
                       transactionKeys: transactions.transactionKeys,
                       transactionLabels: transactions.transactionLabels,
                       participantType: transactions.participantType,
+                      participantTypeLabel: participantTypeLabel(transactions.participantType),
                   }
                 : null,
         })
@@ -923,8 +1315,19 @@ export const publicController = {
             dateKey: todayKey(),
             studentId: String(studentId).trim(),
             status: { $in: ACTIVE_STATUSES as any },
-        }).sort({ createdAt: -1 })
+        })
+            .sort({ createdAt: -1 })
+            .populate("department", "name code enabled transactionManager")
 
-        return res.json({ ticket: ticket || null })
+        if (!ticket) {
+            return res.json({ ticket: null, ticketDetails: null })
+        }
+
+        const ticketDetails = await resolvePublicTicketDetailsFromTicket(ticket)
+
+        return res.json({
+            ticket,
+            ticketDetails,
+        })
     },
 }
