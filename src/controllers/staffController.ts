@@ -118,16 +118,34 @@ function firstNonEmptyText(candidates: unknown[]): string {
 }
 
 function buildPersonFullName(personLike: any): string {
+    // ✅ Prefer explicit name parts first; `name` can be a placeholder/identifier
+    const first = String(personLike?.firstName ?? "").trim()
+    const middle = String(personLike?.middleName ?? "").trim()
+    const last = String(personLike?.lastName ?? "").trim()
+
+    const composed = [first, middle, last].filter(Boolean).join(" ").trim()
+    if (composed) return composed
+
     const name = String(personLike?.name ?? "").trim()
     if (name) return name
 
-    const composed = [personLike?.firstName, personLike?.middleName, personLike?.lastName]
-        .map((x) => String(x ?? "").trim())
-        .filter(Boolean)
-        .join(" ")
-        .trim()
+    return ""
+}
 
-    return composed
+function isLikelyHumanName(label: string, identifier?: string) {
+    const s = String(label ?? "").trim()
+    if (!s) return false
+    if (identifier && s === String(identifier).trim()) return false
+
+    const lower = s.toLowerCase()
+    const reject = new Set(["student", "alumni / visitor", "alumni/visitor", "guest", "participant"])
+    if (reject.has(lower)) return false
+
+    // phone-like / numeric identifiers
+    if (/^\+?\d[\d\s()-]{6,}$/.test(s)) return false
+    if (!/[a-z]/i.test(s)) return false
+
+    return true
 }
 
 function resolveQueuePurpose(ticket: any): string | null {
@@ -536,12 +554,17 @@ async function enrichTickets(tickets: any[]) {
             txSelection?.participantType ||
             (studentId ? participantTypeByIdentity.get(studentId) || null : null)
 
+        const ticketLabelRaw = String(t?.participantLabel ?? "").trim()
+        const ticketLabelCandidate = isLikelyHumanName(ticketLabelRaw, studentId) ? ticketLabelRaw : ""
+
         // ✅ full name priority:
         // 1) TicketTransactionSelection participant (Alumni/Guest/Student)
-        // 2) UserModel name lookup (Student)
+        // 2) Ticket.participantLabel (now persisted on joinQueue)
+        // 3) UserModel name lookup (Student)
         const participantFullName =
             firstNonEmptyText([
                 txSelection?.participantFullName,
+                ticketLabelCandidate,
                 studentId ? participantNameByIdentity.get(studentId) : "",
             ]) || null
 

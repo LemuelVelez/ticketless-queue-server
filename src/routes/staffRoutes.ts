@@ -31,6 +31,10 @@ router.get("/queue/history", staffController.listHistory)
  * - no separate display instances per staff window
  */
 router.get("/queue/state", QueueManagementController.getStaffQueueState)
+
+// ✅ Alias: some clients prefer an explicit "full" endpoint name
+router.get("/queue/state-full", QueueManagementController.getStaffQueueState)
+
 router.post("/queue/call-next-central", QueueManagementController.callNext)
 router.post("/queue/serve", QueueManagementController.serve)
 router.post("/queue/hold", QueueManagementController.hold)

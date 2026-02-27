@@ -522,7 +522,9 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     const queueNumber = await getNextQueueNumber(selectedDepartmentId, dateKey)
     const routing = await resolveWindowAndStaff(selectedDepartmentId)
 
-    const ticket = await TicketModel.create({
+    // ✅ Persist participant display name directly on the ticket
+    // so ANY controller (even non-enriched ones) can display full name.
+    const ticketPayload: any = {
         department: selectedDepartmentId,
         dateKey,
         queueNumber,
@@ -536,12 +538,17 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         // ✅ Important for staff visibility (Student / Alumni-Visitor / Guest)
         participantType: participantType as any,
 
+        // ✅ Full name for UI display (best UX)
+        participantLabel: participantFullName || accountName,
+
         status: "WAITING",
         holdAttempts: 0,
         waitingSince: new Date(),
         window: routing.window?._id,
         windowNumber: routing.window?.number,
-    })
+    }
+
+    const ticket = await TicketModel.create(ticketPayload)
 
     const txLabelMap = await getTransactionLabelMapForDepartment(selectedDepartmentId, {
         participantType: txType,
@@ -703,6 +710,12 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
         .select("participant participantType transactionLabels")
 
     const participantFullName = buildPersonFullName((selection as any)?.participant)
+
+    // ✅ Backfill ticket participantLabel if missing (helps controllers that don't enrich)
+    if (participantFullName && !(ticket as any).participantLabel) {
+        ;(ticket as any).participantLabel = participantFullName
+        await ticket.save()
+    }
 
     const guidance = buildTicketWhereToGo({
         status: ticket.status,
