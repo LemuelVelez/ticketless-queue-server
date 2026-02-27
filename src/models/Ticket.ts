@@ -12,6 +12,13 @@ export type TicketDoc = {
     phone?: string
 
     /**
+     * ✅ Participant display label (full name).
+     * Used by window/monitor UIs so they can display a friendly participant name
+     * without always populating the participant document.
+     */
+    participantLabel?: string
+
+    /**
      * Who joined the queue.
      * Useful for staff visibility (Student / Alumni-Visitor / Guest).
      */
@@ -49,6 +56,9 @@ const TicketSchema = new Schema<TicketDoc>(
 
         studentId: { type: String, required: true, trim: true, index: true },
         phone: { type: String, trim: true },
+
+        // ✅ Persisted participant full name for window/monitor display
+        participantLabel: { type: String, trim: true },
 
         participantType: {
             type: String,

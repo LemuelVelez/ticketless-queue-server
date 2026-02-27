@@ -5,7 +5,7 @@ import { DepartmentModel } from "../models/Department"
 import { QueueCounterModel } from "../models/QueueCounter"
 import { ServiceWindowModel } from "../models/ServiceWindow"
 import { SettingModel } from "../models/Setting"
-import { TicketModel, type TicketStatus } from "../models/Ticket"
+import { TicketModel, type TicketDoc, type TicketStatus } from "../models/Ticket"
 import { UserModel } from "../models/User"
 
 import {
@@ -147,6 +147,10 @@ function buildPersonFullName(personLike: any): string {
 
     const name = String(personLike?.name ?? "").trim()
     if (name) return name
+
+    // extra aliases if present in some schemas
+    const fullName = String(personLike?.fullName ?? personLike?.displayName ?? "").trim()
+    if (fullName) return fullName
 
     return ""
 }
@@ -524,7 +528,9 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
 
     // ✅ Persist participant display name directly on the ticket
     // so ANY controller (even non-enriched ones) can display full name.
-    const ticketPayload: any = {
+    const participantLabel = participantFullName || accountName || participantIdentifier
+
+    const ticketPayload: Partial<TicketDoc> = {
         department: selectedDepartmentId,
         dateKey,
         queueNumber,
@@ -538,8 +544,8 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         // ✅ Important for staff visibility (Student / Alumni-Visitor / Guest)
         participantType: participantType as any,
 
-        // ✅ Full name for UI display (best UX)
-        participantLabel: participantFullName || accountName,
+        // ✅ Full name for UI display (best UX) — persisted now
+        participantLabel,
 
         status: "WAITING",
         holdAttempts: 0,
@@ -571,6 +577,7 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
             participantId: participant._id.toString(),
             participantType,
             participantFullName,
+            participantLabel,
             accountName,
             departmentId: selectedDepartmentId.toString(),
             transactionKeys: input.transactionKeys,
@@ -641,8 +648,8 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         staffAssigned: staffAssignedName,
         staffAssignedId,
 
-        participantFullName,
-        accountName,
+        participantFullName: participantLabel,
+        accountName: participantLabel,
 
         nameOfPersonInCharge: staffAssignedName,
 
@@ -706,14 +713,18 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
           }).select("name number enabled")
 
     const selection = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id })
-        .populate({ path: "participant", select: "name firstName middleName lastName" })
+        .populate({ path: "participant", select: "name firstName middleName lastName fullName displayName" })
         .select("participant participantType transactionLabels")
 
-    const participantFullName = buildPersonFullName((selection as any)?.participant)
+    const fromSelection = buildPersonFullName((selection as any)?.participant)
+    const fromTicket = String(ticket.participantLabel || "").trim()
+
+    // ✅ Always provide a participant full name/label for window display
+    const participantFullName = fromSelection || fromTicket || ""
 
     // ✅ Backfill ticket participantLabel if missing (helps controllers that don't enrich)
-    if (participantFullName && !(ticket as any).participantLabel) {
-        ;(ticket as any).participantLabel = participantFullName
+    if (participantFullName && ticket.participantLabel !== participantFullName) {
+        ticket.participantLabel = participantFullName
         await ticket.save()
     }
 
