@@ -134,16 +134,21 @@ function joinList(items: string[], max = 6) {
 }
 
 function buildPersonFullName(personLike: any): string {
+    /**
+     * ✅ Prefer explicit name parts when available (first/middle/last),
+     * because `name` can sometimes be a placeholder/identifier.
+     */
+    const first = String(personLike?.firstName ?? "").trim()
+    const middle = String(personLike?.middleName ?? "").trim()
+    const last = String(personLike?.lastName ?? "").trim()
+
+    const composed = [first, middle, last].filter(Boolean).join(" ").trim()
+    if (composed) return composed
+
     const name = String(personLike?.name ?? "").trim()
     if (name) return name
 
-    const composed = [personLike?.firstName, personLike?.middleName, personLike?.lastName]
-        .map((x) => String(x ?? "").trim())
-        .filter(Boolean)
-        .join(" ")
-        .trim()
-
-    return composed
+    return ""
 }
 
 function buildTicketWhereToGo(params: {
@@ -446,8 +451,8 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     const participantType = ((anyP.type || anyP.role || "GUEST") as string).toUpperCase() as QueueJoinParticipantType
 
     // ✅ Display full name for Student / Alumni-Visitor / Guest
-    const participantFullName = buildPersonFullName(anyP)
-    const accountName = participantFullName || buildPersonFullName(participant) || "Participant"
+    const participantFullName = buildPersonFullName(anyP) || buildPersonFullName(participant)
+    const accountName = participantFullName || String(anyP?.name || "").trim() || "Participant"
 
     const dateKey = getDateKeyManila()
 
