@@ -203,6 +203,29 @@ function buildPersonFullName(personLike: any): string {
     return ""
 }
 
+/**
+ * ✅ Staff-friendly display line:
+ * Full Name, then Student ID (if student), then Mobile Number.
+ */
+function buildParticipantDisplayLine(params: {
+    participantFullName: string
+    participantType?: string
+    studentId?: string
+    mobileNumber?: string
+}) {
+    const fullName = String(params.participantFullName || "").trim()
+    const type = String(params.participantType || "").toUpperCase()
+    const studentId = String(params.studentId || "").trim()
+    const mobile = String(params.mobileNumber || "").trim()
+
+    const parts: string[] = []
+    if (fullName) parts.push(fullName)
+    if (type === "STUDENT" && studentId) parts.push(studentId)
+    if (mobile) parts.push(mobile)
+
+    return parts.join(" • ")
+}
+
 function buildTicketWhereToGo(params: {
     status: TicketStatus
     queueNumber: number
@@ -447,6 +470,11 @@ export type JoinQueueResult = {
     // ✅ now also used as a friendly display name
     accountName: string
 
+    // ✅ staff-friendly participant display (Full Name • Student ID (if student) • Mobile)
+    participantDisplay: string
+    participantStudentId?: string
+    participantMobileNumber?: string
+
     nameOfPersonInCharge?: string
 
     participantType?: QueueJoinParticipantType
@@ -584,6 +612,28 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
     // so ANY controller (even non-enriched ones) can display full name.
     const participantLabel = participantFullName || accountName || participantIdentifier
 
+    // ✅ Build staff-friendly display values:
+    // Full Name, then Student ID (if student), then Mobile Number.
+    const participantStudentId =
+        participantType === "STUDENT"
+            ? (providedIdentifier ||
+                  candidateStudent ||
+                  (!looksLikePhoneNumber(participantIdentifier) ? participantIdentifier : "") ||
+                  undefined)
+            : undefined
+
+    const participantMobileNumber =
+        String(phoneNumber || "").trim() ||
+        (looksLikePhoneNumber(participantIdentifier) ? participantIdentifier : "") ||
+        undefined
+
+    const participantDisplay = buildParticipantDisplayLine({
+        participantFullName: participantLabel,
+        participantType,
+        studentId: participantStudentId,
+        mobileNumber: participantMobileNumber,
+    })
+
     const ticketPayload: Partial<TicketDoc> = {
         department: selectedDepartmentId,
         dateKey,
@@ -633,6 +683,8 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
             participantFullName,
             participantLabel,
             accountName,
+            participantStudentId,
+            participantMobileNumber,
             departmentId: selectedDepartmentId.toString(),
             transactionKeys: input.transactionKeys,
             identifier: participantIdentifier,
@@ -705,6 +757,11 @@ export async function joinQueue(input: JoinQueueInput): Promise<JoinQueueResult>
         participantFullName: participantLabel,
         accountName: participantLabel,
 
+        // ✅ requested display ordering + raw fields
+        participantDisplay,
+        participantStudentId,
+        participantMobileNumber,
+
         nameOfPersonInCharge: staffAssignedName,
 
         participantType,
@@ -767,20 +824,47 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
           }).select("name number enabled")
 
     const selection = await TicketTransactionSelectionModel.findOne({ ticket: ticket._id })
-        .populate({ path: "participant", select: "name firstName middleName lastName fullName displayName" })
+        .populate({
+            path: "participant",
+            select: "name firstName middleName lastName fullName displayName tcNumber studentId mobileNumber phone email",
+        })
         .select("participant participantType transactionLabels")
 
-    const fromSelection = buildPersonFullName((selection as any)?.participant)
+    const selectionParticipant = (selection as any)?.participant
+    const fromSelectionName = buildPersonFullName(selectionParticipant)
     const fromTicket = String(ticket.participantLabel || "").trim()
 
     // ✅ Always provide a participant full name/label for window display
-    const participantFullName = fromSelection || fromTicket || ""
+    const participantFullName = fromSelectionName || fromTicket || ""
 
     // ✅ Backfill ticket participantLabel if missing (helps controllers that don't enrich)
     if (participantFullName && ticket.participantLabel !== participantFullName) {
         ticket.participantLabel = participantFullName
         await ticket.save()
     }
+
+    // ✅ Resolve contact fields (additive; clients can choose whether to show)
+    const effectiveParticipantType = String((ticket as any).participantType || selection?.participantType || "").toUpperCase()
+
+    const participantStudentId =
+        effectiveParticipantType === "STUDENT"
+            ? String(selectionParticipant?.tcNumber || selectionParticipant?.studentId || "").trim() ||
+              (!looksLikePhoneNumber(ticket.studentId) ? String(ticket.studentId || "").trim() : "") ||
+              undefined
+            : undefined
+
+    const participantMobileNumber =
+        String(ticket.phone || "").trim() ||
+        extractParticipantMobile(selectionParticipant) ||
+        (looksLikePhoneNumber(ticket.studentId) ? String(ticket.studentId || "").trim() : "") ||
+        undefined
+
+    const participantDisplay = buildParticipantDisplayLine({
+        participantFullName,
+        participantType: effectiveParticipantType,
+        studentId: participantStudentId,
+        mobileNumber: participantMobileNumber,
+    })
 
     const guidance = buildTicketWhereToGo({
         status: ticket.status,
@@ -805,6 +889,11 @@ export async function presentDirectlyToDisplayMonitor(ticketId: string) {
 
         // ✅ participant full name (Student / Alumni-Visitor / Guest)
         participantFullName,
+
+        // ✅ participant identity/contact (Full Name • Student ID (if student) • Mobile)
+        participantDisplay,
+        participantStudentId,
+        participantMobileNumber,
 
         // ✅ extra details (safe, additive)
         departmentName: department?.name,
