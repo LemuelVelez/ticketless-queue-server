@@ -16,6 +16,30 @@ function isPopulatedDoc<T extends { _id: unknown }>(v: unknown): v is T {
     return Boolean(v && typeof v === "object" && "_id" in (v as any))
 }
 
+/**
+ * Safely extract an id string from:
+ * - ObjectId
+ * - populated docs { _id }
+ * - raw string ids
+ */
+function refIdString(v: unknown): string {
+    if (!v) return ""
+    if (typeof v === "string") return v
+    if (typeof v === "number") return String(v)
+
+    if (typeof v === "object") {
+        if (isPopulatedDoc<{ _id: unknown }>(v)) {
+            const id = (v as any)?._id
+            return id ? String(id) : ""
+        }
+        const s = String(v)
+        return Types.ObjectId.isValid(s) ? s : ""
+    }
+
+    const s = String(v)
+    return Types.ObjectId.isValid(s) ? s : ""
+}
+
 export type AuthActor = {
     _id?: Types.ObjectId | string
     role?: UserRole
@@ -357,8 +381,13 @@ async function resolveWindowOrFail(windowId: string): Promise<ServiceWindowLean>
  * PUBLIC: Managers list for landing page filter (dropdown/tabs).
  */
 export async function listManagers(): Promise<string[]> {
-    const managers = await DepartmentModel.distinct("transactionManager", { enabled: true }).exec()
-    return managers.map((m) => String(m).trim()).filter(Boolean).sort((a, b) => a.localeCompare(b))
+    const raw = await DepartmentModel.distinct("transactionManager", { enabled: true }).exec()
+    const unique = new Set<string>()
+    for (const m of raw) {
+        const key = normalizeManagerKey(String(m ?? ""))
+        if (key) unique.add(key)
+    }
+    return Array.from(unique).sort((a, b) => a.localeCompare(b))
 }
 
 /**
@@ -834,10 +863,13 @@ export async function outTicket(actor: AuthActor | undefined, ticketId: string, 
 }
 
 async function getAnnouncements(manager: string, sinceIso?: string): Promise<Announcement[]> {
-    const since = sinceIso ? new Date(sinceIso) : undefined
+    const todayKey = getDateKey()
+
+    // If the client doesn't provide a cursor yet (first load), only treat the last few seconds as "new".
+    const since = sinceIso ? new Date(sinceIso) : new Date(Date.now() - 5000)
     if (sinceIso && String(since).includes("Invalid")) throw new HttpError(400, "INVALID_SINCE", "Invalid 'since' timestamp.")
 
-    const match: any = { action: "TICKET_CALLED" }
+    const match: any = { action: "TICKET_CALLED", "meta.dateKey": todayKey }
     if (since) match.createdAt = { $gt: since }
 
     const logs = await AuditLogModel.find(match)
@@ -934,15 +966,18 @@ export async function getPublicDisplayState(manager: string, sinceIso?: string):
 
     const calledByWindow = new Map<string, any>()
     for (const t of calledTickets) {
-        const w = t.window ? String(t.window) : ""
-        if (!w) continue
-        if (!calledByWindow.has(w)) calledByWindow.set(w, t)
-        else {
-            const prev = calledByWindow.get(w)
-            const prevAt = prev?.calledAt ? new Date(prev.calledAt).getTime() : 0
-            const curAt = t?.calledAt ? new Date(t.calledAt).getTime() : 0
-            if (curAt > prevAt) calledByWindow.set(w, t)
+        const wId = refIdString((t as any).window)
+        if (!wId) continue
+
+        if (!calledByWindow.has(wId)) {
+            calledByWindow.set(wId, t)
+            continue
         }
+
+        const prev = calledByWindow.get(wId)
+        const prevAt = prev?.calledAt ? new Date(prev.calledAt).getTime() : 0
+        const curAt = (t as any)?.calledAt ? new Date((t as any).calledAt).getTime() : 0
+        if (curAt > prevAt) calledByWindow.set(wId, t)
     }
 
     const upNext = waitingTickets.slice(0, 10).map(toTicketView)
