@@ -1,25 +1,23 @@
-# ---- Dependencies (includes dev deps for TypeScript build) ----
+# ---- Dependencies (force dev deps even if Coolify sets NODE_ENV=production at buildtime) ----
 FROM node:20-alpine AS deps
 WORKDIR /app
-
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm ci --include=dev
 
-# ---- Build (compile TS -> dist) ----
+# ---- Build ----
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# ✅ npm needs package.json to run scripts
+# npm needs package.json to run scripts, and we want predictable dist output
 COPY package.json package-lock.json* ./
-
 COPY --from=deps /app/node_modules ./node_modules
 COPY tsconfig.json ./
 COPY src ./src
 
-# ✅ your build script is: "tsc -p tsconfig.json"
-RUN npm run build
+# ✅ Force output to /app/dist (overrides tsconfig outDir)
+RUN npm run build -- --outDir dist --rootDir src
 
-# ---- Runtime (only prod deps + compiled dist) ----
+# ---- Runtime ----
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
@@ -33,5 +31,4 @@ COPY --from=builder /app/dist ./dist
 
 USER nodejs
 EXPOSE 3000
-
 CMD ["node", "dist/index.js"]
