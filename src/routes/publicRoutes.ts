@@ -1,6 +1,7 @@
 import { Router } from "express"
 import { publicController } from "../controllers/publicController"
 import { homeController } from "../controllers/HomeController"
+import { displayController } from "../controllers/displayController"
 import { requireParticipantAuth } from "../controllers/middlewares"
 
 const router = Router()
@@ -132,6 +133,38 @@ on("get", "/tickets/:id", publicController.getTicket)
 // ✅ Dedicated details alias (same handler, but clearer intent for frontend)
 on("options", "/tickets/:id/details", okOptions)
 on("get", "/tickets/:id/details", publicController.getTicket)
+
+// --------------------
+// Public Display (Monitor)
+// ✅ Returns participant full name using ticket.participantLabel (from queue.service.ts)
+// --------------------
+on("options", "/display/managers", okOptions)
+on("get", "/display/managers", displayController.managers)
+
+on("options", "/display/:manager/departments", okOptions)
+on("get", "/display/:manager/departments", displayController.departmentsByManager)
+
+on("options", "/display/:manager/windows", okOptions)
+on("get", "/display/:manager/windows", displayController.windowsByManager)
+
+on("options", "/display/:manager/state", okOptions)
+on("get", "/display/:manager/state", displayController.managerState)
+
+on("options", "/display/:manager/announcements", okOptions)
+on("get", "/display/:manager/announcements", displayController.managerAnnouncements)
+
+// legacy helpers (text/snapshot + voice)
+on("options", "/display/monitor-snapshot", okOptions)
+on("get", "/display/monitor-snapshot", displayController.monitorSnapshot)
+
+on("options", "/display/monitor-text", okOptions)
+on("get", "/display/monitor-text", displayController.monitorText)
+
+on("options", "/display/voice", okOptions)
+on("get", "/display/voice", displayController.voiceAnnouncement)
+
+on("options", "/display/voice/:ticketId", okOptions)
+on("get", "/display/voice/:ticketId", displayController.voiceAnnouncement)
 
 // --------------------
 // Display-monitor actions remain participant-protected
