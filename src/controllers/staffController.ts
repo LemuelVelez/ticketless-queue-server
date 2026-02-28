@@ -791,18 +791,42 @@ async function enrichTickets(tickets: any[]) {
             mobileNumber: participantMobileNumber,
         })
 
-        const transactionsPayload = {
+        // ✅ pull direct purpose/category fields introduced in queueManagement.ts
+        const directPurpose = firstNonEmptyText([
+            t?.purpose,
+            t?.transactions?.purpose,
+            t?.transactions?.transactionPurpose,
+            t?.meta?.purpose,
+            t?.meta?.transactionPurpose,
+            t?.queuePurpose,
+        ])
+
+        const transactionCategory = firstNonEmptyText([
+            t?.transactions?.transactionCategory,
+            t?.transactionCategory,
+            t?.meta?.transactionCategory,
+        ])
+
+        const transactionsBase = {
             ...(t?.transactions && typeof t.transactions === "object" ? t.transactions : {}),
             participantType: participantType || null,
             participantTypeLabel: participantTypeLabel(participantType || null),
+
+            // ✅ include category + purpose (aligned with queueManagement TicketView.transaction)
+            transactionCategory: transactionCategory || null,
+
             transactionKey:
                 firstNonEmptyText([t?.transactions?.transactionKey, t?.transactionKey, mergedTransactionKeys[0]]) || null,
             transactionKeys: mergedTransactionKeys,
+
             transactionLabel:
                 firstNonEmptyText([t?.transactions?.transactionLabel, t?.transactionLabel, mergedTransactionLabels[0]]) ||
                 null,
             transactionLabels: mergedTransactionLabels,
             labels: mergedTransactionLabels,
+
+            // purpose will be finalized after queuePurpose resolves (fallback-safe)
+            purpose: directPurpose || null,
         }
 
         const queuePurpose = resolveQueuePurpose({
@@ -811,8 +835,25 @@ async function enrichTickets(tickets: any[]) {
             selectedTransactionKeys: mergedTransactionKeys,
             transactionLabels: mergedTransactionLabels,
             selectedTransactionLabels: mergedTransactionLabels,
-            transactions: transactionsPayload,
+            transactions: transactionsBase,
         })
+
+        // ✅ final purpose: prefer explicit purpose fields, else fall back to resolved queuePurpose
+        const transactionPurpose = firstNonEmptyText([directPurpose, queuePurpose || ""]) || null
+
+        // ✅ final transactions payload (purpose finalized)
+        const transactionsPayload = {
+            ...transactionsBase,
+            purpose: transactionPurpose,
+        }
+
+        // ✅ normalized "transaction" object (aligned with queueManagement TicketView.transaction)
+        const transaction = {
+            category: transactionsPayload.transactionCategory || null,
+            key: transactionsPayload.transactionKey || null,
+            label: transactionsPayload.transactionLabel || null,
+            purpose: transactionPurpose,
+        }
 
         const depName = dep?.name ? String(dep.name) : null
         const depCode = dep?.code ? String(dep.code) : null
@@ -898,6 +939,11 @@ async function enrichTickets(tickets: any[]) {
             selectedTransactionKeys: mergedTransactionKeys,
             transactionLabels: mergedTransactionLabels,
             selectedTransactionLabels: mergedTransactionLabels,
+
+            // ✅ purpose fields (what staff UI should display, aligned to queueManagement.ts)
+            purpose: transactionPurpose,
+            transactionPurpose,
+            transaction,
 
             transactions: transactionsPayload,
             transactionSelections: txSelection
@@ -1109,7 +1155,10 @@ export const staffController = {
 
         const nowServingDoc = await TicketModel.findOne(nowServingQuery)
             .sort({ calledAt: -1, updatedAt: -1 })
-            .select("_id queueNumber department window windowNumber calledAt studentId phone participantType participantLabel")
+            .select(
+                "_id queueNumber department window windowNumber calledAt studentId phone participantType participantLabel " +
+                    "transactionCategory transactionKey transactionLabel purpose transactionKeys transactionLabels selectedTransactionKeys selectedTransactionLabels transactions",
+            )
             .lean()
 
         const upNextDocs = await TicketModel.find({
@@ -1119,7 +1168,10 @@ export const staffController = {
         })
             .sort({ queueNumber: 1, waitingSince: 1 })
             .limit(upNextCount)
-            .select("_id queueNumber department studentId phone participantType participantLabel")
+            .select(
+                "_id queueNumber department studentId phone participantType participantLabel " +
+                    "transactionCategory transactionKey transactionLabel purpose transactionKeys transactionLabels selectedTransactionKeys selectedTransactionLabels transactions",
+            )
             .lean()
 
         const [nowServingEnriched] = nowServingDoc ? await enrichTickets([nowServingDoc]) : [null]
@@ -1174,7 +1226,10 @@ export const staffController = {
             status: "CALLED",
         })
             .sort({ calledAt: -1, updatedAt: -1 })
-            .select("_id queueNumber department window windowNumber calledAt studentId phone participantType participantLabel")
+            .select(
+                "_id queueNumber department window windowNumber calledAt studentId phone participantType participantLabel " +
+                    "transactionCategory transactionKey transactionLabel purpose transactionKeys transactionLabels selectedTransactionKeys selectedTransactionLabels transactions",
+            )
             .lean()
 
         // ✅ enrich once so we can show participant full names + student id/mobile (+ guidance/voiceAnnouncement)
@@ -1253,6 +1308,22 @@ export const staffController = {
                           participantLabel: (calledEnriched as any)?.participantLabel ?? null,
                           participantType: (calledEnriched as any)?.participantType ?? null,
                           participantTypeLabel: (calledEnriched as any)?.transactions?.participantTypeLabel ?? null,
+
+                          // ✅ transaction purpose/label (aligned to queueManagement.ts)
+                          transactionPurpose:
+                              (calledEnriched as any)?.transactionPurpose ??
+                              (calledEnriched as any)?.transaction?.purpose ??
+                              (calledEnriched as any)?.purpose ??
+                              null,
+                          transactionLabel:
+                              (calledEnriched as any)?.transaction?.label ??
+                              (calledEnriched as any)?.transactions?.transactionLabel ??
+                              null,
+                          transactionLabels:
+                              (calledEnriched as any)?.transactions?.transactionLabels ??
+                              (calledEnriched as any)?.transactionLabels ??
+                              [],
+
                           calledAt: (called as any)?.calledAt ? new Date((called as any).calledAt).toISOString() : null,
                           guidance: (calledEnriched as any)?.guidance ?? null,
                           voiceAnnouncement: (calledEnriched as any)?.voiceAnnouncement ?? null,
@@ -1298,6 +1369,22 @@ export const staffController = {
                       participantLabel: (nowServingEnriched as any).participantLabel ?? null,
                       participantType: (nowServingEnriched as any).participantType ?? null,
                       participantTypeLabel: (nowServingEnriched as any)?.transactions?.participantTypeLabel ?? null,
+
+                      // ✅ transaction purpose/label (aligned to queueManagement.ts)
+                      transactionPurpose:
+                          (nowServingEnriched as any)?.transactionPurpose ??
+                          (nowServingEnriched as any)?.transaction?.purpose ??
+                          (nowServingEnriched as any)?.purpose ??
+                          null,
+                      transactionLabel:
+                          (nowServingEnriched as any)?.transaction?.label ??
+                          (nowServingEnriched as any)?.transactions?.transactionLabel ??
+                          null,
+                      transactionLabels:
+                          (nowServingEnriched as any)?.transactions?.transactionLabels ??
+                          (nowServingEnriched as any)?.transactionLabels ??
+                          [],
+
                       calledAt: (nowServingEnriched as any).calledAt
                           ? new Date((nowServingEnriched as any).calledAt).toISOString()
                           : null,
@@ -1321,6 +1408,12 @@ export const staffController = {
                 participantLabel: row.participantLabel ?? null,
                 participantType: row.participantType ?? null,
                 participantTypeLabel: row?.transactions?.participantTypeLabel ?? null,
+
+                // ✅ transaction purpose/label (aligned to queueManagement.ts)
+                transactionPurpose: row?.transactionPurpose ?? row?.transaction?.purpose ?? row?.purpose ?? null,
+                transactionLabel: row?.transaction?.label ?? row?.transactions?.transactionLabel ?? null,
+                transactionLabels: row?.transactions?.transactionLabels ?? row?.transactionLabels ?? [],
+
                 guidance: row?.guidance ?? null,
             })),
             board: {

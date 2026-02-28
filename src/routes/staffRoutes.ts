@@ -102,6 +102,7 @@ router.get("/me/assignment", staffController.myAssignment)
 router.get("/queue/window-assignments", staffController.windowAssignments)
 
 // ✅ Staff display snapshot (backend-integrated source for presenter/monitor UI)
+// (Now includes transactionPurpose / transactionLabel / transactionLabels in nowServing + upNext payloads)
 router.get("/display/snapshot", staffController.displaySnapshot)
 
 // ✅ Alias endpoint (explicit “full” snapshot; includes participant full names + student id/mobile display fields)
@@ -110,7 +111,10 @@ router.get("/display/snapshot-full", staffController.displaySnapshot)
 // ✅ New alias for UIs that want an explicit “participants-enriched” name
 router.get("/display/snapshot-participants", staffController.displaySnapshot)
 
-// Queue lists
+// ✅ v2 aliases (same handlers; explicitly documented for UIs that rely on transaction purpose fields)
+router.get("/display/snapshot-v2", staffController.displaySnapshot)
+
+// Queue lists (now include transactionPurpose fields inside ticket payloads)
 router.get("/queue/waiting", staffController.listWaiting)
 router.get("/queue/hold", staffController.listHold)
 router.get("/queue/out", staffController.listOut)
@@ -122,6 +126,13 @@ router.get("/queue/hold-full", staffController.listHold)
 router.get("/queue/out-full", staffController.listOut)
 router.get("/queue/history-full", staffController.listHistory)
 router.get("/queue/current-called-full", staffController.currentCalledForWindow)
+
+// ✅ v2 aliases (same handlers; explicitly documented for UIs that read transaction purpose)
+router.get("/queue/waiting-v2", staffController.listWaiting)
+router.get("/queue/hold-v2", staffController.listHold)
+router.get("/queue/out-v2", staffController.listOut)
+router.get("/queue/history-v2", staffController.listHistory)
+router.get("/queue/current-called-v2", staffController.currentCalledForWindow)
 
 /**
  * ✅ CENTRALIZED REAL-TIME QUEUE (Critical Foundation)
