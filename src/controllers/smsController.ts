@@ -75,13 +75,125 @@ function parseBooleanInput(value: unknown, defaultValue: boolean): boolean {
     return defaultValue
 }
 
+/**
+ * Semaphore response receipt validation
+ * Prevents "false success" where HTTP 200 returns but receipts show FAILED/REFUNDED (or empty receipts).
+ */
+type SemaphoreReceiptItem = {
+    status?: string
+    message_id?: number | string
+    recipient?: string
+    [key: string]: unknown
+}
+
+type SemaphoreReceiptValidation = {
+    ok: boolean
+    outcome: "sent" | "failed" | "unknown"
+    statusSummary: Record<string, number>
+    error?: string
+    // helpful debugging (lightweight)
+    receiptsCount: number
+}
+
+function normalizeSemaphoreStatus(status: unknown): string {
+    return String(status ?? "").trim().toLowerCase()
+}
+
 function summarizeStatuses(items: Array<{ status?: string }> = []) {
     const out: Record<string, number> = {}
     for (const it of items) {
-        const key = String(it?.status ?? "unknown")
+        const key = normalizeSemaphoreStatus(it?.status) || "unknown"
         out[key] = (out[key] || 0) + 1
     }
     return out
+}
+
+function validateSemaphoreReceipts(providerResponse: unknown): SemaphoreReceiptValidation {
+    const receipts = Array.isArray(providerResponse) ? (providerResponse as SemaphoreReceiptItem[]) : []
+
+    // Empty receipt should be treated as NOT OK (prevents silent "success" cases)
+    if (!receipts.length) {
+        return {
+            ok: false,
+            outcome: "unknown",
+            statusSummary: {},
+            receiptsCount: 0,
+            error: "Empty provider receipt (no message receipts returned by Semaphore).",
+        }
+    }
+
+    const okStatuses = new Set(["queued", "pending", "sent"])
+    const failStatuses = new Set(["failed", "refunded"])
+
+    const summary = summarizeStatuses(receipts)
+
+    let okCount = 0
+    let failCount = 0
+    let unknownCount = 0
+
+    for (const r of receipts) {
+        const st = normalizeSemaphoreStatus(r?.status)
+        if (okStatuses.has(st)) okCount++
+        else if (failStatuses.has(st)) failCount++
+        else unknownCount++
+    }
+
+    const ok = okCount > 0 && failCount === 0
+    const outcome: SemaphoreReceiptValidation["outcome"] = ok ? "sent" : failCount > 0 ? "failed" : "unknown"
+
+    const error = ok
+        ? undefined
+        : failCount > 0
+          ? `Semaphore receipt status indicates failure (${Object.entries(summary)
+                .map(([k, v]) => `${k}:${v}`)
+                .join(", ")})`
+          : `Semaphore receipt status is not confirmable (${Object.entries(summary)
+                .map(([k, v]) => `${k}:${v}`)
+                .join(", ")})`
+
+    return {
+        ok,
+        outcome,
+        statusSummary: summary,
+        receiptsCount: receipts.length,
+        error,
+    }
+}
+
+/**
+ * If smsManagement was updated to return a first-class receipt validation, prefer that.
+ * Otherwise fall back to validating providerResponse.
+ */
+function getReceiptValidationFromResult(result: any): SemaphoreReceiptValidation | undefined {
+    if (result && typeof result === "object") {
+        // common patterns we might have in updated service
+        if (typeof result.receiptOk === "boolean") {
+            const statusSummary =
+                result.receiptStatusSummary && typeof result.receiptStatusSummary === "object"
+                    ? (result.receiptStatusSummary as Record<string, number>)
+                    : summarizeStatuses(Array.isArray(result.providerResponse) ? result.providerResponse : [])
+
+            const outcome: SemaphoreReceiptValidation["outcome"] = result.receiptOk
+                ? "sent"
+                : String(result.receiptOutcome || "").toLowerCase() === "unknown"
+                  ? "unknown"
+                  : "failed"
+
+            return {
+                ok: Boolean(result.receiptOk),
+                outcome,
+                statusSummary,
+                receiptsCount: Array.isArray(result.providerResponse) ? result.providerResponse.length : 0,
+                error: typeof result.receiptError === "string" ? result.receiptError : undefined,
+            }
+        }
+
+        if (result.providerResponse !== undefined) {
+            return validateSemaphoreReceipts(result.providerResponse)
+        }
+    }
+
+    return undefined
 }
 
 function computeOutcome(result: any): "sent" | "skipped" | "failed" | "unknown" {
@@ -106,7 +218,7 @@ function respondTicketSms(
     ctx: { ticketId: string; status?: string },
     result: SendSmsToQueuedUserResult | TicketStatusSmsResult
 ): Response {
-    const outcome = computeOutcome(result as any)
+    let outcome = computeOutcome(result as any)
 
     // ✅ New service behavior: it returns structured "skipped" results (no throw).
     // Controller must map those to proper HTTP responses.
@@ -140,6 +252,22 @@ function respondTicketSms(
         })
     }
 
+    // ✅ Receipt validation (prevents "false success")
+    const receipt = getReceiptValidationFromResult(result as any)
+    if (receipt && receipt.ok === false) {
+        outcome = "failed"
+        return res.status(502).json({
+            ok: false,
+            provider: "semaphore",
+            ticketId: ctx.ticketId,
+            status: ctx.status,
+            outcome,
+            error: receipt.error || "Semaphore receipt indicates failure",
+            statusSummary: receipt.statusSummary,
+            result,
+        })
+    }
+
     // Sent successfully
     return res.status(200).json({
         ok: true,
@@ -147,6 +275,7 @@ function respondTicketSms(
         ticketId: ctx.ticketId,
         status: ctx.status,
         outcome,
+        statusSummary: receipt?.statusSummary,
         result,
     })
 }
@@ -193,6 +322,14 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
             return res.status(400).json({ ok: false, error: "message is required" })
         }
 
+        // Semaphore silently ignores messages that start with "TEST" (common false-success trap)
+        if (/^test\b/i.test(message)) {
+            return res.status(400).json({
+                ok: false,
+                error: 'message cannot start with "TEST" (Semaphore will silently ignore it)',
+            })
+        }
+
         const opts: SendSmsOptions = {
             senderName: senderName || undefined,
             priority: parseBooleanInput(body.priority, false),
@@ -210,10 +347,16 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
 
         const providerResponse = await sendSmsViaService(rawNumbers, message, opts)
 
-        return res.status(200).json({
-            ok: true,
+        // ✅ Validate receipts so we don't return ok=true when Semaphore receipts are FAILED/REFUNDED/empty
+        const receipt = validateSemaphoreReceipts(providerResponse)
+        const httpStatus = receipt.ok ? 200 : 502
+
+        return res.status(httpStatus).json({
+            ok: receipt.ok,
             provider: "semaphore",
-            statusSummary: summarizeStatuses(providerResponse),
+            outcome: receipt.outcome,
+            statusSummary: receipt.statusSummary,
+            error: receipt.error,
             result: providerResponse,
         })
     } catch (error: any) {
@@ -355,6 +498,14 @@ async function sendTicketSms(req: Request, res: Response): Promise<Response> {
             return res.status(400).json({
                 ok: false,
                 error: 'status must be one of: "CALLED" | "HOLD" | "OUT" | "SERVED"',
+            })
+        }
+
+        // Semaphore silently ignores messages that start with "TEST" (false-success trap)
+        if (customMessage && /^test\b/i.test(customMessage)) {
+            return res.status(400).json({
+                ok: false,
+                error: 'message cannot start with "TEST" (Semaphore will silently ignore it)',
             })
         }
 

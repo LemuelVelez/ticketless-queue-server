@@ -27,6 +27,74 @@ function normalizeSenderName(raw: unknown) {
     return cleaned.slice(0, 11)
 }
 
+/**
+ * Receipt validation (route-local)
+ * Prevents false ok=true when Semaphore returns receipts with FAILED/REFUNDED/empty.
+ */
+type SemaphoreReceiptItem = { status?: string; [k: string]: unknown }
+
+function normalizeSemaphoreStatus(status: unknown): string {
+    return String(status ?? "").trim().toLowerCase()
+}
+
+function summarizeSemaphoreStatuses(items: Array<SemaphoreReceiptItem> = []) {
+    const out: Record<string, number> = {}
+    for (const it of items) {
+        const key = normalizeSemaphoreStatus(it?.status) || "unknown"
+        out[key] = (out[key] || 0) + 1
+    }
+    return out
+}
+
+function validateSemaphoreReceipts(providerResponse: unknown): {
+    ok: boolean
+    outcome: "sent" | "failed" | "unknown"
+    statusSummary: Record<string, number>
+    error?: string
+} {
+    const receipts = Array.isArray(providerResponse) ? (providerResponse as SemaphoreReceiptItem[]) : []
+
+    if (!receipts.length) {
+        return {
+            ok: false,
+            outcome: "unknown",
+            statusSummary: {},
+            error: "Empty provider receipt (no message receipts returned by Semaphore).",
+        }
+    }
+
+    const okStatuses = new Set(["queued", "pending", "sent"])
+    const failStatuses = new Set(["failed", "refunded"])
+
+    const summary = summarizeSemaphoreStatuses(receipts)
+
+    let okCount = 0
+    let failCount = 0
+    let unknownCount = 0
+
+    for (const r of receipts) {
+        const st = normalizeSemaphoreStatus(r?.status)
+        if (okStatuses.has(st)) okCount++
+        else if (failStatuses.has(st)) failCount++
+        else unknownCount++
+    }
+
+    const ok = okCount > 0 && failCount === 0
+    const outcome: "sent" | "failed" | "unknown" = ok ? "sent" : failCount > 0 ? "failed" : "unknown"
+
+    const error = ok
+        ? undefined
+        : failCount > 0
+          ? `Semaphore receipt status indicates failure (${Object.entries(summary)
+                .map(([k, v]) => `${k}:${v}`)
+                .join(", ")})`
+          : `Semaphore receipt status is not confirmable (${Object.entries(summary)
+                .map(([k, v]) => `${k}:${v}`)
+                .join(", ")})`
+
+    return { ok, outcome, statusSummary: summary, error }
+}
+
 // Assignment
 router.get("/me/assignment", staffController.myAssignment)
 
@@ -91,6 +159,7 @@ router.post("/tickets/:id/sms-status", smsController.sendTicketStatus)
  * - Now uses centralized smsManagement service (single source of truth)
  * - Fixes false "SEMAPHORE_API_KEY is missing" by supporting multiple env key variants
  * - Returns 200 with ok=false on provider failure to avoid browser "Failed to load resource"
+ * - ✅ Validates Semaphore receipts to prevent false success
  */
 router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
     try {
@@ -125,6 +194,17 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
         // If UI doesn't send message, still allow but make it obvious
         const finalMessage = message || `Queue Update: You are being called now. Please proceed to your assigned window.`
 
+        // Semaphore silently ignores messages that start with "TEST" (common false-success trap)
+        if (/^test\b/i.test(finalMessage)) {
+            return res.status(400).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId,
+                outcome: "failed",
+                error: 'message cannot start with "TEST" (Semaphore will silently ignore it)',
+            })
+        }
+
         const actorId = String((req as any)?.user?.id ?? "").trim() || undefined
 
         const result = await sendSmsToQueuedUser({
@@ -156,6 +236,7 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
             })
         }
 
+        // Provider error surfaced by service
         const providerError = String((result as any).error || "").trim()
         if (providerError) {
             res.setHeader("X-Error-Message", providerError)
@@ -174,12 +255,35 @@ router.post("/tickets/:id/sms", async (req: Request, res: Response) => {
             })
         }
 
+        // ✅ Receipt validation (prevents false ok=true)
+        const receipt = validateSemaphoreReceipts((result as any).providerResponse)
+        if (!receipt.ok) {
+            const errMsg = receipt.error || "Semaphore receipt indicates failure"
+            res.setHeader("X-Error-Message", errMsg)
+
+            return res.json({
+                ok: false,
+                provider: "semaphore",
+                ticketId,
+                outcome: "failed",
+                reason: errMsg,
+                error: "receipt_invalid",
+                statusSummary: receipt.statusSummary,
+                result: {
+                    sentTo: (result as any).sentTo,
+                    reliability: (result as any).reliability,
+                    providerResponse: (result as any).providerResponse,
+                },
+            })
+        }
+
         return res.json({
             ok: true,
             provider: "semaphore",
             ticketId,
             outcome: "sent",
             number: (result as any).sentTo,
+            statusSummary: receipt.statusSummary,
             result: {
                 reliability: (result as any).reliability,
                 providerResponse: (result as any).providerResponse,
