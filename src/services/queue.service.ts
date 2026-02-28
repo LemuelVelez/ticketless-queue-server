@@ -17,6 +17,14 @@ import {
     getTransactionLabelMapForDepartment,
     validateTransactionsForParticipantInDepartment,
 } from "./registrarTransactions.service"
+import {
+    sendSmsToQueuedUser,
+    sendTicketStatusSms,
+    type ActorRef,
+    type SemaphoreMessageResponse,
+    type SendSmsToQueuedUserResult,
+    type TicketStatusSmsResult,
+} from "./smsManagement"
 
 /**
  * Some codebases define ParticipantType without "GUEST" even if the app supports it.
@@ -975,4 +983,237 @@ export function getJoinQueueQrPayload(baseUrl: string, departmentCode?: string) 
         shouldDisplayImmediately: true,
         label: "Scan QR Code to Join Queue",
     }
+}
+
+/* =========================================================================================
+   ✅ Staff SMS called helper (prevents HTTP 500 when Semaphore returns 5xx)
+   - Your UI expects a normalized object (ok/outcome/message/statusSummary/receiptsCount)
+   - We ALWAYS set throwOnProviderFailure=false here so routes return 200 with ok:false instead of 500.
+========================================================================================= */
+
+function summarizeSemaphoreStatuses(items: SemaphoreMessageResponse[] | undefined | null) {
+    const out: Record<string, number> = {}
+    for (const it of items || []) {
+        const key = String((it as any)?.status ?? "unknown")
+        out[key] = (out[key] || 0) + 1
+    }
+    return out
+}
+
+type NormalizedSmsOutcome = "sent" | "skipped" | "failed"
+
+export type SendTicketCalledSmsInput = {
+    ticketId: string
+    message?: string
+    senderName?: string
+    actor?: ActorRef
+}
+
+export type SendTicketCalledSmsResponse = {
+    ok: boolean
+    outcome: NormalizedSmsOutcome
+    message: string
+    reason?: string
+
+    ticketId: string
+    queueNumber?: number
+
+    // normalized recipient
+    number?: string
+
+    // provider details for UI (optional)
+    receiptsCount?: number
+    statusSummary?: Record<string, number>
+    reliability?: any
+
+    advanceNotice?: {
+        enabled: boolean
+        attempted: boolean
+        nextTicketId?: string
+        nextQueueNumber?: number
+        ok?: boolean
+        outcome?: NormalizedSmsOutcome
+        message?: string
+        reason?: string
+        number?: string
+        receiptsCount?: number
+        statusSummary?: Record<string, number>
+    }
+}
+
+function normalizeSendSmsResult(ticketId: string, queueNumber: number | undefined, res: SendSmsToQueuedUserResult): SendTicketCalledSmsResponse {
+    if ((res as any)?.skipped) {
+        const r = res as Extract<SendSmsToQueuedUserResult, { skipped: true }>
+        const msg =
+            r.reason === "opted_out"
+                ? "SMS skipped: user opted out."
+                : r.reason === "no_recipient"
+                  ? "SMS skipped: no recipient number found."
+                  : r.reason === "invalid_number"
+                    ? "SMS skipped: invalid mobile number."
+                    : r.reason === "message_not_allowed"
+                      ? "SMS skipped: message not allowed."
+                      : r.reason === "ticket_not_found"
+                        ? "SMS skipped: ticket not found."
+                        : "SMS skipped."
+
+        return {
+            ok: false,
+            outcome: "skipped",
+            message: r.error ? `${msg} ${r.error}` : msg,
+            reason: r.reason,
+            ticketId,
+            queueNumber,
+        }
+    }
+
+    const r = res as Extract<SendSmsToQueuedUserResult, { skipped: false }>
+    const receiptsCount = Array.isArray(r.providerResponse) ? r.providerResponse.length : 0
+    const statusSummary = summarizeSemaphoreStatuses(r.providerResponse)
+
+    if (typeof r.error === "string" && r.error.trim()) {
+        return {
+            ok: false,
+            outcome: "failed",
+            message: r.error,
+            reason: "provider_error",
+            ticketId,
+            queueNumber,
+            number: r.sentTo,
+            receiptsCount,
+            statusSummary,
+            reliability: r.reliability,
+        }
+    }
+
+    return {
+        ok: true,
+        outcome: "sent",
+        message: "SMS sent.",
+        ticketId,
+        queueNumber,
+        number: r.sentTo,
+        receiptsCount,
+        statusSummary,
+        reliability: r.reliability,
+    }
+}
+
+function normalizeAdvanceNotice(base: TicketStatusSmsResult, payload: SendTicketCalledSmsResponse) {
+    const adv = (base as any)?.advanceNotice
+    if (!adv) return payload
+
+    const out: SendTicketCalledSmsResponse = { ...payload }
+
+    out.advanceNotice = {
+        enabled: Boolean(adv?.enabled),
+        attempted: Boolean(adv?.attempted),
+        nextTicketId: adv?.nextTicketId ? String(adv.nextTicketId) : undefined,
+        nextQueueNumber: typeof adv?.nextQueueNumber === "number" ? adv.nextQueueNumber : undefined,
+    }
+
+    if (adv?.result) {
+        const normalized = normalizeSendSmsResult(
+            adv?.nextTicketId ? String(adv.nextTicketId) : payload.ticketId,
+            typeof adv?.nextQueueNumber === "number" ? adv.nextQueueNumber : undefined,
+            adv.result as SendSmsToQueuedUserResult
+        )
+
+        out.advanceNotice.ok = normalized.ok
+        out.advanceNotice.outcome = normalized.outcome
+        out.advanceNotice.message = normalized.message
+        out.advanceNotice.reason = normalized.reason
+        out.advanceNotice.number = normalized.number
+        out.advanceNotice.receiptsCount = normalized.receiptsCount
+        out.advanceNotice.statusSummary = normalized.statusSummary
+    } else if (typeof adv?.error === "string" && adv.error.trim()) {
+        out.advanceNotice.ok = false
+        out.advanceNotice.outcome = "failed"
+        out.advanceNotice.message = adv.error
+        out.advanceNotice.reason = "advance_notice_failed"
+    }
+
+    return out
+}
+
+/**
+ * ✅ Main helper used by /api/staff/tickets/:id/sms-called
+ * - Never throws on provider failure (prevents HTTP 500)
+ * - Returns normalized payload for UI
+ */
+export async function sendTicketCalledSms(input: SendTicketCalledSmsInput): Promise<SendTicketCalledSmsResponse> {
+    const ticketId = String(input.ticketId || "").trim()
+    if (!Types.ObjectId.isValid(ticketId)) {
+        return {
+            ok: false,
+            outcome: "failed",
+            message: "Invalid ticket id.",
+            reason: "invalid_ticket_id",
+            ticketId,
+        }
+    }
+
+    // for UI context only (do not block if it fails)
+    let queueNumber: number | undefined
+    try {
+        const t = await TicketModel.findById(ticketId).select({ queueNumber: 1 }).lean().exec()
+        queueNumber = typeof (t as any)?.queueNumber === "number" ? (t as any).queueNumber : undefined
+    } catch {
+        queueNumber = undefined
+    }
+
+    const senderName = String(input.senderName || "").trim()
+    const customMessage = String(input.message || "").trim()
+
+    try {
+        // Custom message (from staff dialog) => send exactly that
+        if (customMessage) {
+            const res = await sendSmsToQueuedUser({
+                ticketId,
+                message: customMessage,
+                options: {
+                    actor: input.actor,
+                    ...(senderName ? { senderName } : {}),
+                    respectOptOut: true,
+                    throwOnProviderFailure: false,
+                    meta: { source: "staff_sms_called_custom" },
+                },
+            })
+
+            return normalizeSendSmsResult(ticketId, queueNumber, res)
+        }
+
+        // Default CALLED template (and optional advance notice if enabled)
+        const base = await sendTicketStatusSms({
+            ticketId,
+            status: "CALLED",
+            options: {
+                actor: input.actor,
+                ...(senderName ? { senderName } : {}),
+                respectOptOut: true,
+                throwOnProviderFailure: false,
+                meta: { source: "staff_sms_called_default" },
+            },
+        })
+
+        const normalized = normalizeSendSmsResult(ticketId, queueNumber, base as any)
+        return normalizeAdvanceNotice(base, normalized)
+    } catch (e: any) {
+        return {
+            ok: false,
+            outcome: "failed",
+            message: String(e?.message || "Failed to send SMS."),
+            reason: "internal_error",
+            ticketId,
+            queueNumber,
+        }
+    }
+}
+
+// Extra aliases (helps avoid controller mismatches if it calls a different name)
+export async function sendSmsCalled(input: SendTicketCalledSmsInput) {
+    return sendTicketCalledSms(input)
+}
+export async function sendSmsCalledForTicket(input: SendTicketCalledSmsInput) {
+    return sendTicketCalledSms(input)
 }

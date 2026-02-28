@@ -26,6 +26,13 @@ import { UserModel } from "../models/User"
  * - We now REQUIRE a valid JSON response and at least one message receipt object.
  * - If a host returns HTML/empty/unknown JSON, we treat it as FAILURE (throw),
  *   instead of returning an empty array (which caused your UI to show success even when nothing was sent).
+ *
+ * ✅ IMPORTANT UX/RELIABILITY CHANGE (fixes your 500 on /sms-called):
+ * - We DO NOT crash API routes by default when Semaphore is down (5xx).
+ * - Caller-facing helpers (sendSmsToQueuedUser / sendTicketStatusSms) now default to:
+ *     throwOnProviderFailure = false
+ *   so your staff endpoints can return HTTP 200 with { ok:false } instead of HTTP 500.
+ * - If you want strict “throw on failure”, pass: { throwOnProviderFailure: true }.
  */
 
 // ✅ Prefer the official API host; include beta as fallback (Semaphore FAQ says beta endpoint still works).
@@ -173,8 +180,8 @@ export type SendSmsOptions = {
     supportedNetworkTokens?: string[]
 
     /**
-     * ✅ If true (default), provider failures/invalid receipts THROW (so API returns non-2xx and UI won't show “SMS sent”).
-     * Set to false only for non-critical/background flows where you want structured return instead of throw.
+     * ✅ If true, provider failures/invalid receipts THROW (so API returns non-2xx).
+     * ✅ DEFAULT IS NOW FALSE to prevent staff endpoints from returning HTTP 500 when Semaphore is down.
      */
     throwOnProviderFailure?: boolean
 }
@@ -209,7 +216,7 @@ export type SendSmsToQueuedUserResult =
           providerResponse: SemaphoreMessageResponse[]
           /**
            * Present when the provider request failed (or other non-fatal issue) but we intentionally did NOT throw,
-           * so API routes won't crash or time out into HTTP 502.
+           * so API routes won't crash or time out into HTTP 502/500.
            */
           error?: string
       }
@@ -499,11 +506,6 @@ function shortBodyPreview(text: string, max = 180) {
     if (!raw) return ""
     if (raw.length <= max) return raw
     return `${raw.slice(0, max)}…`
-}
-
-function looksLikeJsonPayload(text: string) {
-    const t = String(text || "").trim()
-    return t.startsWith("{") || t.startsWith("[")
 }
 
 function isSemaphoreMessageLike(obj: any) {
@@ -1208,8 +1210,9 @@ function buildFailedReliabilityInfo(): SmsReliabilityInfo {
  * - Respects smsUpdates=false when user can be resolved (default)
  * - Adds reliability info: status/network/support
  *
- * ✅ FIX: provider failures now THROW by default (opts.throwOnProviderFailure !== false),
- * so your API returns an error and the UI won't show a false “SMS sent”.
+ * ✅ FIX:
+ * - Defaults to NOT throwing on provider failure, so your staff endpoints won't return HTTP 500.
+ * - If you want strict throwing, pass { throwOnProviderFailure: true }.
  */
 export async function sendSmsToQueuedUser(params: {
     ticketId: string
@@ -1219,7 +1222,7 @@ export async function sendSmsToQueuedUser(params: {
     const { ticketId, message } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
-        throwOnProviderFailure: true,
+        throwOnProviderFailure: false,
         ...(params.options || {}),
         entityType: "TICKET",
         entityId: ticketId,
@@ -1372,14 +1375,13 @@ export async function sendSmsToQueuedUser(params: {
             },
         })
 
-        // ✅ Default behavior: THROW so the API returns non-2xx and UI won't show false success
-        if (options.throwOnProviderFailure !== false) {
+        // ✅ Only throw if explicitly requested
+        if (options.throwOnProviderFailure === true) {
             const err: any = new Error(errorMessage)
             err.cause = e
             throw err
         }
 
-        // Fallback behavior (only if explicitly opted out of throwing):
         return {
             skipped: false,
             sentTo: resolved.number,
@@ -1399,6 +1401,9 @@ export async function sendSmsToQueuedUser(params: {
  *   automatically notify the NEXT WAITING ticket (smallest queueNumber > current.queueNumber).
  * - Toggle priority:
  *    1) env queue_sms_advance_notice_enabled = true/false (global toggle)
+ *
+ * ✅ FIX:
+ * - Defaults to NOT throwing on provider failure to avoid HTTP 500 on staff routes.
  */
 export async function sendTicketStatusSms(params: {
     ticketId: string
@@ -1408,7 +1413,7 @@ export async function sendTicketStatusSms(params: {
     const { ticketId, status } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
-        throwOnProviderFailure: true,
+        throwOnProviderFailure: false,
         ...(params.options || {}),
         entityType: "TICKET",
         entityId: ticketId,
