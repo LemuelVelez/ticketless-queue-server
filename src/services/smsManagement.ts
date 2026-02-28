@@ -21,11 +21,17 @@ import { UserModel } from "../models/User"
  * Response includes:
  * - network: recipient phone number's network
  * - status: Queued | Pending | Sent | Failed | Refunded
+ *
+ * IMPORTANT FIX (prevents false “SMS sent”):
+ * - We now REQUIRE a valid JSON response and at least one message receipt object.
+ * - If a host returns HTML/empty/unknown JSON, we treat it as FAILURE (throw),
+ *   instead of returning an empty array (which caused your UI to show success even when nothing was sent).
  */
 
-// We keep BOTH hosts because Semaphore docs/examples sometimes show semaphore.co and api.semaphore.co.
-// Primary should be api.semaphore.co per docs.
-const DEFAULT_SEMAPHORE_BASE_URLS = ["https://api.semaphore.co", "https://semaphore.co"]
+// ✅ Prefer the official API host; include beta as fallback (Semaphore FAQ says beta endpoint still works).
+// We intentionally DO NOT rely on "https://semaphore.co" as a primary host because it can return HTML pages.
+// If you still want to use it, you can set SEMAPHORE_BASE_URL to "https://semaphore.co" explicitly.
+const DEFAULT_SEMAPHORE_BASE_URLS = ["https://api.semaphore.co", "https://beta.semaphore.co"]
 const SEMAPHORE_API_V4_PREFIX = "/api/v4"
 
 const SEMAPHORE_PATH_MESSAGES = "/messages"
@@ -42,9 +48,9 @@ const DEFAULT_SUPPORTED_NETWORK_TOKENS = ["GLOBE", "SMART", "SUN", "DITO", "TM",
  * 1) Never allow this service to hang indefinitely:
  *    - Add request timeouts for Semaphore fetch()
  *    - Add timeouts for audit-log writes (Mongo can hang when unhealthy)
- * 2) Avoid throwing from common, user-facing flows:
- *    - sendSmsToQueuedUser() and sendTicketStatusSms() return structured errors instead of throwing
- *      so controllers/routes won't accidentally crash or leave unhandled promise rejections.
+ * 2) Avoid false positives:
+ *    - Never treat non-JSON/empty/unexpected responses as success
+ *    - Never treat “Failed/Refunded” provider statuses as success
  */
 
 function clamp(n: number, min: number, max: number) {
@@ -165,6 +171,12 @@ export type SendSmsOptions = {
      * Optional: override supported network tokens used for reliability checks.
      */
     supportedNetworkTokens?: string[]
+
+    /**
+     * ✅ If true (default), provider failures/invalid receipts THROW (so API returns non-2xx and UI won't show “SMS sent”).
+     * Set to false only for non-critical/background flows where you want structured return instead of throw.
+     */
+    throwOnProviderFailure?: boolean
 }
 
 export type SmsDeliveryStatus = "QUEUED" | "PENDING" | "SENT" | "FAILED" | "REFUNDED" | "UNKNOWN"
@@ -243,13 +255,58 @@ function getSemaphoreApiKey(): string {
 }
 
 function getDefaultSenderName(): string | undefined {
-    const name = (
+    const raw =
         process.env.semaphore_sendername ||
         process.env.SEMAPHORE_SENDERNAME ||
         process.env.SEMAPHORE_SENDER ||
         process.env.semaphore_sender
-    ).trim()
+
+    const name = String(raw ?? "").trim()
     return name || undefined
+}
+
+function getFallbackSenderName(): string {
+    // FAQ suggests trying SEMAPHORE as sender name when delivery issues happen.
+    // You can override with SEMAPHORE_FALLBACK_SENDERNAME.
+    const raw = process.env.SEMAPHORE_FALLBACK_SENDERNAME
+    const v = String(raw ?? "SEMAPHORE").trim()
+    return v || "SEMAPHORE"
+}
+
+function isFallbackSenderDisabled() {
+    return parseBooleanEnv(process.env.SEMAPHORE_DISABLE_FALLBACK_SENDERNAME, false)
+}
+
+function ensureSenderNameAllowed(senderName: string) {
+    const trimmed = String(senderName || "").trim()
+    if (!trimmed) return
+
+    // Advisory: beginning July 1, 2024 users can no longer send from Sender Name "Semaphore".
+    // We block the common variants to avoid “sent” UX when provider rejects it.
+    const lower = trimmed.toLowerCase()
+    if (lower === "semaphore" && trimmed !== "SEMAPHORE") {
+        throw new Error(
+            'Invalid sender name "Semaphore". Please use an approved Sender Name (or "SEMAPHORE") per Semaphore advisories.'
+        )
+    }
+}
+
+function resolveEffectiveSenderName(optsSenderName?: string) {
+    const direct = String(optsSenderName ?? "").trim()
+    if (direct) return direct
+
+    const envDefault = getDefaultSenderName()
+    if (envDefault) return envDefault
+
+    if (isFallbackSenderDisabled()) return ""
+
+    return getFallbackSenderName()
+}
+
+function maskApiKey(key: string) {
+    const k = String(key || "")
+    if (k.length <= 8) return "****"
+    return `${k.slice(0, 4)}****${k.slice(-4)}`
 }
 
 function getSemaphoreBaseUrls(): string[] {
@@ -437,6 +494,64 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     }
 }
 
+function shortBodyPreview(text: string, max = 180) {
+    const raw = String(text || "").replace(/\s+/g, " ").trim()
+    if (!raw) return ""
+    if (raw.length <= max) return raw
+    return `${raw.slice(0, max)}…`
+}
+
+function looksLikeJsonPayload(text: string) {
+    const t = String(text || "").trim()
+    return t.startsWith("{") || t.startsWith("[")
+}
+
+function isSemaphoreMessageLike(obj: any) {
+    if (!obj || typeof obj !== "object") return false
+    // message_id is the best signal; but some responses might omit it in edge cases
+    return (
+        typeof obj.message_id === "number" ||
+        typeof obj.recipient === "string" ||
+        typeof obj.status === "string"
+    )
+}
+
+function assertProviderReceipts(messages: SemaphoreMessageResponse[], endpoint: string) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+        const err: any = new Error(
+            `Semaphore returned no message receipt. The request was NOT confirmed as sent. Endpoint: ${endpoint}`
+        )
+        err.code = "SEMAPHORE_NO_RECEIPT"
+        throw err
+    }
+
+    const failed = messages.filter((m) => m?.status === "Failed" || m?.status === "Refunded")
+    if (failed.length) {
+        const preview = failed
+            .slice(0, 3)
+            .map((m) => `${maskMobileNumber(String(m?.recipient || ""))}:${m?.status}`)
+            .join(", ")
+        const err: any = new Error(
+            `Semaphore rejected the message (${failed[0]?.status}). Recipients preview: ${preview || "n/a"}`
+        )
+        err.code = "SEMAPHORE_REJECTED"
+        err.failedCount = failed.length
+        throw err
+    }
+
+    const ok = messages.some((m) => m?.status === "Queued" || m?.status === "Pending" || m?.status === "Sent")
+    if (!ok) {
+        const statuses = summarizeStatuses(messages)
+        const err: any = new Error(
+            `Semaphore returned an unknown delivery status (no Queued/Pending/Sent). Statuses: ${JSON.stringify(
+                statuses
+            )}`
+        )
+        err.code = "SEMAPHORE_UNKNOWN_STATUS"
+        throw err
+    }
+}
+
 async function postSemaphore(
     urlCandidates: string[],
     payload: Record<string, string>,
@@ -476,6 +591,8 @@ async function postSemaphore(
                 lastAttemptRateLimit = rateLimit || lastAttemptRateLimit
 
                 const text = await res.text()
+                const contentType = String(res.headers.get("content-type") || "")
+
                 let json: any
                 try {
                     json = text ? JSON.parse(text) : null
@@ -501,17 +618,50 @@ async function postSemaphore(
                     throw err
                 }
 
+                // ✅ STRICT SUCCESS: must be JSON and must contain receipts
+                if (!text || !text.trim()) {
+                    const err: any = new Error(
+                        `Semaphore returned an empty response body (HTTP ${res.status}) from ${url}.`
+                    )
+                    err.status = res.status
+                    err.endpoint = url
+                    throw err
+                }
+
+                if (!json) {
+                    // if HTML or non-json, treat as failure (prevents false “sent”)
+                    const err: any = new Error(
+                        `Semaphore returned a non-JSON response from ${url} (content-type: ${contentType || "unknown"}). Preview: ${shortBodyPreview(
+                            text
+                        )}`
+                    )
+                    err.status = res.status
+                    err.endpoint = url
+                    err.data = text
+                    throw err
+                }
+
                 // Semaphore commonly returns an array of message objects on success.
                 if (Array.isArray(json)) {
                     return { messages: json as SemaphoreMessageResponse[], endpointUsed: url, rateLimit }
                 }
 
                 // Some variants may return a single object; normalize it to an array.
-                if (json && typeof json === "object" && (json.message_id || json.status || json.recipient)) {
+                if (isSemaphoreMessageLike(json)) {
                     return { messages: [json as SemaphoreMessageResponse], endpointUsed: url, rateLimit }
                 }
 
-                return { messages: [], endpointUsed: url, rateLimit }
+                // Some error payloads may still be 200 (rare); treat as failure if schema is unexpected
+                const maybeError = (json && (json.error || json.message)) ? String(json.error || json.message) : ""
+                const err: any = new Error(
+                    `Unexpected Semaphore response from ${url}.${
+                        maybeError ? ` Provider message: ${maybeError}` : ""
+                    } Preview: ${shortBodyPreview(text)}`
+                )
+                err.status = res.status
+                err.endpoint = url
+                err.data = json
+                throw err
             } catch (e: any) {
                 lastErr = e
                 // If this candidate failed due to network/timeout, try the next candidate in the same attempt.
@@ -590,6 +740,8 @@ async function getSemaphore(
                 const rateLimit = extractRateLimitInfo(res.headers)
 
                 const text = await res.text()
+                const contentType = String(res.headers.get("content-type") || "")
+
                 let json: any
                 try {
                     json = text ? JSON.parse(text) : null
@@ -611,6 +763,28 @@ async function getSemaphore(
                     err.attempt = attempt
                     err.maxAttempts = maxAttempts
                     err.endpoint = url
+                    throw err
+                }
+
+                // ✅ STRICT: successful GET must still be JSON (avoid HTML/empty false positives)
+                if (!text || !text.trim()) {
+                    const err: any = new Error(
+                        `Semaphore returned an empty response body (HTTP ${res.status}) from ${urlBase}.`
+                    )
+                    err.status = res.status
+                    err.endpoint = urlBase
+                    throw err
+                }
+
+                if (!json) {
+                    const err: any = new Error(
+                        `Semaphore returned a non-JSON response from ${urlBase} (content-type: ${contentType || "unknown"}). Preview: ${shortBodyPreview(
+                            text
+                        )}`
+                    )
+                    err.status = res.status
+                    err.endpoint = urlBase
+                    err.data = text
                     throw err
                 }
 
@@ -696,6 +870,8 @@ export async function getSemaphoreAccount() {
  * - Validates PH mobile number format (63 + 10 digits); filters invalid numbers and logs them
  * - Tracks supported networks (based on Semaphore coverage), and logs unsupported/unknown
  * - Logs per-call status summary + response preview + errors (failed requests)
+ *
+ * ✅ FIX: requires provider receipts, and throws on non-JSON/empty/unexpected responses
  */
 export async function sendSms(
     numbers: string | string[],
@@ -705,7 +881,9 @@ export async function sendSms(
     ensureMessageAllowed(message)
 
     const apiKey = getSemaphoreApiKey()
-    const senderName = (opts.senderName || getDefaultSenderName() || "").trim() || undefined
+
+    const senderNameResolved = resolveEffectiveSenderName(opts.senderName)
+    if (senderNameResolved) ensureSenderNameAllowed(senderNameResolved)
 
     const list = Array.isArray(numbers) ? numbers : String(numbers ?? "").split(",")
     const normalizedAll = Array.from(
@@ -763,6 +941,21 @@ export async function sendSms(
         })
     }
 
+    // Helpful warning: if we had to fallback sender name (and user did not provide)
+    if (!String(opts.senderName ?? "").trim() && !getDefaultSenderName() && senderNameResolved) {
+        await maybeAuditLog({
+            actor: opts.actor,
+            action: "SMS_SENDERNAME_FALLBACK_USED",
+            entityType: opts.entityType,
+            entityId: opts.entityId,
+            meta: {
+                provider: "semaphore",
+                fallbackSenderName: senderNameResolved,
+                note: "No sender name provided; fallback sender name was applied to avoid provider default issues.",
+            },
+        })
+    }
+
     for (const chunk of chunks) {
         const payload: Record<string, string> = {
             apikey: apiKey,
@@ -771,7 +964,7 @@ export async function sendSms(
             message: String(message).replace(/\r\n/g, "\n"),
         }
 
-        if (senderName) payload.sendername = senderName
+        if (senderNameResolved) payload.sendername = senderNameResolved
         if (opts.otp && opts.otpCode !== undefined && opts.otpCode !== null) {
             payload.code = String(opts.otpCode)
         }
@@ -797,7 +990,8 @@ export async function sendSms(
                     recipientsCount: chunk.length,
                     recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber),
                     messageLen: String(message).length,
-                    senderName: senderName ?? null,
+                    senderName: senderNameResolved || null,
+                    apiKeyMasked: maskApiKey(apiKey),
                     errorMessage: String(e?.message || "Unknown error"),
                     httpStatus: e?.status ?? null,
                     rateLimit: e?.rateLimit ?? null,
@@ -813,6 +1007,10 @@ export async function sendSms(
         }
 
         const r = result.messages
+
+        // ✅ CRITICAL: must have valid receipts and acceptable statuses
+        assertProviderReceipts(r, result.endpointUsed)
+
         responses.push(...r)
 
         const statusSummary = summarizeStatuses(r)
@@ -849,7 +1047,7 @@ export async function sendSms(
                 recipientsCount: chunk.length,
                 recipientsMasked: chunk.slice(0, 10).map(maskMobileNumber),
                 messageLen: String(message).length,
-                senderName: senderName ?? null,
+                senderName: senderNameResolved || null,
                 statusSummary,
                 supportedNetworkSummary: supportedSummary,
                 responsePreview,
@@ -1010,9 +1208,8 @@ function buildFailedReliabilityInfo(): SmsReliabilityInfo {
  * - Respects smsUpdates=false when user can be resolved (default)
  * - Adds reliability info: status/network/support
  *
- * IMPORTANT:
- * - This function is hardened to avoid throwing for common cases (prevents API crashes/timeouts -> 502).
- * - It returns structured results with `error` instead.
+ * ✅ FIX: provider failures now THROW by default (opts.throwOnProviderFailure !== false),
+ * so your API returns an error and the UI won't show a false “SMS sent”.
  */
 export async function sendSmsToQueuedUser(params: {
     ticketId: string
@@ -1022,6 +1219,7 @@ export async function sendSmsToQueuedUser(params: {
     const { ticketId, message } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
+        throwOnProviderFailure: true,
         ...(params.options || {}),
         entityType: "TICKET",
         entityId: ticketId,
@@ -1174,7 +1372,14 @@ export async function sendSmsToQueuedUser(params: {
             },
         })
 
-        // Return (do NOT throw) -> avoids API 500/timeout and lets UI show a friendly toast.
+        // ✅ Default behavior: THROW so the API returns non-2xx and UI won't show false success
+        if (options.throwOnProviderFailure !== false) {
+            const err: any = new Error(errorMessage)
+            err.cause = e
+            throw err
+        }
+
+        // Fallback behavior (only if explicitly opted out of throwing):
         return {
             skipped: false,
             sentTo: resolved.number,
@@ -1194,19 +1399,16 @@ export async function sendSmsToQueuedUser(params: {
  *   automatically notify the NEXT WAITING ticket (smallest queueNumber > current.queueNumber).
  * - Toggle priority:
  *    1) env queue_sms_advance_notice_enabled = true/false (global toggle)
- *
- * HARDENED:
- * - returns structured results instead of throwing (prevents route crashes -> 502)
  */
 export async function sendTicketStatusSms(params: {
     ticketId: string
     status: "CALLED" | "HOLD" | "OUT" | "SERVED"
     options?: Omit<SendSmsOptions, "entityType" | "entityId">
 }): Promise<TicketStatusSmsResult> {
-    // (rest of file unchanged)
     const { ticketId, status } = params
     const options: SendSmsOptions = {
         respectOptOut: true,
+        throwOnProviderFailure: true,
         ...(params.options || {}),
         entityType: "TICKET",
         entityId: ticketId,
