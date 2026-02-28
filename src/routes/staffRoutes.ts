@@ -148,8 +148,8 @@ router.post("/tickets/:id/return", staffController.returnFromHold)
 // ✅ SMS operations (Semaphore) - powered by centralized smsManagement service
 router.post("/sms/send", smsController.sendSms)
 
-// Legacy alias: sends CALLED status (or custom message if provided)
-router.post("/tickets/:id/sms-called", smsController.sendTicketCalled)
+// ✅ FIX: make /sms-called use the unified safe responder (prevents 500/5xx and always returns safe JSON)
+router.post("/tickets/:id/sms-called", smsController.sendTicketSms)
 
 // Unified ticket status SMS (CALLED | HOLD | OUT | SERVED) + optional custom message override
 router.post("/tickets/:id/sms-status", smsController.sendTicketStatus)

@@ -204,66 +204,65 @@ function computeOutcome(result: any): "sent" | "skipped" | "failed" | "unknown" 
     return "unknown"
 }
 
-function skippedReasonToHttpStatus(reason: string | undefined) {
-    if (!reason) return 400
-    if (reason === "opted_out") return 200
-    if (reason === "ticket_not_found") return 404
-    if (reason === "internal_error") return 500
-    // no_recipient | invalid_number | message_not_allowed
-    return 400
-}
-
+/**
+ * ✅ SAFE responder for staff ticket SMS endpoints:
+ * - NEVER returns 5xx/4xx for provider failures / internal hiccups
+ * - Always returns HTTP 200 with { ok:false, ... } so the UI won't crash/throw (axios)
+ * - Still includes structured reason/outcome/details for toasts and debugging
+ */
 function respondTicketSms(
     res: Response,
     ctx: { ticketId: string; status?: string },
     result: SendSmsToQueuedUserResult | TicketStatusSmsResult
 ): Response {
-    let outcome = computeOutcome(result as any)
+    const outcome = computeOutcome(result as any)
 
-    // ✅ New service behavior: it returns structured "skipped" results (no throw).
-    // Controller must map those to proper HTTP responses.
+    // Skipped cases (opt-out, no recipient, invalid number, ticket not found, etc.)
     if ((result as any).skipped === true) {
-        const reason = String((result as any).reason || "unknown")
-        const httpStatus = skippedReasonToHttpStatus(reason)
-        const ok = httpStatus === 200 // only opted_out becomes ok=true
+        const reason = String((result as any).reason || "skipped")
+        const err = String((result as any).error || "").trim()
 
-        return res.status(httpStatus).json({
-            ok,
-            provider: "semaphore",
-            ticketId: ctx.ticketId,
-            status: ctx.status,
-            outcome,
-            reason,
-            error: (result as any).error,
-            result,
-        })
-    }
-
-    // Provider failure (upstream) -> HTTP 502 but include structured payload for UI
-    if ((result as any).skipped === false && typeof (result as any).error === "string" && (result as any).error.trim()) {
-        return res.status(502).json({
+        return res.status(200).json({
             ok: false,
             provider: "semaphore",
             ticketId: ctx.ticketId,
             status: ctx.status,
-            outcome,
-            error: (result as any).error,
+            outcome: "skipped",
+            reason,
+            error: err || undefined,
             result,
         })
     }
 
-    // ✅ Receipt validation (prevents "false success")
+    // Provider error surfaced by service (but service didn't throw)
+    if ((result as any).skipped === false && typeof (result as any).error === "string" && (result as any).error.trim()) {
+        const err = String((result as any).error || "").trim()
+        return res.status(200).json({
+            ok: false,
+            provider: "semaphore",
+            ticketId: ctx.ticketId,
+            status: ctx.status,
+            outcome: "failed",
+            reason: "provider_error",
+            error: err,
+            // Keep lightweight details (still helpful for UI)
+            result,
+        })
+    }
+
+    // Receipt validation (prevents false success); return 200 ok=false if invalid
     const receipt = getReceiptValidationFromResult(result as any)
     if (receipt && receipt.ok === false) {
-        outcome = "failed"
-        return res.status(502).json({
+        return res.status(200).json({
             ok: false,
             provider: "semaphore",
             ticketId: ctx.ticketId,
             status: ctx.status,
-            outcome,
+            outcome: "failed",
+            reason: "receipt_invalid",
             error: receipt.error || "Semaphore receipt indicates failure",
             statusSummary: receipt.statusSummary,
+            receiptsCount: receipt.receiptsCount,
             result,
         })
     }
@@ -276,6 +275,7 @@ function respondTicketSms(
         status: ctx.status,
         outcome,
         statusSummary: receipt?.statusSummary,
+        receiptsCount: receipt?.receiptsCount,
         result,
     })
 }
@@ -371,15 +371,30 @@ async function sendSms(req: Request, res: Response): Promise<Response> {
  * Legacy route handler: /tickets/:id/sms-called
  * - If body.message is provided: sends that custom message to the queued user (ticket-based recipient resolution)
  * - Else: sends standardized "CALLED" ticket status SMS (with optional advance notice if enabled via env)
+ *
+ * ✅ SAFETY:
+ * - Always returns HTTP 200 with ok=false on failures (prevents UI/axios throwing)
  */
 async function sendTicketCalled(req: Request, res: Response): Promise<Response> {
+    const { id } = req.params
     try {
-        const { id } = req.params
         const body = (req.body || {}) as any
 
         const customMessage = String(body.message ?? "").trim()
         const senderNameRaw = String(body.senderName ?? "").trim()
         const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
+
+        // Semaphore silently ignores messages that start with "TEST" (false-success trap)
+        if (customMessage && /^test\b/i.test(customMessage)) {
+            return res.status(200).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                outcome: "failed",
+                reason: "message_not_allowed",
+                error: 'message cannot start with "TEST" (Semaphore will silently ignore it)',
+            })
+        }
 
         const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
             senderName: senderName || undefined,
@@ -392,6 +407,9 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
                 : undefined,
             actor: getActorFromReq(req),
             meta: body.meta && typeof body.meta === "object" ? body.meta : undefined,
+
+            // ✅ Critical: never throw to the route for provider failures
+            throwOnProviderFailure: false,
         }
 
         const result = customMessage
@@ -408,8 +426,13 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
 
         return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : "CALLED" }, result)
     } catch (error: any) {
-        return res.status(inferHttpStatus(error)).json({
+        // ✅ Never surface 500 for this endpoint; keep UI stable
+        return res.status(200).json({
             ok: false,
+            provider: "semaphore",
+            ticketId: id,
+            outcome: "failed",
+            reason: "internal_error",
             error: toErrorMessage(error),
         })
     }
@@ -420,10 +443,12 @@ async function sendTicketCalled(req: Request, res: Response): Promise<Response> 
  * Body:
  * - status: "CALLED" | "HOLD" | "OUT" | "SERVED"
  * - message?: custom override (if provided, it will send custom message instead of templated status SMS)
+ *
+ * ✅ SAFETY: always HTTP 200 with ok=false on failures
  */
 async function sendTicketStatus(req: Request, res: Response): Promise<Response> {
+    const { id } = req.params
     try {
-        const { id } = req.params
         const body = (req.body || {}) as any
 
         const status = String(body.status ?? "").trim().toUpperCase()
@@ -433,78 +458,24 @@ async function sendTicketStatus(req: Request, res: Response): Promise<Response> 
 
         const allowed = new Set(["CALLED", "HOLD", "OUT", "SERVED"])
         if (!status || !allowed.has(status)) {
-            return res.status(400).json({
+            return res.status(200).json({
                 ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                outcome: "failed",
+                reason: "invalid_status",
                 error: 'status is required and must be one of: "CALLED" | "HOLD" | "OUT" | "SERVED"',
-            })
-        }
-
-        const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
-            senderName: senderName || undefined,
-            priority: parseBooleanInput(body.priority, false),
-            otp: parseBooleanInput(body.otp, false),
-            otpCode: body.otpCode,
-            respectOptOut: parseBooleanInput(body.respectOptOut, true),
-            supportedNetworkTokens: Array.isArray(body.supportedNetworkTokens)
-                ? body.supportedNetworkTokens
-                : undefined,
-            actor: getActorFromReq(req),
-            meta: body.meta && typeof body.meta === "object" ? body.meta : undefined,
-        }
-
-        const result = customMessage
-            ? await sendSmsToQueuedUser({
-                  ticketId: id,
-                  message: customMessage,
-                  options,
-              })
-            : await sendTicketStatusSms({
-                  ticketId: id,
-                  status: status as "CALLED" | "HOLD" | "OUT" | "SERVED",
-                  options,
-              })
-
-        return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : status }, result)
-    } catch (error: any) {
-        return res.status(inferHttpStatus(error)).json({
-            ok: false,
-            error: toErrorMessage(error),
-        })
-    }
-}
-
-/**
- * ✅ Unified alias route handler: /tickets/:id/sms
- * Supports:
- * - body.message (custom message)
- * - body.status (CALLED|HOLD|OUT|SERVED)
- * - if neither is provided: defaults to status=CALLED (matches legacy expectation)
- */
-async function sendTicketSms(req: Request, res: Response): Promise<Response> {
-    try {
-        const { id } = req.params
-        const body = (req.body || {}) as any
-
-        const customMessage = String(body.message ?? "").trim()
-        const statusRaw = String(body.status ?? "").trim().toUpperCase()
-        const senderNameRaw = String(body.senderName ?? "").trim()
-        const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
-
-        const allowed = new Set(["CALLED", "HOLD", "OUT", "SERVED"])
-        const hasStatus = !!statusRaw
-        const status = hasStatus ? statusRaw : "CALLED"
-
-        if (hasStatus && !allowed.has(status)) {
-            return res.status(400).json({
-                ok: false,
-                error: 'status must be one of: "CALLED" | "HOLD" | "OUT" | "SERVED"',
             })
         }
 
         // Semaphore silently ignores messages that start with "TEST" (false-success trap)
         if (customMessage && /^test\b/i.test(customMessage)) {
-            return res.status(400).json({
+            return res.status(200).json({
                 ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                outcome: "failed",
+                reason: "message_not_allowed",
                 error: 'message cannot start with "TEST" (Semaphore will silently ignore it)',
             })
         }
@@ -520,6 +491,9 @@ async function sendTicketSms(req: Request, res: Response): Promise<Response> {
                 : undefined,
             actor: getActorFromReq(req),
             meta: body.meta && typeof body.meta === "object" ? body.meta : undefined,
+
+            // ✅ Critical: never throw to the route for provider failures
+            throwOnProviderFailure: false,
         }
 
         const result = customMessage
@@ -536,8 +510,99 @@ async function sendTicketSms(req: Request, res: Response): Promise<Response> {
 
         return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : status }, result)
     } catch (error: any) {
-        return res.status(inferHttpStatus(error)).json({
+        return res.status(200).json({
             ok: false,
+            provider: "semaphore",
+            ticketId: id,
+            outcome: "failed",
+            reason: "internal_error",
+            error: toErrorMessage(error),
+        })
+    }
+}
+
+/**
+ * ✅ Unified alias route handler: /tickets/:id/sms
+ * Supports:
+ * - body.message (custom message)
+ * - body.status (CALLED|HOLD|OUT|SERVED)
+ * - if neither is provided: defaults to status=CALLED (matches legacy expectation)
+ *
+ * ✅ SAFETY: always HTTP 200 with ok=false on failures
+ */
+async function sendTicketSms(req: Request, res: Response): Promise<Response> {
+    const { id } = req.params
+    try {
+        const body = (req.body || {}) as any
+
+        const customMessage = String(body.message ?? "").trim()
+        const statusRaw = String(body.status ?? "").trim().toUpperCase()
+        const senderNameRaw = String(body.senderName ?? "").trim()
+        const senderName = senderNameRaw && senderNameRaw !== "undefined" ? senderNameRaw : ""
+
+        const allowed = new Set(["CALLED", "HOLD", "OUT", "SERVED"])
+        const hasStatus = !!statusRaw
+        const status = hasStatus ? statusRaw : "CALLED"
+
+        if (hasStatus && !allowed.has(status)) {
+            return res.status(200).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                outcome: "failed",
+                reason: "invalid_status",
+                error: 'status must be one of: "CALLED" | "HOLD" | "OUT" | "SERVED"',
+            })
+        }
+
+        // Semaphore silently ignores messages that start with "TEST" (false-success trap)
+        if (customMessage && /^test\b/i.test(customMessage)) {
+            return res.status(200).json({
+                ok: false,
+                provider: "semaphore",
+                ticketId: id,
+                outcome: "failed",
+                reason: "message_not_allowed",
+                error: 'message cannot start with "TEST" (Semaphore will silently ignore it)',
+            })
+        }
+
+        const options: Omit<SendSmsOptions, "entityType" | "entityId"> = {
+            senderName: senderName || undefined,
+            priority: parseBooleanInput(body.priority, false),
+            otp: parseBooleanInput(body.otp, false),
+            otpCode: body.otpCode,
+            respectOptOut: parseBooleanInput(body.respectOptOut, true),
+            supportedNetworkTokens: Array.isArray(body.supportedNetworkTokens)
+                ? body.supportedNetworkTokens
+                : undefined,
+            actor: getActorFromReq(req),
+            meta: body.meta && typeof body.meta === "object" ? body.meta : undefined,
+
+            // ✅ Critical: never throw to the route for provider failures
+            throwOnProviderFailure: false,
+        }
+
+        const result = customMessage
+            ? await sendSmsToQueuedUser({
+                  ticketId: id,
+                  message: customMessage,
+                  options,
+              })
+            : await sendTicketStatusSms({
+                  ticketId: id,
+                  status: status as "CALLED" | "HOLD" | "OUT" | "SERVED",
+                  options,
+              })
+
+        return respondTicketSms(res, { ticketId: id, status: customMessage ? undefined : status }, result)
+    } catch (error: any) {
+        return res.status(200).json({
+            ok: false,
+            provider: "semaphore",
+            ticketId: id,
+            outcome: "failed",
+            reason: "internal_error",
             error: toErrorMessage(error),
         })
     }
