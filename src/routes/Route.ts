@@ -1,14 +1,26 @@
 import { Router } from "express"
 import {
     AuditLogController,
+    AuthController,
     DepartmentController,
     ServiceWindowController,
     SettingController,
     TicketController,
     UserController,
 } from "../controllers"
+import {
+    requireAuth,
+    requireRoles,
+} from "../controllers/middlewares"
 
 export const ROUTE_PATHS = {
+    auth: {
+        register: "/auth/register",
+        login: "/auth/login",
+        forgotPassword: "/auth/forgot-password",
+        resetPassword: "/auth/reset-password",
+        me: "/auth/me",
+    },
     settings: {
         current: "/settings/current",
     },
@@ -43,10 +55,26 @@ export const ROUTE_PATHS = {
 
 export const route = Router()
 
+route.post(ROUTE_PATHS.auth.register, AuthController.register)
+route.post(ROUTE_PATHS.auth.login, AuthController.login)
+route.post(ROUTE_PATHS.auth.forgotPassword, AuthController.forgotPassword)
+route.post(ROUTE_PATHS.auth.resetPassword, AuthController.resetPassword)
+route.get(ROUTE_PATHS.auth.me, requireAuth, AuthController.me)
+
 route.get(ROUTE_PATHS.settings.current, SettingController.getCurrent)
 
-route.get(ROUTE_PATHS.auditLogs.recent, AuditLogController.listRecent)
-route.get(ROUTE_PATHS.auditLogs.byActor, AuditLogController.getByActor)
+route.get(
+    ROUTE_PATHS.auditLogs.recent,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    AuditLogController.listRecent
+)
+route.get(
+    ROUTE_PATHS.auditLogs.byActor,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    AuditLogController.getByActor
+)
 
 route.get(ROUTE_PATHS.departments.enabled, DepartmentController.listEnabled)
 route.get(ROUTE_PATHS.departments.byId, DepartmentController.getById)
@@ -76,9 +104,29 @@ route.get(
     TicketController.listActiveByDepartment
 )
 
-route.get(ROUTE_PATHS.users.byId, UserController.getById)
-route.get(ROUTE_PATHS.users.byStudentId, UserController.getByStudentId)
-route.get(ROUTE_PATHS.users.staff, UserController.listStaff)
-route.get(ROUTE_PATHS.users.participants, UserController.listParticipants)
+route.get(
+    ROUTE_PATHS.users.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.getById
+)
+route.get(
+    ROUTE_PATHS.users.byStudentId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.getByStudentId
+)
+route.get(
+    ROUTE_PATHS.users.staff,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.listStaff
+)
+route.get(
+    ROUTE_PATHS.users.participants,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.listParticipants
+)
 
 export default route

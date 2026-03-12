@@ -1,4 +1,5 @@
 export * from "./AuditLogController"
+export * from "./AuthController"
 export * from "./ControllerUtils"
 export * from "./DepartmentController"
 export * from "./ServiceWindowController"

@@ -5,7 +5,13 @@ import type {
     RequestHandler,
     Response,
 } from "express"
+import type { UserRole } from "../models/Model"
 import { getClientOrigin, getNodeEnv } from "../config/env"
+import {
+    AuthService,
+    type AccessTokenPayload,
+} from "../services/AuthService"
+import type { UserView } from "../services/UserService"
 
 function buildAllowedOrigins() {
     const configured = getClientOrigin()
@@ -20,6 +26,25 @@ function buildAllowedOrigins() {
 }
 
 const allowedOrigins = buildAllowedOrigins()
+
+export type AuthenticatedRequest = Request & {
+    auth?: AccessTokenPayload
+    currentUser?: UserView
+}
+
+function getBearerToken(req: Request): string | null {
+    const header = String(req.headers.authorization ?? "").trim()
+
+    if (!header) return null
+
+    const [scheme, token] = header.split(" ")
+
+    if (!/^Bearer$/i.test(scheme) || !token?.trim()) {
+        return null
+    }
+
+    return token.trim()
+}
 
 export const corsMiddleware: RequestHandler = (req, res, next) => {
     const requestOrigin = String(req.headers.origin ?? "").trim().replace(/\/$/, "")
@@ -47,6 +72,67 @@ export const corsMiddleware: RequestHandler = (req, res, next) => {
     }
 
     next()
+}
+
+export const requireAuth: RequestHandler = async (req, res, next) => {
+    try {
+        const token = getBearerToken(req)
+
+        if (!token) {
+            res.status(401).json({
+                ok: false,
+                message: "Authentication required",
+            })
+            return
+        }
+
+        const payload = AuthService.verifyAccessToken(token)
+        const currentUser = await AuthService.getCurrentUser(payload.sub)
+
+        if (!currentUser || !currentUser.active) {
+            res.status(401).json({
+                ok: false,
+                message: "Invalid or expired access token",
+            })
+            return
+        }
+
+        const authReq = req as AuthenticatedRequest
+        authReq.auth = payload
+        authReq.currentUser = currentUser
+
+        next()
+    } catch {
+        res.status(401).json({
+            ok: false,
+            message: "Invalid or expired access token",
+        })
+    }
+}
+
+export function requireRoles(...roles: UserRole[]): RequestHandler {
+    return (req, res, next) => {
+        const authReq = req as AuthenticatedRequest
+        const currentRole = authReq.currentUser?.role as UserRole | undefined
+
+        if (!currentRole) {
+            res.status(401).json({
+                ok: false,
+                message: "Authentication required",
+            })
+            return
+        }
+
+        if (!roles.includes(currentRole)) {
+            res.status(403).json({
+                ok: false,
+                message: "You do not have permission to access this resource",
+            })
+            return
+        }
+
+        next()
+    }
 }
 
 export const notFoundHandler: RequestHandler = (_req, res) => {
