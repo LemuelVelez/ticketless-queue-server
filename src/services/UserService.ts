@@ -1,5 +1,6 @@
 import { Types } from "mongoose"
 import { UserModel } from "../models/Model"
+import { resolveStoredFileUrl } from "../s3"
 import { NameService } from "./NameService"
 
 export type UserView = {
@@ -21,9 +22,20 @@ export type UserView = {
 
 export class UserService {
     static toView(user: any): UserView {
-        const assignedDepartments = Array.isArray(user?.assignedDepartments)
-            ? user.assignedDepartments
-            : []
+        const assignedDepartmentsSource =
+            Array.isArray(user?.assignedDepartments) && user.assignedDepartments.length > 0
+                ? user.assignedDepartments
+                : user?.assignedDepartment
+                    ? [user.assignedDepartment]
+                    : []
+
+        const assignedDepartmentNames = Array.from(
+            new Set(
+                assignedDepartmentsSource
+                    .map((department: any) => NameService.getDepartmentName(department))
+                    .filter(Boolean)
+            )
+        )
 
         return {
             id: NameService.toIdString(user?._id) ?? "",
@@ -37,13 +49,11 @@ export class UserService {
             departmentName: user?.departmentId
                 ? NameService.getDepartmentName(user.departmentId)
                 : undefined,
-            assignedDepartmentNames: assignedDepartments.map((department: any) =>
-                NameService.getDepartmentName(department)
-            ),
+            assignedDepartmentNames,
             assignedWindowName: user?.assignedWindow
                 ? NameService.getWindowName(user.assignedWindow)
                 : undefined,
-            avatarUrl: user?.avatarUrl ? String(user.avatarUrl) : undefined,
+            avatarUrl: resolveStoredFileUrl(user?.avatarUrl),
             createdAt: user?.createdAt,
             updatedAt: user?.updatedAt,
         }
@@ -84,6 +94,7 @@ export class UserService {
         if (!includeInactive) filter.active = true
 
         const users = await UserModel.find(filter)
+            .populate("departmentId", "name code")
             .populate("assignedDepartment", "name code")
             .populate("assignedDepartments", "name code")
             .populate("assignedWindow", "name number")

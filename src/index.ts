@@ -5,41 +5,79 @@ import dotenv from "dotenv"
 import routes from "./routes"
 import { notFoundHandler, errorHandler, corsMiddleware } from "./controllers/middlewares"
 import { initDefaults } from "./migration/initDefaults"
+import {
+    getBooleanEnv,
+    getEnvOrThrow,
+    getMissingOptionalEnv,
+    getNumberEnv,
+    getServerPublicUrl,
+} from "./config/env"
 
 dotenv.config()
 
-async function connectDb() {
-    const url = process.env.DATABASE_URL
-    if (!url) throw new Error("DATABASE_URL is missing")
+function logOptionalEnvWarnings() {
+    const missing = getMissingOptionalEnv([
+        "CLIENT_ORIGIN",
+        "SERVER_PUBLIC_URL",
+        "SUPPORT_INBOX",
+        "S3_BUCKET_NAME",
+        "S3_PUBLIC_URL_BASE",
+    ])
 
-    const ssl = String(process.env.DATABASE_SSL || "false").toLowerCase() === "true"
+    if (!missing.length) return
+
+    // eslint-disable-next-line no-console
+    console.warn(`⚠️ Optional env not configured: ${missing.join(", ")}`)
+}
+
+async function connectDb() {
+    const url = getEnvOrThrow("DATABASE_URL")
+    const ssl = getBooleanEnv("DATABASE_SSL", false)
+
     await mongoose.connect(url, ssl ? { tls: true } : {})
+
     // eslint-disable-next-line no-console
     console.log("✅ MongoDB connected")
 }
 
 async function bootstrap() {
+    logOptionalEnvWarnings()
+
     await connectDb()
     await initDefaults()
 
     const app = express()
+    const publicUrl = getServerPublicUrl()
 
-    // Basic CORS (no extra dependency)
+    app.disable("x-powered-by")
+    app.set("trust proxy", 1)
+
     app.use(corsMiddleware)
-
     app.use(express.json({ limit: "2mb" }))
+    app.use(express.urlencoded({ extended: true, limit: "2mb" }))
 
-    app.get("/health", (_req, res) => res.json({ ok: true }))
+    app.get("/health", (_req, res) =>
+        res.json({
+            ok: true,
+            service: "QueuePass API",
+            publicUrl: publicUrl ?? null,
+        })
+    )
 
     app.use("/api", routes)
 
     app.use(notFoundHandler)
     app.use(errorHandler)
 
-    const port = Number(process.env.PORT || 5000)
+    const port = getNumberEnv("PORT", 3000)
     const server = app.listen(port, () => {
         // eslint-disable-next-line no-console
         console.log(`🚀 Server running on port ${port}`)
+
+        if (publicUrl) {
+            // eslint-disable-next-line no-console
+            console.log(`🌐 Public URL: ${publicUrl}`)
+        }
     })
 
     const shutdown = async () => {

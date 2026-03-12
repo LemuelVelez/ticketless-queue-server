@@ -1,11 +1,16 @@
 import nodemailer from "nodemailer"
 import * as fs from "fs"
 import * as path from "path"
+import {
+    getClientOrigin,
+    getOptionalEnv,
+    getSupportInbox,
+} from "../config/env"
 import { buildSendLoginCredentialsEmail } from "./email-templates/send-login-credentials"
 
 function getTransporter() {
-    const user = process.env.GMAIL_USER
-    const pass = process.env.GMAIL_APP_PASSWORD
+    const user = getOptionalEnv("GMAIL_USER")
+    const pass = getOptionalEnv("GMAIL_APP_PASSWORD")
 
     if (!user || !pass) return null
 
@@ -25,17 +30,16 @@ function escapeHtml(input: string) {
 }
 
 function buildResetLinkFromClientOrigin(token: string) {
-    const originRaw = process.env.CLIENT_ORIGIN
-    if (!originRaw) return null
+    const origin = getClientOrigin()
+    if (!origin) return null
 
-    const origin = originRaw.replace(/\/$/, "")
     return `${origin}/reset-password?token=${encodeURIComponent(token)}`
 }
 
 function buildLoginLinkFromClientOrigin() {
-    const originRaw = process.env.CLIENT_ORIGIN
-    if (!originRaw) return null
-    const origin = originRaw.replace(/\/$/, "")
+    const origin = getClientOrigin()
+    if (!origin) return null
+
     return `${origin}/login`
 }
 
@@ -54,7 +58,6 @@ const THEME = {
     ring: "#18A7A1",
 }
 
-// ✅ Gmail tends to be more reliable when CID includes "@"
 const LOGO_PNG_CID = "queuepass-logo@queuepass.local"
 
 function findLogoPngPath(): string | null {
@@ -62,6 +65,7 @@ function findLogoPngPath(): string | null {
         path.join(process.cwd(), "src", "images", "logo.png"),
         path.join(process.cwd(), "dist", "images", "logo.png"),
         path.join(process.cwd(), "build", "images", "logo.png"),
+        path.join(process.cwd(), "images", "logo.png"),
         path.join(__dirname, "..", "images", "logo.png"),
         path.join(__dirname, "..", "..", "images", "logo.png"),
         path.join(__dirname, "..", "..", "..", "images", "logo.png"),
@@ -74,6 +78,7 @@ function findLogoPngPath(): string | null {
             // ignore
         }
     }
+
     return null
 }
 
@@ -108,7 +113,12 @@ export async function sendPasswordResetEmail(opts: {
         throw new Error("Email not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD.")
     }
 
-    const fromUser = process.env.GMAIL_USER!
+    const fromUser = getOptionalEnv("GMAIL_USER")
+    if (!fromUser) {
+        throw new Error("GMAIL_USER is missing")
+    }
+
+    const supportInbox = getSupportInbox()
     const subject = "Reset your QueuePass password"
 
     const safeName = opts.name ? escapeHtml(opts.name.trim()) : ""
@@ -125,19 +135,16 @@ export async function sendPasswordResetEmail(opts: {
         "",
         `This link expires in ${opts.expiresMinutes} minutes.`,
         "If you did not request this, you can ignore this email.",
+        supportInbox ? `Need help? Contact ${supportInbox}.` : "",
         "",
         "— QueuePass",
-    ].join("\n")
+    ]
+        .filter(Boolean)
+        .join("\n")
 
     const year = new Date().getFullYear()
     const logoAttachment = getInlineLogoAttachment()
 
-    /**
-     * ✅ Fix “cramped / not balanced” logo:
-     * - Give the logo container padding
-     * - Make the image fill the padded area with object-fit: cover
-     * - Center the crop using object-position: center
-     */
     const logoInnerHtml = logoAttachment
         ? `<img src="cid:${LOGO_PNG_CID}" alt="QueuePass logo"
               style="display:block;width:100%;height:100%;object-fit:cover;object-position:center;border-radius:10px;" />`
@@ -147,6 +154,31 @@ export async function sendPasswordResetEmail(opts: {
                      display:block;line-height:36px;text-align:center;">
               QP
            </div>`
+
+    const safeSupportInbox = supportInbox ? escapeHtml(supportInbox) : ""
+    const safeResetLink = resetLink ? escapeHtml(resetLink) : null
+
+    const supportHtml = safeSupportInbox
+        ? `
+                    <div style="font-size:12px;color:${THEME.mutedForeground};line-height:1.5;margin:14px 0 0 0;">
+                      Need help? Contact
+                      <a href="mailto:${safeSupportInbox}" style="color:${THEME.primary};text-decoration:none;font-weight:800;">
+                        ${safeSupportInbox}
+                      </a>.
+                    </div>
+        `
+        : ""
+
+    const footerSupportHtml = safeSupportInbox
+        ? `
+                    <div style="font-family:Arial, sans-serif;font-size:12px;color:${THEME.mutedForeground};line-height:1.5;margin-top:8px;">
+                      Support:
+                      <a href="mailto:${safeSupportInbox}" style="color:${THEME.primary};text-decoration:none;font-weight:800;">
+                        ${safeSupportInbox}
+                      </a>
+                    </div>
+        `
+        : ""
 
     const html = `
 <div style="margin:0;padding:0;background:${THEME.muted};width:100%;">
@@ -160,7 +192,6 @@ export async function sendPasswordResetEmail(opts: {
       <td align="center">
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:560px;">
 
-          <!-- Header -->
           <tr>
             <td style="padding:0 0 14px 0;">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
@@ -170,10 +201,8 @@ export async function sendPasswordResetEmail(opts: {
                     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
                       <tr>
                         <td width="46" valign="middle" style="padding-right:12px;">
-                          <!-- ✅ Outer logo container -->
                           <div style="width:46px;height:46px;border-radius:14px;border:1px solid ${THEME.border};
                                       background:${THEME.background};overflow:hidden;padding:4px;box-sizing:border-box;">
-                            <!-- ✅ Inner area (46 - 8 padding = 38px square) -->
                             <div style="width:38px;height:38px;">
                               ${logoInnerHtml}
                             </div>
@@ -202,7 +231,6 @@ export async function sendPasswordResetEmail(opts: {
             </td>
           </tr>
 
-          <!-- Card -->
           <tr>
             <td>
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
@@ -221,10 +249,10 @@ export async function sendPasswordResetEmail(opts: {
                       ${greeting}
                     </div>
 
-                    ${resetLink
+                    ${safeResetLink
             ? `
                     <div style="margin:0 0 14px 0;">
-                      <a href="${resetLink}"
+                      <a href="${safeResetLink}"
                          style="display:inline-block;background:${THEME.primary};color:${THEME.primaryForeground};
                                 text-decoration:none;padding:12px 14px;border-radius:14px;font-size:14px;font-weight:800;">
                         Reset Password
@@ -237,16 +265,16 @@ export async function sendPasswordResetEmail(opts: {
                                   border:1px solid ${THEME.border};word-break:break-all;
                                   font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace;
                                   font-size:12px;color:${THEME.foreground};">
-                        ${resetLink}
+                        ${safeResetLink}
                       </div>
                     </div>
-                            `
+                    `
             : `
                     <div style="margin:0 0 14px 0;padding:12px 12px;border-radius:14px;background:${THEME.secondary};
                                 border:1px solid ${THEME.border};color:${THEME.mutedForeground};font-size:13px;line-height:1.5;">
                       CLIENT_ORIGIN is not configured, so a reset link cannot be generated.
                     </div>
-                            `
+                    `
         }
 
                     <div style="font-size:12px;color:${THEME.mutedForeground};line-height:1.5;margin:0 0 6px 0;">
@@ -257,6 +285,8 @@ export async function sendPasswordResetEmail(opts: {
                       If you did not request this, you can safely ignore this email.
                     </div>
 
+                    ${supportHtml}
+
                   </td>
                 </tr>
 
@@ -265,6 +295,7 @@ export async function sendPasswordResetEmail(opts: {
                     <div style="font-family:Arial, sans-serif;font-size:12px;color:${THEME.mutedForeground};line-height:1.5;">
                       For security reasons, please do not share your password with anyone.
                     </div>
+                    ${footerSupportHtml}
                   </td>
                 </tr>
               </table>
@@ -288,6 +319,7 @@ export async function sendPasswordResetEmail(opts: {
 
     await transporter.sendMail({
         from: `QueuePass <${fromUser}>`,
+        replyTo: supportInbox ?? fromUser,
         to: opts.to,
         subject,
         text,
@@ -309,8 +341,12 @@ export async function sendLoginCredentialsEmail(opts: {
         throw new Error("Email not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD.")
     }
 
-    const fromUser = process.env.GMAIL_USER!
+    const fromUser = getOptionalEnv("GMAIL_USER")
+    if (!fromUser) {
+        throw new Error("GMAIL_USER is missing")
+    }
 
+    const supportInbox = getSupportInbox()
     const loginLink = buildLoginLinkFromClientOrigin() ?? opts.loginLink ?? null
 
     const logoAttachment = getInlineLogoAttachment()
@@ -322,11 +358,13 @@ export async function sendLoginCredentialsEmail(opts: {
         loginLink,
         hasInlineLogo: Boolean(logoAttachment),
         logoCid: LOGO_PNG_CID,
+        supportEmail: supportInbox,
         theme: THEME,
     })
 
     await transporter.sendMail({
         from: `QueuePass <${fromUser}>`,
+        replyTo: supportInbox ?? fromUser,
         to: opts.to,
         subject: payload.subject,
         text: payload.text,

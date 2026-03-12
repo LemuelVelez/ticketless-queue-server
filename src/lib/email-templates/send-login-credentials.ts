@@ -27,6 +27,7 @@ export function buildSendLoginCredentialsEmail(opts: {
     loginLink: string | null
     hasInlineLogo: boolean
     logoCid: string
+    supportEmail?: string
     theme: Theme
 }) {
     const theme = opts.theme
@@ -36,6 +37,9 @@ export function buildSendLoginCredentialsEmail(opts: {
     const greeting = safeName ? `Hi ${safeName},` : "Hi,"
 
     const subject = "Your QueuePass login credentials"
+    const safeSupportEmail = opts.supportEmail
+        ? escapeHtml(String(opts.supportEmail).trim())
+        : ""
 
     const text = [
         opts.name ? `Hi ${String(opts.name).trim()},` : "Hi,",
@@ -49,7 +53,9 @@ export function buildSendLoginCredentialsEmail(opts: {
         opts.loginLink ? `Login: ${opts.loginLink}` : "Login: (CLIENT_ORIGIN not configured)",
         "",
         "For security, please change your password after logging in.",
-        "If you did not expect this email, contact your administrator.",
+        opts.supportEmail
+            ? `Need help? Contact ${String(opts.supportEmail).trim()}.`
+            : "If you did not expect this email, contact your administrator.",
         "",
         "— QueuePass",
     ]
@@ -73,10 +79,12 @@ export function buildSendLoginCredentialsEmail(opts: {
            </span>`
         : ""
 
-    const loginCta = opts.loginLink
+    const safeLoginLink = opts.loginLink ? escapeHtml(opts.loginLink) : null
+
+    const loginCta = safeLoginLink
         ? `
         <div style="margin:0 0 14px 0;">
-          <a href="${opts.loginLink}"
+          <a href="${safeLoginLink}"
              style="display:inline-block;background:${theme.primary};color:${theme.primaryForeground};
                     text-decoration:none;padding:12px 14px;border-radius:14px;font-size:14px;font-weight:900;">
             Login to QueuePass
@@ -89,7 +97,7 @@ export function buildSendLoginCredentialsEmail(opts: {
                       border:1px solid ${theme.border};word-break:break-all;
                       font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono','Courier New', monospace;
                       font-size:12px;color:${theme.foreground};">
-            ${opts.loginLink}
+            ${safeLoginLink}
           </div>
         </div>
         `
@@ -99,6 +107,28 @@ export function buildSendLoginCredentialsEmail(opts: {
           CLIENT_ORIGIN is not configured, so a login link cannot be generated.
         </div>
         `
+
+    const supportHtml = safeSupportEmail
+        ? `
+        <div style="font-size:12px;color:${theme.mutedForeground};line-height:1.5;margin:14px 0 0 0;">
+          Need help? Contact
+          <a href="mailto:${safeSupportEmail}" style="color:${theme.primary};text-decoration:none;font-weight:700;">
+            ${safeSupportEmail}
+          </a>.
+        </div>
+        `
+        : ""
+
+    const footerSupportHtml = safeSupportEmail
+        ? `
+        <div style="font-family:Arial, sans-serif;font-size:12px;color:${theme.mutedForeground};line-height:1.5;margin-top:8px;">
+          Support:
+          <a href="mailto:${safeSupportEmail}" style="color:${theme.primary};text-decoration:none;font-weight:700;">
+            ${safeSupportEmail}
+          </a>
+        </div>
+        `
+        : ""
 
     const html = `
 <div style="margin:0;padding:0;background:${theme.muted};width:100%;">
@@ -112,7 +142,6 @@ export function buildSendLoginCredentialsEmail(opts: {
       <td align="center">
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="max-width:560px;">
 
-          <!-- Header -->
           <tr>
             <td style="padding:0 0 14px 0;">
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
@@ -152,7 +181,6 @@ export function buildSendLoginCredentialsEmail(opts: {
             </td>
           </tr>
 
-          <!-- Card -->
           <tr>
             <td>
               <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%"
@@ -195,6 +223,8 @@ export function buildSendLoginCredentialsEmail(opts: {
                       For security, please change your password after logging in. If you did not expect this email, contact your administrator.
                     </div>
 
+                    ${supportHtml}
+
                   </td>
                 </tr>
 
@@ -203,6 +233,7 @@ export function buildSendLoginCredentialsEmail(opts: {
                     <div style="font-family:Arial, sans-serif;font-size:12px;color:${theme.mutedForeground};line-height:1.5;">
                       For security reasons, please do not share your password with anyone.
                     </div>
+                    ${footerSupportHtml}
                   </td>
                 </tr>
               </table>
