@@ -1,4 +1,4 @@
-import { SettingModel } from "../models/Setting"
+import { SettingModel } from "../models/Model"
 
 export async function initDefaults() {
     // Ensure exactly one settings doc exists

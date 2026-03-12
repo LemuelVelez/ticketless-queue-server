@@ -1,13 +1,15 @@
 import mongoose from "mongoose"
 import dotenv from "dotenv"
 
-import { AuditLogModel } from "../models/AuditLog"
-import { DepartmentModel } from "../models/Department"
-import { QueueCounterModel } from "../models/QueueCounter"
-import { ServiceWindowModel } from "../models/ServiceWindow"
-import { SettingModel } from "../models/Setting"
-import { TicketModel } from "../models/Ticket"
-import { UserModel } from "../models/User"
+import {
+    AuditLogModel,
+    DepartmentModel,
+    QueueCounterModel,
+    ServiceWindowModel,
+    SettingModel,
+    TicketModel,
+    UserModel,
+} from "../models/Model"
 import { initDefaults } from "./initDefaults"
 
 dotenv.config()
