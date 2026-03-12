@@ -20,6 +20,10 @@ export type UserView = {
     updatedAt?: Date
 }
 
+function isNonEmptyString(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0
+}
+
 export class UserService {
     static toView(user: any): UserView {
         const assignedDepartmentsSource =
@@ -29,11 +33,11 @@ export class UserService {
                     ? [user.assignedDepartment]
                     : []
 
-        const assignedDepartmentNames = Array.from(
+        const assignedDepartmentNames: string[] = Array.from(
             new Set(
                 assignedDepartmentsSource
                     .map((department: any) => NameService.getDepartmentName(department))
-                    .filter(Boolean)
+                    .filter(isNonEmptyString)
             )
         )
 
