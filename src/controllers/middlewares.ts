@@ -52,6 +52,54 @@ function extractTokenFromHeaderValue(value: unknown): string | null {
     return raw
 }
 
+function parseCookieHeader(header: unknown): Record<string, string> {
+    const raw = Array.isArray(header)
+        ? header.join("; ")
+        : String(header ?? "").trim()
+
+    if (!raw) return {}
+
+    const out: Record<string, string> = {}
+
+    for (const chunk of raw.split(";")) {
+        const part = String(chunk ?? "").trim()
+        if (!part) continue
+
+        const separatorIndex = part.indexOf("=")
+        if (separatorIndex < 1) continue
+
+        const key = decodeURIComponent(part.slice(0, separatorIndex).trim())
+        const value = decodeURIComponent(part.slice(separatorIndex + 1).trim())
+
+        if (!key) continue
+        out[key] = value
+    }
+
+    return out
+}
+
+const AUTH_COOKIE_NAMES = [
+    "accessToken",
+    "access_token",
+    "sessionToken",
+    "session_token",
+    "authToken",
+    "auth_token",
+    "token",
+    "jwt",
+] as const
+
+function getTokenFromCookies(req: Request): string | null {
+    const cookies = parseCookieHeader(req.headers.cookie)
+
+    for (const name of AUTH_COOKIE_NAMES) {
+        const token = extractTokenFromHeaderValue(cookies[name])
+        if (token) return token
+    }
+
+    return null
+}
+
 function getBearerToken(req: Request): string | null {
     const authHeader = extractTokenFromHeaderValue(req.headers.authorization)
     if (authHeader) return authHeader
@@ -61,6 +109,9 @@ function getBearerToken(req: Request): string | null {
 
     const xSessionTokenAlt = extractTokenFromHeaderValue(req.headers["x-sessiontoken"])
     if (xSessionTokenAlt) return xSessionTokenAlt
+
+    const cookieToken = getTokenFromCookies(req)
+    if (cookieToken) return cookieToken
 
     return null
 }
