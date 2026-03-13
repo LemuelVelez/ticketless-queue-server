@@ -72,10 +72,14 @@ export const ROUTE_PATHS = {
         byId: "/users/:id",
         byStudentId: "/users/student/:studentId",
         staff: "/users/staff",
+        staffSendLogin: "/users/staff/:id/send-login",
+        staffResendLogin: "/users/staff/:id/resend-login",
         participants: "/users/participants",
     },
     admin: {
         staff: "/admin/staff",
+        staffSendLogin: "/admin/staff/:id/send-login",
+        staffResendLogin: "/admin/staff/:id/resend-login",
         participants: "/admin/participants",
     },
 } as const
@@ -525,11 +529,35 @@ route.get(
     requireRoles("ADMIN", "STAFF"),
     UserController.listStaff
 )
+route.post(
+    ROUTE_PATHS.users.staffSendLogin,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.sendLoginCredentials
+)
+route.post(
+    ROUTE_PATHS.users.staffResendLogin,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.resendLoginCredentials
+)
 route.get(
     ROUTE_PATHS.admin.staff,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     UserController.listStaff
+)
+route.post(
+    ROUTE_PATHS.admin.staffSendLogin,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.sendLoginCredentials
+)
+route.post(
+    ROUTE_PATHS.admin.staffResendLogin,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.resendLoginCredentials
 )
 route.get(
     ROUTE_PATHS.users.participants,
