@@ -374,7 +374,16 @@ export class AuthService {
     }
 
     static async getCurrentUser(userId: string): Promise<UserView | null> {
-        return UserService.getById(userId)
+        const user = await UserModel.findById(userId).exec()
+
+        if (!user || !user.active) {
+            return null
+        }
+
+        return (
+            (await UserService.getById(user._id)) ??
+            UserService.toView(user)
+        )
     }
 
     static async registerParticipant(

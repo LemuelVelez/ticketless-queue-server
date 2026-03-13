@@ -119,7 +119,7 @@ export const requireAuth: RequestHandler = async (req, res, next) => {
         const payload = AuthService.verifyAccessToken(token)
         const currentUser = await AuthService.getCurrentUser(payload.sub)
 
-        if (!currentUser || !currentUser.active) {
+        if (!currentUser) {
             res.status(401).json({
                 ok: false,
                 message: "Invalid or expired access token",
