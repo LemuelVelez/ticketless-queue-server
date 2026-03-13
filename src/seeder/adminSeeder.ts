@@ -1,10 +1,33 @@
-import { UserModel } from "../models/User"
-import { hashPassword } from "../controllers/security"
+import { pbkdf2Sync, randomBytes } from "crypto"
+import { UserModel } from "../models/Model"
 
 export type SeedAdminOptions = {
     email: string
     password: string
     name?: string
+}
+
+const PASSWORD_ALGO = "pbkdf2-sha256" as const
+const PASSWORD_ITERATIONS = 150000
+const PASSWORD_KEY_LENGTH = 32
+
+function hashPassword(password: string) {
+    const normalized = String(password ?? "")
+    const salt = randomBytes(16).toString("hex")
+    const hash = pbkdf2Sync(
+        normalized,
+        salt,
+        PASSWORD_ITERATIONS,
+        PASSWORD_KEY_LENGTH,
+        "sha256"
+    ).toString("hex")
+
+    return {
+        salt,
+        hash,
+        algo: PASSWORD_ALGO,
+        iterations: PASSWORD_ITERATIONS,
+    }
 }
 
 export async function seedAdminUser(opts: SeedAdminOptions) {
@@ -20,7 +43,7 @@ export async function seedAdminUser(opts: SeedAdminOptions) {
         return { created: false, userId: String(existing._id) }
     }
 
-    const { salt, hash, algo, iterations } = await hashPassword(opts.password)
+    const { salt, hash, algo, iterations } = hashPassword(opts.password)
 
     const user = await UserModel.create({
         name,

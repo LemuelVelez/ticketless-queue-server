@@ -8,7 +8,8 @@
     "start": "node dist/index.js",
     "migrate": "ts-node --transpile-only --project tsconfig.json ./src/migration/migrate.ts",
     "seed:admin": "ts-node --transpile-only --project tsconfig.json ./src/seeder/seedAdmin.ts",
-    "seed": "npm run seed:admin",
+    "seed:registrar-transactions": "ts-node --transpile-only --project tsconfig.json ./src/seeder/seedRegistrarTransactions.ts",
+    "seed": "npm run seed:admin && npm run seed:registrar-transactions",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

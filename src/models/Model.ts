@@ -4,6 +4,7 @@ export type UserRole = "ADMIN" | "STAFF" | "STUDENT" | "ALUMNI_VISITOR" | "GUEST
 export type ParticipantType = "STUDENT" | "ALUMNI_VISITOR" | "GUEST"
 export type TicketStatus = "WAITING" | "CALLED" | "HOLD" | "OUT" | "SERVED"
 export type TicketParticipantType = "STUDENT" | "ALUMNI_VISITOR" | "GUEST"
+export type RegistrarTransactionAudience = "INTERNAL" | "EXTERNAL"
 
 export type AuditLogDoc = {
     actor?: Types.ObjectId
@@ -15,6 +16,11 @@ export type AuditLogDoc = {
     createdAt: Date
 }
 
+export type RegistrarTransactionGroup = {
+    audience: RegistrarTransactionAudience
+    items: string[]
+}
+
 export type DepartmentDoc = {
     name: string
     code?: string
@@ -24,6 +30,12 @@ export type DepartmentDoc = {
      * Examples: REGISTRAR, LIBRARY, ADMIN_BUILDING
      */
     transactionManager: string
+
+    /**
+     * Registrar transaction catalog used by student/visitor flows.
+     * Intended for checkbox-based multi-select transactions.
+     */
+    registrarTransactionGroups?: RegistrarTransactionGroup[]
 
     enabled: boolean
     createdAt: Date
@@ -192,6 +204,27 @@ const DepartmentSchema = new Schema<DepartmentDoc>(
             trim: true,
             uppercase: true,
             index: true,
+        },
+        registrarTransactionGroups: {
+            type: [
+                new Schema<RegistrarTransactionGroup>(
+                    {
+                        audience: {
+                            type: String,
+                            enum: ["INTERNAL", "EXTERNAL"],
+                            required: true,
+                            uppercase: true,
+                            trim: true,
+                        },
+                        items: {
+                            type: [{ type: String, trim: true }],
+                            default: [],
+                        },
+                    },
+                    { _id: false }
+                ),
+            ],
+            default: [],
         },
         enabled: { type: Boolean, default: true },
     },
