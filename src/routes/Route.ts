@@ -103,6 +103,37 @@ function normalizeTransactionPurposeKey(value: string): string {
         .replace(/^-+|-+$/g, "")
 }
 
+function normalizeTransactionManager(value: unknown): string {
+    return getString(value).toUpperCase()
+}
+
+function normalizeAudience(value: unknown): "INTERNAL" | "EXTERNAL" | "" {
+    const raw = getString(value).toUpperCase()
+    if (raw === "INTERNAL" || raw === "EXTERNAL") return raw
+    return ""
+}
+
+function uniqueStrings(values: Array<string | undefined | null>): string[] {
+    const out: string[] = []
+    const seen = new Set<string>()
+
+    for (const value of values) {
+        const clean = getString(value)
+        if (!clean || seen.has(clean)) continue
+        seen.add(clean)
+        out.push(clean)
+    }
+
+    return out
+}
+
+function buildTransactionPurposeId(manager: string, keyOrLabel: string): string {
+    const normalizedManager = normalizeTransactionManager(manager) || "GENERAL"
+    const normalizedKey = normalizeTransactionPurposeKey(keyOrLabel)
+    if (!normalizedKey) return ""
+    return `${normalizedManager}:${normalizedKey}`
+}
+
 route.post(ROUTE_PATHS.auth.register, AuthController.register)
 route.post(ROUTE_PATHS.auth.login, AuthController.login)
 route.post(ROUTE_PATHS.auth.forgotPassword, AuthController.forgotPassword)
@@ -212,78 +243,219 @@ route.get(ROUTE_PATHS.serviceWindows.byId, ServiceWindowController.getById)
 route.get(ROUTE_PATHS.transactionPurposes.list, async (req, res, next) => {
     try {
         const departmentId = getString(req.query.departmentId)
-        const transactionManager = getString(req.query.transactionManager).toUpperCase()
+        const transactionManager = normalizeTransactionManager(
+            req.query.transactionManager
+        )
+        const includeDisabled = parseBoolean(req.query.includeDisabled, false)
+
+        if (departmentId && !isValidObjectId(departmentId)) {
+            res.status(400).json({
+                message: "Invalid departmentId",
+            })
+            return
+        }
+
+        const departmentFilter: Record<string, unknown> = {}
+
+        if (!includeDisabled) {
+            departmentFilter.enabled = true
+        }
+
+        if (departmentId) {
+            departmentFilter._id = new Types.ObjectId(departmentId)
+        }
+
+        if (transactionManager) {
+            departmentFilter.transactionManager = transactionManager
+        }
+
+        const departments = await DepartmentModel.find(departmentFilter)
+            .select("_id enabled name code transactionManager registrarTransactionGroups")
+            .sort({ name: 1, code: 1, createdAt: -1 })
+            .lean()
+
+        const departmentIds = departments
+            .map((department: any) => getString(department?._id))
+            .filter(Boolean)
+
+        const managerByDepartmentId = new Map<string, string>()
+        for (const department of departments as Array<Record<string, unknown>>) {
+            const id = getString(department._id)
+            if (!id) continue
+            managerByDepartmentId.set(
+                id,
+                normalizeTransactionManager(department.transactionManager)
+            )
+        }
+
+        const unique = new Map<string, Record<string, unknown>>()
+        let sortOrder = 1
+
+        const upsertPurpose = (input: {
+            manager: string
+            key?: string
+            label?: string
+            purpose?: string
+            scopes?: string[]
+            departmentId?: string
+            enabled?: boolean
+        }) => {
+            const manager = normalizeTransactionManager(input.manager) || "GENERAL"
+            const label =
+                getString(input.label) ||
+                getString(input.purpose) ||
+                getString(input.key)
+
+            const key = getString(input.key) || label
+            const purpose = getString(input.purpose) || label
+            const departmentIdValue = getString(input.departmentId)
+            const normalizedScopes = uniqueStrings(
+                (input.scopes || []).map((scope) => normalizeAudience(scope))
+            )
+
+            const id = buildTransactionPurposeId(manager, key)
+            const normalizedKey = normalizeTransactionPurposeKey(key)
+
+            if (!id || !normalizedKey || !label) return
+
+            const existing = unique.get(id)
+
+            if (existing) {
+                existing.label = getString(existing.label) || label
+                existing.name = getString(existing.name) || label
+                existing.purpose = getString(existing.purpose) || purpose
+                existing.transactionPurpose =
+                    getString(existing.transactionPurpose) || purpose
+
+                existing.scopes = uniqueStrings([
+                    ...((existing.scopes as string[]) || []),
+                    ...normalizedScopes,
+                ])
+
+                existing.departmentIds = uniqueStrings([
+                    ...((existing.departmentIds as string[]) || []),
+                    departmentIdValue,
+                ])
+
+                existing.enabled =
+                    Boolean(existing.enabled) || input.enabled !== false
+
+                existing.sortOrder = Math.min(
+                    Number(existing.sortOrder || sortOrder),
+                    sortOrder
+                )
+
+                return
+            }
+
+            unique.set(id, {
+                id,
+                _id: id,
+                key: normalizedKey,
+                name: label,
+                label,
+                purpose,
+                transactionPurpose: purpose,
+                category: manager,
+                transactionCategory: manager,
+                scopes: normalizedScopes,
+                departmentIds: departmentIdValue ? [departmentIdValue] : [],
+                enabled: input.enabled !== false,
+                sortOrder: sortOrder++,
+            })
+        }
+
+        for (const department of departments as Array<Record<string, unknown>>) {
+            const manager = normalizeTransactionManager(department.transactionManager)
+            const currentDepartmentId = getString(department._id)
+            const enabled = department.enabled !== false
+            const registrarGroups = Array.isArray(
+                department.registrarTransactionGroups
+            )
+                ? (department.registrarTransactionGroups as Array<Record<string, unknown>>)
+                : []
+
+            for (const group of registrarGroups) {
+                const audience = normalizeAudience(group.audience)
+                const items = Array.isArray(group.items) ? group.items : []
+
+                for (const item of items) {
+                    const label = getString(item)
+                    if (!label) continue
+
+                    upsertPurpose({
+                        manager,
+                        key: label,
+                        label,
+                        purpose: label,
+                        scopes: audience ? [audience] : [],
+                        departmentId: currentDepartmentId,
+                        enabled,
+                    })
+                }
+            }
+        }
 
         const ticketFilter: Record<string, unknown> = {}
 
         if (departmentId) {
-            if (!isValidObjectId(departmentId)) {
-                res.status(400).json({
-                    message: "Invalid departmentId",
-                })
-                return
-            }
-
             ticketFilter.department = new Types.ObjectId(departmentId)
-        } else if (transactionManager) {
-            const departments = await DepartmentModel.find({
-                transactionManager,
-            })
-                .select("_id")
-                .lean()
-
-            const departmentIds = departments
-                .map((item: any) => item?._id)
-                .filter(Boolean)
-
-            if (!departmentIds.length) {
-                res.status(200).json({
-                    data: [],
-                    count: 0,
-                })
-                return
+        } else if (departmentIds.length > 0) {
+            ticketFilter.department = {
+                $in: departmentIds.map((id) => new Types.ObjectId(id)),
             }
-
-            ticketFilter.department = { $in: departmentIds }
+        } else if (transactionManager) {
+            ticketFilter.transactionCategory = transactionManager
         }
 
         const tickets = await TicketModel.find(ticketFilter)
-            .select("transactionCategory transactionKey transactionLabel purpose")
+            .select(
+                "department transactionCategory transactionKey transactionLabel purpose"
+            )
             .sort({ transactionLabel: 1, purpose: 1, createdAt: -1 })
             .lean()
 
-        const unique = new Map<string, Record<string, unknown>>()
-
         for (const ticket of tickets as Array<Record<string, unknown>>) {
-            const transactionLabel = getString(ticket.transactionLabel)
-            const purpose = getString(ticket.purpose)
-            const transactionKey = getString(ticket.transactionKey)
-            const transactionCategory = getString(ticket.transactionCategory)
+            const ticketDepartmentId = getString(ticket.department)
+            const manager =
+                normalizeTransactionManager(ticket.transactionCategory) ||
+                managerByDepartmentId.get(ticketDepartmentId) ||
+                transactionManager ||
+                "GENERAL"
 
-            const label = transactionLabel || purpose || transactionKey
+            const label =
+                getString(ticket.transactionLabel) ||
+                getString(ticket.purpose) ||
+                getString(ticket.transactionKey)
+
             if (!label) continue
 
-            const key =
-                transactionKey || normalizeTransactionPurposeKey(label)
+            const key = getString(ticket.transactionKey) || label
+            const id = buildTransactionPurposeId(manager, key)
+            if (!id || unique.has(id)) continue
 
-            if (!key || unique.has(key)) continue
-
-            unique.set(key, {
-                id: key,
+            upsertPurpose({
+                manager,
                 key,
-                name: label,
                 label,
-                purpose: purpose || label,
-                transactionPurpose: purpose || label,
-                category: transactionCategory || null,
-                transactionCategory: transactionCategory || null,
+                purpose: getString(ticket.purpose) || label,
+                scopes: ["INTERNAL", "EXTERNAL"],
+                departmentId: ticketDepartmentId,
                 enabled: true,
             })
         }
 
-        const data = Array.from(unique.values()).sort((a, b) =>
-            String(a.label ?? "").localeCompare(String(b.label ?? ""))
-        )
+        const data = Array.from(unique.values()).sort((a, b) => {
+            const aCategory = getString(a.category)
+            const bCategory = getString(b.category)
+            if (aCategory !== bCategory) return aCategory.localeCompare(bCategory)
+
+            const aSort = Number(a.sortOrder || 1000)
+            const bSort = Number(b.sortOrder || 1000)
+            if (aSort !== bSort) return aSort - bSort
+
+            return getString(a.label).localeCompare(getString(b.label))
+        })
 
         res.status(200).json({
             data,
