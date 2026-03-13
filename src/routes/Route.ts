@@ -30,6 +30,8 @@ export const ROUTE_PATHS = {
     },
     settings: {
         current: "/settings/current",
+        avatar: "/settings/current/avatar",
+        avatarPresign: "/settings/current/avatar/presign",
     },
     auditLogs: {
         list: "/audit-logs",
@@ -91,6 +93,8 @@ export const ROUTE_PATHS = {
 } as const
 
 export const route = Router()
+
+type RouteHandler = (req: any, res: any, next: any) => unknown
 
 function getString(value: unknown): string {
     if (Array.isArray(value)) return String(value[0] ?? "").trim()
@@ -237,6 +241,24 @@ function createDateKeysInclusive(fromDateKey: string, toDateKey: string): string
     return out
 }
 
+function resolveSettingControllerHandler(candidates: string[]): RouteHandler {
+    return (req, res, next) => {
+        const controller = SettingController as unknown as Record<string, unknown>
+        const handler = candidates
+            .map((name) => controller[name])
+            .find((value): value is RouteHandler => typeof value === "function")
+
+        if (!handler) {
+            res.status(501).json({
+                message: `Settings handler is not configured for ${req.method} ${req.path}`,
+            })
+            return
+        }
+
+        Promise.resolve(handler.call(SettingController, req, res, next)).catch(next)
+    }
+}
+
 function buildReportsMatchFilter(req: any) {
     const today = getTodayDateKey()
     const rawFrom = parseDateKey(req.query.from) || shiftDateKey(today, -6)
@@ -332,7 +354,49 @@ route.post(ROUTE_PATHS.auth.forgotPassword, AuthController.forgotPassword)
 route.post(ROUTE_PATHS.auth.resetPassword, AuthController.resetPassword)
 route.get(ROUTE_PATHS.auth.me, requireAuth, AuthController.me)
 
-route.get(ROUTE_PATHS.settings.current, SettingController.getCurrent)
+route.get(
+    ROUTE_PATHS.settings.current,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    SettingController.getCurrent
+)
+route.patch(
+    ROUTE_PATHS.settings.current,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    resolveSettingControllerHandler(["updateCurrent", "patchCurrent", "update"])
+)
+route.post(
+    ROUTE_PATHS.settings.avatarPresign,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    resolveSettingControllerHandler([
+        "presignAvatarUpload",
+        "createAvatarPresign",
+        "createAvatarUploadPresign",
+        "presignAvatar",
+    ])
+)
+route.post(
+    ROUTE_PATHS.settings.avatar,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    resolveSettingControllerHandler([
+        "uploadAvatar",
+        "setAvatar",
+        "updateAvatar",
+    ])
+)
+route.delete(
+    ROUTE_PATHS.settings.avatar,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    resolveSettingControllerHandler([
+        "removeAvatar",
+        "deleteAvatar",
+        "clearAvatar",
+    ])
+)
 
 route.get(
     ROUTE_PATHS.auditLogs.list,
