@@ -1,6 +1,11 @@
 import type { NextFunction, Request, Response } from "express"
+import { Types } from "mongoose"
 import { TicketService } from "../services/TicketService"
 import { ControllerUtils } from "./ControllerUtils"
+
+function isValidObjectId(value: string): boolean {
+    return Types.ObjectId.isValid(String(value ?? "").trim())
+}
 
 export class TicketController {
     static async getById(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -9,6 +14,11 @@ export class TicketController {
 
             if (!ticketId) {
                 ControllerUtils.sendBadRequest(res, "ticketId is required")
+                return
+            }
+
+            if (!isValidObjectId(ticketId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid ticketId")
                 return
             }
 
@@ -56,6 +66,11 @@ export class TicketController {
                 return
             }
 
+            if (!isValidObjectId(departmentId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid departmentId")
+                return
+            }
+
             const dateKey = ControllerUtils.getDateKey(req.query.dateKey)
 
             const tickets = await TicketService.listQueueByDepartment(departmentId, dateKey)
@@ -83,6 +98,11 @@ export class TicketController {
 
             if (!departmentId) {
                 ControllerUtils.sendBadRequest(res, "departmentId is required")
+                return
+            }
+
+            if (!isValidObjectId(departmentId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid departmentId")
                 return
             }
 

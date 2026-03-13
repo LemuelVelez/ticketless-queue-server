@@ -16,6 +16,14 @@ export type ServiceWindowView = {
     updatedAt?: Date
 }
 
+function normalizeObjectIdString(
+    value: string | Types.ObjectId | null | undefined
+): string | null {
+    const normalized = NameService.toIdString(value)
+    if (!normalized) return null
+    return Types.ObjectId.isValid(normalized) ? normalized : null
+}
+
 export class ServiceWindowService {
     static toView(window: any): ServiceWindowView {
         const primaryDepartment = window?.department
@@ -45,7 +53,10 @@ export class ServiceWindowService {
     }
 
     static async getById(windowId: string | Types.ObjectId): Promise<ServiceWindowView | null> {
-        const window = await ServiceWindowModel.findById(windowId)
+        const normalizedWindowId = normalizeObjectIdString(windowId)
+        if (!normalizedWindowId) return null
+
+        const window = await ServiceWindowModel.findById(normalizedWindowId)
             .populate("department", "name code")
             .populate("departmentIds", "name code")
             .exec()
@@ -67,8 +78,11 @@ export class ServiceWindowService {
         departmentId: string | Types.ObjectId,
         includeDisabled = false
     ): Promise<ServiceWindowView[]> {
+        const normalizedDepartmentId = normalizeObjectIdString(departmentId)
+        if (!normalizedDepartmentId) return []
+
         const filter: Record<string, unknown> = {
-            $or: [{ department: departmentId }, { departmentIds: departmentId }],
+            $or: [{ department: normalizedDepartmentId }, { departmentIds: normalizedDepartmentId }],
         }
 
         if (!includeDisabled) filter.enabled = true
@@ -86,7 +100,7 @@ export class ServiceWindowService {
         ids: Array<string | Types.ObjectId | null | undefined>
     ): Promise<Map<string, string>> {
         const normalizedIds = Array.from(
-            new Set(ids.map((id) => NameService.toIdString(id)).filter(Boolean) as string[])
+            new Set(ids.map((id) => normalizeObjectIdString(id)).filter(Boolean) as string[])
         )
 
         if (!normalizedIds.length) return new Map()

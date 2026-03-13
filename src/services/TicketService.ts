@@ -30,6 +30,14 @@ export type TicketView = {
     updatedAt?: Date
 }
 
+function normalizeObjectIdString(
+    value: string | Types.ObjectId | null | undefined
+): string | null {
+    const normalized = NameService.toIdString(value)
+    if (!normalized) return null
+    return Types.ObjectId.isValid(normalized) ? normalized : null
+}
+
 export class TicketService {
     static toView(ticket: any, participantNameMap?: Map<string, string>): TicketView {
         const studentId = String(ticket?.studentId ?? "").trim()
@@ -79,7 +87,10 @@ export class TicketService {
     }
 
     static async getById(ticketId: string | Types.ObjectId): Promise<TicketView | null> {
-        const ticket = await TicketModel.findById(ticketId)
+        const normalizedTicketId = normalizeObjectIdString(ticketId)
+        if (!normalizedTicketId) return null
+
+        const ticket = await TicketModel.findById(normalizedTicketId)
             .populate("department", "name code")
             .populate("window", "name number")
             .exec()
@@ -97,8 +108,11 @@ export class TicketService {
         departmentId: string | Types.ObjectId,
         dateKey: string
     ): Promise<TicketView[]> {
+        const normalizedDepartmentId = normalizeObjectIdString(departmentId)
+        if (!normalizedDepartmentId) return []
+
         const tickets = await TicketModel.find({
-            department: departmentId,
+            department: normalizedDepartmentId,
             dateKey: String(dateKey ?? "").trim(),
         })
             .populate("department", "name code")
@@ -117,8 +131,11 @@ export class TicketService {
         departmentId: string | Types.ObjectId,
         dateKey: string
     ): Promise<TicketView[]> {
+        const normalizedDepartmentId = normalizeObjectIdString(departmentId)
+        if (!normalizedDepartmentId) return []
+
         const tickets = await TicketModel.find({
-            department: departmentId,
+            department: normalizedDepartmentId,
             dateKey: String(dateKey ?? "").trim(),
             status: { $in: ["WAITING", "CALLED", "HOLD"] },
         })

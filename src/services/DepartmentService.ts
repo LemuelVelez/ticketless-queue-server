@@ -12,6 +12,14 @@ export type DepartmentView = {
     updatedAt?: Date
 }
 
+function normalizeObjectIdString(
+    value: string | Types.ObjectId | null | undefined
+): string | null {
+    const normalized = NameService.toIdString(value)
+    if (!normalized) return null
+    return Types.ObjectId.isValid(normalized) ? normalized : null
+}
+
 export class DepartmentService {
     static toView(department: any): DepartmentView {
         return {
@@ -26,7 +34,10 @@ export class DepartmentService {
     }
 
     static async getById(departmentId: string | Types.ObjectId): Promise<DepartmentView | null> {
-        const department = await DepartmentModel.findById(departmentId).exec()
+        const normalizedDepartmentId = normalizeObjectIdString(departmentId)
+        if (!normalizedDepartmentId) return null
+
+        const department = await DepartmentModel.findById(normalizedDepartmentId).exec()
         return department ? DepartmentService.toView(department) : null
     }
 
@@ -57,7 +68,7 @@ export class DepartmentService {
         ids: Array<string | Types.ObjectId | null | undefined>
     ): Promise<Map<string, string>> {
         const normalizedIds = Array.from(
-            new Set(ids.map((id) => NameService.toIdString(id)).filter(Boolean) as string[])
+            new Set(ids.map((id) => normalizeObjectIdString(id)).filter(Boolean) as string[])
         )
 
         if (!normalizedIds.length) return new Map()

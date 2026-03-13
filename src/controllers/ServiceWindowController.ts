@@ -1,6 +1,11 @@
 import type { NextFunction, Request, Response } from "express"
+import { Types } from "mongoose"
 import { ServiceWindowService } from "../services/ServiceWindowService"
 import { ControllerUtils } from "./ControllerUtils"
+
+function isValidObjectId(value: string): boolean {
+    return Types.ObjectId.isValid(String(value ?? "").trim())
+}
 
 export class ServiceWindowController {
     static async getById(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -9,6 +14,11 @@ export class ServiceWindowController {
 
             if (!windowId) {
                 ControllerUtils.sendBadRequest(res, "windowId is required")
+                return
+            }
+
+            if (!isValidObjectId(windowId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid windowId")
                 return
             }
 
@@ -47,6 +57,11 @@ export class ServiceWindowController {
 
             if (!departmentId) {
                 ControllerUtils.sendBadRequest(res, "departmentId is required")
+                return
+            }
+
+            if (!isValidObjectId(departmentId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid departmentId")
                 return
             }
 
