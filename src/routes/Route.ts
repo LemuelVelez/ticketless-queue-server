@@ -1,4 +1,4 @@
-import { Router } from "express"
+import { raw, Router } from "express"
 import { Types } from "mongoose"
 import {
     AuditLogController,
@@ -93,8 +93,6 @@ export const ROUTE_PATHS = {
 } as const
 
 export const route = Router()
-
-type RouteHandler = (req: any, res: any, next: any) => unknown
 
 function getString(value: unknown): string {
     if (Array.isArray(value)) return String(value[0] ?? "").trim()
@@ -241,24 +239,6 @@ function createDateKeysInclusive(fromDateKey: string, toDateKey: string): string
     return out
 }
 
-function resolveSettingControllerHandler(candidates: string[]): RouteHandler {
-    return (req, res, next) => {
-        const controller = SettingController as unknown as Record<string, unknown>
-        const handler = candidates
-            .map((name) => controller[name])
-            .find((value): value is RouteHandler => typeof value === "function")
-
-        if (!handler) {
-            res.status(501).json({
-                message: `Settings handler is not configured for ${req.method} ${req.path}`,
-            })
-            return
-        }
-
-        Promise.resolve(handler.call(SettingController, req, res, next)).catch(next)
-    }
-}
-
 function buildReportsMatchFilter(req: any) {
     const today = getTodayDateKey()
     const rawFrom = parseDateKey(req.query.from) || shiftDateKey(today, -6)
@@ -364,38 +344,25 @@ route.patch(
     ROUTE_PATHS.settings.current,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
-    resolveSettingControllerHandler(["updateCurrent", "patchCurrent", "update"])
+    SettingController.updateCurrent
 )
 route.post(
     ROUTE_PATHS.settings.avatarPresign,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
-    resolveSettingControllerHandler([
-        "presignAvatarUpload",
-        "createAvatarPresign",
-        "createAvatarUploadPresign",
-        "presignAvatar",
-    ])
+    SettingController.presignCurrentAvatarUpload
+)
+route.put(
+    ROUTE_PATHS.settings.avatar,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.putCurrentAvatarUpload
 )
 route.post(
     ROUTE_PATHS.settings.avatar,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
-    resolveSettingControllerHandler([
-        "uploadAvatar",
-        "setAvatar",
-        "updateAvatar",
-    ])
-)
-route.delete(
-    ROUTE_PATHS.settings.avatar,
-    requireAuth,
-    requireRoles("ADMIN", "STAFF"),
-    resolveSettingControllerHandler([
-        "removeAvatar",
-        "deleteAvatar",
-        "clearAvatar",
-    ])
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.uploadCurrentAvatar
 )
 
 route.get(
