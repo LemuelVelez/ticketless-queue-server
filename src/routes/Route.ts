@@ -74,6 +74,10 @@ export const ROUTE_PATHS = {
         staff: "/users/staff",
         participants: "/users/participants",
     },
+    admin: {
+        staff: "/admin/staff",
+        participants: "/admin/participants",
+    },
 } as const
 
 export const route = Router()
@@ -522,7 +526,19 @@ route.get(
     UserController.listStaff
 )
 route.get(
+    ROUTE_PATHS.admin.staff,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.listStaff
+)
+route.get(
     ROUTE_PATHS.users.participants,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.listParticipants
+)
+route.get(
+    ROUTE_PATHS.admin.participants,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     UserController.listParticipants
