@@ -58,6 +58,9 @@ export const ROUTE_PATHS = {
         queueByDepartment: "/tickets/department/:departmentId/queue",
         activeByDepartment: "/tickets/department/:departmentId/active",
     },
+    reports: {
+        timeseries: "/reports/timeseries",
+    },
     publicDisplay: {
         managers: "/landing/managers",
         managersAlt: "/public-display/managers",
@@ -123,6 +126,20 @@ function normalizeAudience(value: unknown): "INTERNAL" | "EXTERNAL" | "" {
     return ""
 }
 
+function normalizeTicketParticipantType(
+    value: unknown
+): "STUDENT" | "ALUMNI_VISITOR" | "GUEST" | "" {
+    const raw = getString(value).toUpperCase()
+    if (
+        raw === "STUDENT" ||
+        raw === "ALUMNI_VISITOR" ||
+        raw === "GUEST"
+    ) {
+        return raw
+    }
+    return ""
+}
+
 function uniqueStrings(values: Array<string | undefined | null>): string[] {
     const out: string[] = []
     const seen = new Set<string>()
@@ -142,6 +159,81 @@ function buildTransactionPurposeId(manager: string, keyOrLabel: string): string 
     const normalizedKey = normalizeTransactionPurposeKey(keyOrLabel)
     if (!normalizedKey) return ""
     return `${normalizedManager}:${normalizedKey}`
+}
+
+function parseDateKey(value: unknown): string {
+    const raw = getString(value)
+    if (!raw) return ""
+
+    const match = raw.match(/^(\d{4}-\d{2}-\d{2})/)
+    return match?.[1] || ""
+}
+
+function parseDateKeyToUtc(value: unknown): Date | null {
+    const dateKey = parseDateKey(value)
+    if (!dateKey) return null
+
+    const [year, month, day] = dateKey.split("-").map((part) => Number(part))
+    if (
+        !Number.isInteger(year) ||
+        !Number.isInteger(month) ||
+        !Number.isInteger(day)
+    ) {
+        return null
+    }
+
+    const parsed = new Date(Date.UTC(year, month - 1, day))
+    if (Number.isNaN(parsed.getTime())) return null
+
+    const normalized = [
+        String(parsed.getUTCFullYear()).padStart(4, "0"),
+        String(parsed.getUTCMonth() + 1).padStart(2, "0"),
+        String(parsed.getUTCDate()).padStart(2, "0"),
+    ].join("-")
+
+    return normalized === dateKey ? parsed : null
+}
+
+function formatUtcDateKey(value: Date): string {
+    return [
+        String(value.getUTCFullYear()).padStart(4, "0"),
+        String(value.getUTCMonth() + 1).padStart(2, "0"),
+        String(value.getUTCDate()).padStart(2, "0"),
+    ].join("-")
+}
+
+function getTodayDateKey(): string {
+    return formatUtcDateKey(new Date())
+}
+
+function shiftDateKey(dateKey: string, days: number): string {
+    const parsed = parseDateKeyToUtc(dateKey)
+    if (!parsed) return dateKey
+
+    const shifted = new Date(parsed)
+    shifted.setUTCDate(shifted.getUTCDate() + days)
+    return formatUtcDateKey(shifted)
+}
+
+function createDateKeysInclusive(fromDateKey: string, toDateKey: string): string[] {
+    const start = parseDateKeyToUtc(fromDateKey)
+    const end = parseDateKeyToUtc(toDateKey)
+
+    if (!start || !end || start.getTime() > end.getTime()) return []
+
+    const days =
+        Math.floor((end.getTime() - start.getTime()) / 86_400_000) + 1
+    if (days < 1 || days > 366) return []
+
+    const out: string[] = []
+    const cursor = new Date(start)
+
+    while (cursor.getTime() <= end.getTime()) {
+        out.push(formatUtcDateKey(cursor))
+        cursor.setUTCDate(cursor.getUTCDate() + 1)
+    }
+
+    return out
 }
 
 route.post(ROUTE_PATHS.auth.register, AuthController.register)
@@ -498,6 +590,226 @@ route.get(
     TicketController.listActiveByDepartment
 )
 route.get(ROUTE_PATHS.tickets.byId, TicketController.getById)
+
+route.get(
+    ROUTE_PATHS.reports.timeseries,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    async (req, res, next) => {
+        try {
+            const today = getTodayDateKey()
+            const rawFrom = parseDateKey(req.query.from) || shiftDateKey(today, -6)
+            const rawTo = parseDateKey(req.query.to) || today
+
+            const fromDate = parseDateKeyToUtc(rawFrom)
+            const toDate = parseDateKeyToUtc(rawTo)
+
+            if (!fromDate || !toDate) {
+                res.status(400).json({
+                    message: "Invalid from/to date. Use YYYY-MM-DD format.",
+                })
+                return
+            }
+
+            if (fromDate.getTime() > toDate.getTime()) {
+                res.status(400).json({
+                    message: "`from` must be less than or equal to `to`.",
+                })
+                return
+            }
+
+            const dateKeys = createDateKeysInclusive(rawFrom, rawTo)
+            if (!dateKeys.length) {
+                res.status(400).json({
+                    message:
+                        "Invalid date range. Use a range between 1 and 366 days.",
+                })
+                return
+            }
+
+            const departmentId = getString(req.query.departmentId)
+            const transactionManager = normalizeTransactionManager(
+                req.query.transactionManager
+            )
+            const participantType = normalizeTicketParticipantType(
+                req.query.participantType
+            )
+
+            if (departmentId && !isValidObjectId(departmentId)) {
+                res.status(400).json({
+                    message: "Invalid departmentId",
+                })
+                return
+            }
+
+            const match: Record<string, unknown> = {
+                dateKey: {
+                    $gte: rawFrom,
+                    $lte: rawTo,
+                },
+            }
+
+            if (departmentId) {
+                match.department = new Types.ObjectId(departmentId)
+            }
+
+            if (transactionManager) {
+                match.transactionCategory = transactionManager
+            }
+
+            if (participantType) {
+                match.participantType = participantType
+            }
+
+            const rows = (await TicketModel.aggregate([
+                { $match: match },
+                {
+                    $group: {
+                        _id: "$dateKey",
+                        total: { $sum: 1 },
+                        waiting: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "WAITING"] }, 1, 0],
+                            },
+                        },
+                        called: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "CALLED"] }, 1, 0],
+                            },
+                        },
+                        hold: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "HOLD"] }, 1, 0],
+                            },
+                        },
+                        out: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "OUT"] }, 1, 0],
+                            },
+                        },
+                        served: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "SERVED"] }, 1, 0],
+                            },
+                        },
+                    },
+                },
+                { $sort: { _id: 1 } },
+            ])) as Array<{
+                _id?: string
+                total?: number
+                waiting?: number
+                called?: number
+                hold?: number
+                out?: number
+                served?: number
+            }>
+
+            const byDateKey = new Map<string, (typeof rows)[number]>()
+            for (const row of rows) {
+                const key = getString(row._id)
+                if (!key) continue
+                byDateKey.set(key, row)
+            }
+
+            const points = dateKeys.map((dateKey) => {
+                const row = byDateKey.get(dateKey)
+
+                const total = Number(row?.total || 0)
+                const waiting = Number(row?.waiting || 0)
+                const called = Number(row?.called || 0)
+                const hold = Number(row?.hold || 0)
+                const out = Number(row?.out || 0)
+                const served = Number(row?.served || 0)
+                const active = waiting + called + hold
+                const closed = out + served
+
+                return {
+                    date: dateKey,
+                    label: dateKey,
+                    value: total,
+                    count: total,
+                    total,
+                    totalCount: total,
+                    waiting,
+                    waitingCount: waiting,
+                    called,
+                    calledCount: called,
+                    hold,
+                    holdCount: hold,
+                    out,
+                    outCount: out,
+                    served,
+                    servedCount: served,
+                    active,
+                    activeCount: active,
+                    closed,
+                    closedCount: closed,
+                    completed: served,
+                    completedCount: served,
+                }
+            })
+
+            const summary = points.reduce(
+                (acc, point) => {
+                    acc.total += point.total
+                    acc.waiting += point.waiting
+                    acc.called += point.called
+                    acc.hold += point.hold
+                    acc.out += point.out
+                    acc.served += point.served
+                    acc.active += point.active
+                    acc.closed += point.closed
+                    acc.completed += point.completed
+                    return acc
+                },
+                {
+                    total: 0,
+                    waiting: 0,
+                    called: 0,
+                    hold: 0,
+                    out: 0,
+                    served: 0,
+                    active: 0,
+                    closed: 0,
+                    completed: 0,
+                }
+            )
+
+            res.status(200).json({
+                data: points,
+                points,
+                labels: points.map((point) => point.date),
+                totals: points.map((point) => point.total),
+                series: {
+                    total: points.map((point) => point.total),
+                    waiting: points.map((point) => point.waiting),
+                    called: points.map((point) => point.called),
+                    hold: points.map((point) => point.hold),
+                    out: points.map((point) => point.out),
+                    served: points.map((point) => point.served),
+                    active: points.map((point) => point.active),
+                    closed: points.map((point) => point.closed),
+                    completed: points.map((point) => point.completed),
+                },
+                summary,
+                count: points.length,
+                range: {
+                    from: rawFrom,
+                    to: rawTo,
+                    days: points.length,
+                },
+                filters: {
+                    departmentId: departmentId || undefined,
+                    transactionManager: transactionManager || undefined,
+                    participantType: participantType || undefined,
+                },
+            })
+        } catch (error) {
+            next(error)
+        }
+    }
+)
 
 route.get(
     ROUTE_PATHS.publicDisplay.managers,
