@@ -8,6 +8,7 @@ import {
     TicketController,
     UserController,
 } from "../controllers"
+import { PublicDisplayController } from "../controllers/PublicDisplayController"
 import {
     requireAuth,
     requireRoles,
@@ -44,6 +45,17 @@ export const ROUTE_PATHS = {
         byId: "/tickets/:id",
         queueByDepartment: "/tickets/department/:departmentId/queue",
         activeByDepartment: "/tickets/department/:departmentId/active",
+    },
+    publicDisplay: {
+        managers: "/landing/managers",
+        managersAlt: "/public-display/managers",
+        managersAlt2: "/display/managers",
+        state: "/landing/public-display/:transactionManager",
+        stateByQuery: "/landing/public-display",
+        stateAlt: "/public-display/:transactionManager",
+        stateAltByQuery: "/public-display",
+        stateAlt2: "/display/:transactionManager",
+        stateAlt2ByQuery: "/display",
     },
     users: {
         byId: "/users/:id",
@@ -102,6 +114,44 @@ route.get(
 route.get(
     ROUTE_PATHS.tickets.activeByDepartment,
     TicketController.listActiveByDepartment
+)
+
+route.get(
+    ROUTE_PATHS.publicDisplay.managers,
+    PublicDisplayController.listManagers
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.managersAlt,
+    PublicDisplayController.listManagers
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.managersAlt2,
+    PublicDisplayController.listManagers
+)
+
+route.get(
+    ROUTE_PATHS.publicDisplay.state,
+    PublicDisplayController.getState
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.stateByQuery,
+    PublicDisplayController.getState
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.stateAlt,
+    PublicDisplayController.getState
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.stateAltByQuery,
+    PublicDisplayController.getState
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.stateAlt2,
+    PublicDisplayController.getState
+)
+route.get(
+    ROUTE_PATHS.publicDisplay.stateAlt2ByQuery,
+    PublicDisplayController.getState
 )
 
 route.get(

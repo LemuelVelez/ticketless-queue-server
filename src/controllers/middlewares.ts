@@ -32,18 +32,37 @@ export type AuthenticatedRequest = Request & {
     currentUser?: UserView
 }
 
-function getBearerToken(req: Request): string | null {
-    const header = String(req.headers.authorization ?? "").trim()
-
-    if (!header) return null
-
-    const [scheme, token] = header.split(" ")
-
-    if (!/^Bearer$/i.test(scheme) || !token?.trim()) {
+function extractTokenFromHeaderValue(value: unknown): string | null {
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const token = extractTokenFromHeaderValue(item)
+            if (token) return token
+        }
         return null
     }
 
-    return token.trim()
+    const raw = String(value ?? "").trim()
+    if (!raw) return null
+
+    if (/^Bearer\s+/i.test(raw)) {
+        const token = raw.replace(/^Bearer\s+/i, "").trim()
+        return token || null
+    }
+
+    return raw
+}
+
+function getBearerToken(req: Request): string | null {
+    const authHeader = extractTokenFromHeaderValue(req.headers.authorization)
+    if (authHeader) return authHeader
+
+    const xSessionToken = extractTokenFromHeaderValue(req.headers["x-session-token"])
+    if (xSessionToken) return xSessionToken
+
+    const xSessionTokenAlt = extractTokenFromHeaderValue(req.headers["x-sessiontoken"])
+    if (xSessionTokenAlt) return xSessionTokenAlt
+
+    return null
 }
 
 export const corsMiddleware: RequestHandler = (req, res, next) => {
@@ -63,7 +82,18 @@ export const corsMiddleware: RequestHandler = (req, res, next) => {
     }
 
     res.header("Access-Control-Allow-Credentials", "true")
-    res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
+    res.header(
+        "Access-Control-Allow-Headers",
+        [
+            "Origin",
+            "X-Requested-With",
+            "Content-Type",
+            "Accept",
+            "Authorization",
+            "X-Session-Token",
+            "X-SessionToken",
+        ].join(", ")
+    )
     res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
 
     if (req.method === "OPTIONS") {
