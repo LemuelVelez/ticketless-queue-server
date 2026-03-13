@@ -89,24 +89,23 @@ route.get(
 )
 
 route.get(ROUTE_PATHS.departments.enabled, DepartmentController.listEnabled)
-route.get(ROUTE_PATHS.departments.byId, DepartmentController.getById)
 route.get(
     ROUTE_PATHS.departments.byTransactionManager,
     DepartmentController.listByTransactionManager
 )
+route.get(ROUTE_PATHS.departments.byId, DepartmentController.getById)
 
 route.get(
     ROUTE_PATHS.serviceWindows.enabled,
     ServiceWindowController.listEnabled
 )
-route.get(ROUTE_PATHS.serviceWindows.byId, ServiceWindowController.getById)
 route.get(
     ROUTE_PATHS.serviceWindows.byDepartment,
     ServiceWindowController.listByDepartment
 )
+route.get(ROUTE_PATHS.serviceWindows.byId, ServiceWindowController.getById)
 
 route.get(ROUTE_PATHS.tickets.recent, TicketController.listRecent)
-route.get(ROUTE_PATHS.tickets.byId, TicketController.getById)
 route.get(
     ROUTE_PATHS.tickets.queueByDepartment,
     TicketController.listQueueByDepartment
@@ -115,6 +114,7 @@ route.get(
     ROUTE_PATHS.tickets.activeByDepartment,
     TicketController.listActiveByDepartment
 )
+route.get(ROUTE_PATHS.tickets.byId, TicketController.getById)
 
 route.get(
     ROUTE_PATHS.publicDisplay.managers,
@@ -155,18 +155,6 @@ route.get(
 )
 
 route.get(
-    ROUTE_PATHS.users.byId,
-    requireAuth,
-    requireRoles("ADMIN", "STAFF"),
-    UserController.getById
-)
-route.get(
-    ROUTE_PATHS.users.byStudentId,
-    requireAuth,
-    requireRoles("ADMIN", "STAFF"),
-    UserController.getByStudentId
-)
-route.get(
     ROUTE_PATHS.users.staff,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
@@ -177,6 +165,18 @@ route.get(
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     UserController.listParticipants
+)
+route.get(
+    ROUTE_PATHS.users.byStudentId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.getByStudentId
+)
+route.get(
+    ROUTE_PATHS.users.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.getById
 )
 
 export default route

@@ -1,6 +1,11 @@
 import type { NextFunction, Request, Response } from "express"
+import { Types } from "mongoose"
 import { UserService } from "../services/UserService"
 import { ControllerUtils } from "./ControllerUtils"
+
+function isValidObjectId(value: string): boolean {
+    return Types.ObjectId.isValid(String(value ?? "").trim())
+}
 
 export class UserController {
     static async getById(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -9,6 +14,11 @@ export class UserController {
 
             if (!userId) {
                 ControllerUtils.sendBadRequest(res, "userId is required")
+                return
+            }
+
+            if (!isValidObjectId(userId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid userId")
                 return
             }
 
