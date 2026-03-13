@@ -59,6 +59,7 @@ export const ROUTE_PATHS = {
         activeByDepartment: "/tickets/department/:departmentId/active",
     },
     reports: {
+        summary: "/reports/summary",
         timeseries: "/reports/timeseries",
     },
     publicDisplay: {
@@ -234,6 +235,95 @@ function createDateKeysInclusive(fromDateKey: string, toDateKey: string): string
     }
 
     return out
+}
+
+function buildReportsMatchFilter(req: any) {
+    const today = getTodayDateKey()
+    const rawFrom = parseDateKey(req.query.from) || shiftDateKey(today, -6)
+    const rawTo = parseDateKey(req.query.to) || today
+
+    const fromDate = parseDateKeyToUtc(rawFrom)
+    const toDate = parseDateKeyToUtc(rawTo)
+
+    if (!fromDate || !toDate) {
+        return {
+            ok: false as const,
+            status: 400,
+            body: {
+                message: "Invalid from/to date. Use YYYY-MM-DD format.",
+            },
+        }
+    }
+
+    if (fromDate.getTime() > toDate.getTime()) {
+        return {
+            ok: false as const,
+            status: 400,
+            body: {
+                message: "`from` must be less than or equal to `to`.",
+            },
+        }
+    }
+
+    const dateKeys = createDateKeysInclusive(rawFrom, rawTo)
+    if (!dateKeys.length) {
+        return {
+            ok: false as const,
+            status: 400,
+            body: {
+                message:
+                    "Invalid date range. Use a range between 1 and 366 days.",
+            },
+        }
+    }
+
+    const departmentId = getString(req.query.departmentId)
+    const transactionManager = normalizeTransactionManager(
+        req.query.transactionManager
+    )
+    const participantType = normalizeTicketParticipantType(
+        req.query.participantType
+    )
+
+    if (departmentId && !isValidObjectId(departmentId)) {
+        return {
+            ok: false as const,
+            status: 400,
+            body: {
+                message: "Invalid departmentId",
+            },
+        }
+    }
+
+    const match: Record<string, unknown> = {
+        dateKey: {
+            $gte: rawFrom,
+            $lte: rawTo,
+        },
+    }
+
+    if (departmentId) {
+        match.department = new Types.ObjectId(departmentId)
+    }
+
+    if (transactionManager) {
+        match.transactionCategory = transactionManager
+    }
+
+    if (participantType) {
+        match.participantType = participantType
+    }
+
+    return {
+        ok: true as const,
+        rawFrom,
+        rawTo,
+        dateKeys,
+        departmentId,
+        transactionManager,
+        participantType,
+        match,
+    }
 }
 
 route.post(ROUTE_PATHS.auth.register, AuthController.register)
@@ -592,74 +682,167 @@ route.get(
 route.get(ROUTE_PATHS.tickets.byId, TicketController.getById)
 
 route.get(
+    ROUTE_PATHS.reports.summary,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    async (req, res, next) => {
+        try {
+            const built = buildReportsMatchFilter(req)
+
+            if (!built.ok) {
+                res.status(built.status).json(built.body)
+                return
+            }
+
+            const {
+                rawFrom,
+                rawTo,
+                dateKeys,
+                departmentId,
+                transactionManager,
+                participantType,
+                match,
+            } = built
+
+            const aggregateRows = (await TicketModel.aggregate([
+                { $match: match },
+                {
+                    $group: {
+                        _id: null,
+                        total: { $sum: 1 },
+                        waiting: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "WAITING"] }, 1, 0],
+                            },
+                        },
+                        called: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "CALLED"] }, 1, 0],
+                            },
+                        },
+                        hold: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "HOLD"] }, 1, 0],
+                            },
+                        },
+                        out: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "OUT"] }, 1, 0],
+                            },
+                        },
+                        served: {
+                            $sum: {
+                                $cond: [{ $eq: ["$status", "SERVED"] }, 1, 0],
+                            },
+                        },
+                    },
+                },
+            ])) as Array<{
+                total?: number
+                waiting?: number
+                called?: number
+                hold?: number
+                out?: number
+                served?: number
+            }>
+
+            const row = aggregateRows[0] || {}
+
+            const total = Number(row.total || 0)
+            const waiting = Number(row.waiting || 0)
+            const called = Number(row.called || 0)
+            const hold = Number(row.hold || 0)
+            const out = Number(row.out || 0)
+            const served = Number(row.served || 0)
+            const active = waiting + called + hold
+            const closed = out + served
+            const averagePerDay =
+                dateKeys.length > 0 ? Number((total / dateKeys.length).toFixed(2)) : 0
+
+            res.status(200).json({
+                data: {
+                    total,
+                    count: total,
+                    waiting,
+                    called,
+                    hold,
+                    out,
+                    served,
+                    active,
+                    closed,
+                    completed: served,
+                    averagePerDay,
+                    days: dateKeys.length,
+                    from: rawFrom,
+                    to: rawTo,
+                },
+                summary: {
+                    total,
+                    count: total,
+                    waiting,
+                    called,
+                    hold,
+                    out,
+                    served,
+                    active,
+                    closed,
+                    completed: served,
+                    averagePerDay,
+                    days: dateKeys.length,
+                    from: rawFrom,
+                    to: rawTo,
+                },
+                totals: {
+                    total,
+                    count: total,
+                    waiting,
+                    called,
+                    hold,
+                    out,
+                    served,
+                    active,
+                    closed,
+                    completed: served,
+                },
+                range: {
+                    from: rawFrom,
+                    to: rawTo,
+                    days: dateKeys.length,
+                },
+                filters: {
+                    departmentId: departmentId || undefined,
+                    transactionManager: transactionManager || undefined,
+                    participantType: participantType || undefined,
+                },
+            })
+        } catch (error) {
+            next(error)
+        }
+    }
+)
+
+route.get(
     ROUTE_PATHS.reports.timeseries,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     async (req, res, next) => {
         try {
-            const today = getTodayDateKey()
-            const rawFrom = parseDateKey(req.query.from) || shiftDateKey(today, -6)
-            const rawTo = parseDateKey(req.query.to) || today
+            const built = buildReportsMatchFilter(req)
 
-            const fromDate = parseDateKeyToUtc(rawFrom)
-            const toDate = parseDateKeyToUtc(rawTo)
-
-            if (!fromDate || !toDate) {
-                res.status(400).json({
-                    message: "Invalid from/to date. Use YYYY-MM-DD format.",
-                })
+            if (!built.ok) {
+                res.status(built.status).json(built.body)
                 return
             }
 
-            if (fromDate.getTime() > toDate.getTime()) {
-                res.status(400).json({
-                    message: "`from` must be less than or equal to `to`.",
-                })
-                return
-            }
-
-            const dateKeys = createDateKeysInclusive(rawFrom, rawTo)
-            if (!dateKeys.length) {
-                res.status(400).json({
-                    message:
-                        "Invalid date range. Use a range between 1 and 366 days.",
-                })
-                return
-            }
-
-            const departmentId = getString(req.query.departmentId)
-            const transactionManager = normalizeTransactionManager(
-                req.query.transactionManager
-            )
-            const participantType = normalizeTicketParticipantType(
-                req.query.participantType
-            )
-
-            if (departmentId && !isValidObjectId(departmentId)) {
-                res.status(400).json({
-                    message: "Invalid departmentId",
-                })
-                return
-            }
-
-            const match: Record<string, unknown> = {
-                dateKey: {
-                    $gte: rawFrom,
-                    $lte: rawTo,
-                },
-            }
-
-            if (departmentId) {
-                match.department = new Types.ObjectId(departmentId)
-            }
-
-            if (transactionManager) {
-                match.transactionCategory = transactionManager
-            }
-
-            if (participantType) {
-                match.participantType = participantType
-            }
+            const {
+                rawFrom,
+                rawTo,
+                dateKeys,
+                departmentId,
+                transactionManager,
+                participantType,
+                match,
+            } = built
 
             const rows = (await TicketModel.aggregate([
                 { $match: match },
