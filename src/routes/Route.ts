@@ -32,6 +32,7 @@ export const ROUTE_PATHS = {
         current: "/settings/current",
     },
     auditLogs: {
+        list: "/audit-logs",
         recent: "/audit-logs/recent",
         byActor: "/audit-logs/actor/:actorId",
     },
@@ -77,6 +78,7 @@ export const ROUTE_PATHS = {
         participants: "/users/participants",
     },
     admin: {
+        auditLogs: "/admin/audit-logs",
         staff: "/admin/staff",
         staffSendLogin: "/admin/staff/:id/send-login",
         staffResendLogin: "/admin/staff/:id/resend-login",
@@ -151,6 +153,12 @@ route.get(ROUTE_PATHS.auth.me, requireAuth, AuthController.me)
 route.get(ROUTE_PATHS.settings.current, SettingController.getCurrent)
 
 route.get(
+    ROUTE_PATHS.auditLogs.list,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    AuditLogController.listRecent
+)
+route.get(
     ROUTE_PATHS.auditLogs.recent,
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
@@ -161,6 +169,12 @@ route.get(
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     AuditLogController.getByActor
+)
+route.get(
+    ROUTE_PATHS.admin.auditLogs,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    AuditLogController.listRecent
 )
 
 route.get(ROUTE_PATHS.departments.enabled, DepartmentController.listEnabled)
