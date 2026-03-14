@@ -8,6 +8,37 @@ function isValidObjectId(value: string): boolean {
 }
 
 export class ServiceWindowController {
+    static async list(req: Request, res: Response, next: NextFunction): Promise<void> {
+        try {
+            const departmentId = ControllerUtils.getValue(
+                req.query.departmentId,
+                req.params.departmentId
+            )
+
+            if (departmentId && !isValidObjectId(departmentId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid departmentId")
+                return
+            }
+
+            const includeDisabled = ControllerUtils.parseBoolean(
+                req.query.includeDisabled,
+                false
+            )
+
+            const windows = await ServiceWindowService.list({
+                includeDisabled,
+                departmentId,
+            })
+
+            res.status(200).json({
+                data: windows,
+                count: windows.length,
+            })
+        } catch (error) {
+            ControllerUtils.forwardError(error, next)
+        }
+    }
+
     static async getById(req: Request, res: Response, next: NextFunction): Promise<void> {
         try {
             const windowId = ControllerUtils.getValue(req.params.id, req.params.windowId)

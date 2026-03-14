@@ -24,10 +24,51 @@ function normalizeObjectIdString(
     return Types.ObjectId.isValid(normalized) ? normalized : null
 }
 
+function collectWindowDepartments(window: any) {
+    const out: Array<{ id: string; name?: string }> = []
+    const seen = new Set<string>()
+
+    const pushDepartment = (department: any) => {
+        const id = NameService.toIdString(department?._id ?? department)
+        if (!id || seen.has(id)) return
+
+        seen.add(id)
+
+        const name = String(NameService.getDepartmentName(department) ?? "").trim()
+
+        out.push({
+            id,
+            name: name || undefined,
+        })
+    }
+
+    pushDepartment(window?.department)
+
+    const departments = Array.isArray(window?.departmentIds)
+        ? window.departmentIds
+        : []
+
+    for (const department of departments) {
+        pushDepartment(department)
+    }
+
+    return out
+}
+
 export class ServiceWindowService {
     static toView(window: any): ServiceWindowView {
         const primaryDepartment = window?.department
-        const departments = Array.isArray(window?.departmentIds) ? window.departmentIds : []
+        const departmentEntries = collectWindowDepartments(window)
+
+        const primaryDepartmentId =
+            NameService.toIdString(primaryDepartment?._id ?? primaryDepartment) ??
+            departmentEntries[0]?.id
+
+        const resolvedPrimaryDepartmentName = String(
+            primaryDepartment
+                ? NameService.getDepartmentName(primaryDepartment)
+                : departmentEntries[0]?.name ?? ""
+        ).trim()
 
         return {
             id: NameService.toIdString(window?._id) ?? "",
@@ -35,18 +76,12 @@ export class ServiceWindowService {
             number: Number(window?.number ?? 0),
             displayName: NameService.getWindowName(window),
             enabled: Boolean(window?.enabled),
-            primaryDepartmentId: NameService.toIdString(
-                primaryDepartment?._id ?? primaryDepartment
-            ),
-            primaryDepartmentName: primaryDepartment
-                ? NameService.getDepartmentName(primaryDepartment)
-                : undefined,
-            departmentIds: departments
-                .map((department: any) => NameService.toIdString(department?._id ?? department))
-                .filter((value: string | undefined): value is string => Boolean(value)),
-            departmentNames: departments.map((department: any) =>
-                NameService.getDepartmentName(department)
-            ),
+            primaryDepartmentId: primaryDepartmentId || undefined,
+            primaryDepartmentName: resolvedPrimaryDepartmentName || undefined,
+            departmentIds: departmentEntries.map((department) => department.id),
+            departmentNames: departmentEntries
+                .map((department) => String(department.name ?? "").trim())
+                .filter((value): value is string => Boolean(value)),
             createdAt: window?.createdAt,
             updatedAt: window?.updatedAt,
         }
@@ -64,28 +99,27 @@ export class ServiceWindowService {
         return window ? ServiceWindowService.toView(window) : null
     }
 
-    static async listEnabled(): Promise<ServiceWindowView[]> {
-        const windows = await ServiceWindowModel.find({ enabled: true })
-            .populate("department", "name code")
-            .populate("departmentIds", "name code")
-            .sort({ number: 1, name: 1 })
-            .exec()
+    static async list(options?: {
+        includeDisabled?: boolean
+        departmentId?: string | Types.ObjectId | null
+    }): Promise<ServiceWindowView[]> {
+        const includeDisabled = Boolean(options?.includeDisabled)
+        const normalizedDepartmentId = normalizeObjectIdString(
+            options?.departmentId ?? null
+        )
 
-        return windows.map((window) => ServiceWindowService.toView(window))
-    }
+        const filter: Record<string, unknown> = {}
 
-    static async listByDepartment(
-        departmentId: string | Types.ObjectId,
-        includeDisabled = false
-    ): Promise<ServiceWindowView[]> {
-        const normalizedDepartmentId = normalizeObjectIdString(departmentId)
-        if (!normalizedDepartmentId) return []
-
-        const filter: Record<string, unknown> = {
-            $or: [{ department: normalizedDepartmentId }, { departmentIds: normalizedDepartmentId }],
+        if (!includeDisabled) {
+            filter.enabled = true
         }
 
-        if (!includeDisabled) filter.enabled = true
+        if (normalizedDepartmentId) {
+            filter.$or = [
+                { department: normalizedDepartmentId },
+                { departmentIds: normalizedDepartmentId },
+            ]
+        }
 
         const windows = await ServiceWindowModel.find(filter)
             .populate("department", "name code")
@@ -94,6 +128,20 @@ export class ServiceWindowService {
             .exec()
 
         return windows.map((window) => ServiceWindowService.toView(window))
+    }
+
+    static async listEnabled(): Promise<ServiceWindowView[]> {
+        return ServiceWindowService.list({ includeDisabled: false })
+    }
+
+    static async listByDepartment(
+        departmentId: string | Types.ObjectId,
+        includeDisabled = false
+    ): Promise<ServiceWindowView[]> {
+        return ServiceWindowService.list({
+            departmentId,
+            includeDisabled,
+        })
     }
 
     static async getNameMap(

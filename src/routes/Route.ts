@@ -12,7 +12,6 @@ import {
 import { PublicDisplayController } from "../controllers/PublicDisplayController"
 import {
     DepartmentModel,
-    ServiceWindowModel,
     TicketModel,
     type RegistrarTransactionAudience,
 } from "../models/Model"
@@ -766,47 +765,10 @@ route.get(
     ROUTE_PATHS.serviceWindows.byDepartment,
     ServiceWindowController.listByDepartment
 )
-route.get(ROUTE_PATHS.serviceWindows.list, async (req, res, next) => {
-    try {
-        const includeDisabled = parseBoolean(req.query.includeDisabled, false)
-        const departmentId = getString(req.query.departmentId)
-
-        const filter: Record<string, unknown> = {}
-
-        if (!includeDisabled) {
-            filter.enabled = true
-        }
-
-        if (departmentId) {
-            if (!isValidObjectId(departmentId)) {
-                res.status(400).json({
-                    message: "Invalid departmentId",
-                })
-                return
-            }
-
-            const departmentObjectId = new Types.ObjectId(departmentId)
-
-            filter.$or = [
-                { department: departmentObjectId },
-                { departmentIds: departmentObjectId },
-            ]
-        }
-
-        const serviceWindows = await ServiceWindowModel.find(filter)
-            .sort({ number: 1, name: 1, createdAt: -1 })
-            .populate("department")
-            .populate("departmentIds")
-            .lean()
-
-        res.status(200).json({
-            data: serviceWindows,
-            count: serviceWindows.length,
-        })
-    } catch (error) {
-        next(error)
-    }
-})
+route.get(
+    ROUTE_PATHS.serviceWindows.list,
+    ServiceWindowController.list
+)
 route.get(ROUTE_PATHS.serviceWindows.byId, ServiceWindowController.getById)
 
 route.post(
