@@ -61,9 +61,16 @@ export const ROUTE_PATHS = {
     },
     serviceWindows: {
         list: "/service-windows",
+        create: "/service-windows",
         enabled: "/service-windows/enabled",
         byId: "/service-windows/:id",
+        updateById: "/service-windows/:id",
+        deleteById: "/service-windows/:id",
         byDepartment: "/service-windows/department/:departmentId",
+        legacyList: "/windows",
+        legacyListAlt: "/window",
+        legacyById: "/windows/:id",
+        legacyByIdAlt: "/window/:id",
     },
     transactionPurposes: {
         list: "/transaction-purposes",
@@ -769,7 +776,95 @@ route.get(
     ROUTE_PATHS.serviceWindows.list,
     ServiceWindowController.list
 )
+route.get(
+    ROUTE_PATHS.serviceWindows.legacyList,
+    ServiceWindowController.list
+)
+route.get(
+    ROUTE_PATHS.serviceWindows.legacyListAlt,
+    ServiceWindowController.list
+)
 route.get(ROUTE_PATHS.serviceWindows.byId, ServiceWindowController.getById)
+route.get(
+    ROUTE_PATHS.serviceWindows.legacyById,
+    ServiceWindowController.getById
+)
+route.get(
+    ROUTE_PATHS.serviceWindows.legacyByIdAlt,
+    ServiceWindowController.getById
+)
+route.post(
+    ROUTE_PATHS.serviceWindows.create,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.create
+)
+route.post(
+    ROUTE_PATHS.serviceWindows.legacyList,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.create
+)
+route.post(
+    ROUTE_PATHS.serviceWindows.legacyListAlt,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.create
+)
+route.patch(
+    ROUTE_PATHS.serviceWindows.updateById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.update
+)
+route.patch(
+    ROUTE_PATHS.serviceWindows.legacyById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.update
+)
+route.patch(
+    ROUTE_PATHS.serviceWindows.legacyByIdAlt,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.update
+)
+route.put(
+    ROUTE_PATHS.serviceWindows.updateById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.update
+)
+route.put(
+    ROUTE_PATHS.serviceWindows.legacyById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.update
+)
+route.put(
+    ROUTE_PATHS.serviceWindows.legacyByIdAlt,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.update
+)
+route.delete(
+    ROUTE_PATHS.serviceWindows.deleteById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.delete
+)
+route.delete(
+    ROUTE_PATHS.serviceWindows.legacyById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.delete
+)
+route.delete(
+    ROUTE_PATHS.serviceWindows.legacyByIdAlt,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    ServiceWindowController.delete
+)
 
 route.post(
     ROUTE_PATHS.transactionPurposes.list,
@@ -799,10 +894,10 @@ route.post(
                 hasOwn(body, "scopes")
                     ? body.scopes
                     : hasOwn(body, "audiences")
-                        ? body.audiences
-                        : hasOwn(body, "scope")
-                            ? body.scope
-                            : body.audience
+                      ? body.audiences
+                      : hasOwn(body, "scope")
+                        ? body.scope
+                        : body.audience
             )
 
             if (departmentId && !isValidObjectId(departmentId)) {
@@ -1142,10 +1237,10 @@ route.patch(
                 hasOwn(body, "scopes")
                     ? body.scopes
                     : hasOwn(body, "audiences")
-                        ? body.audiences
-                        : hasOwn(body, "scope")
-                            ? body.scope
-                            : body.audience
+                      ? body.audiences
+                      : hasOwn(body, "scope")
+                        ? body.scope
+                        : body.audience
             )
             const enabled = hasOwn(body, "enabled")
                 ? parseBoolean(body.enabled, true)
@@ -1328,10 +1423,10 @@ route.put(
                 hasOwn(body, "scopes")
                     ? body.scopes
                     : hasOwn(body, "audiences")
-                        ? body.audiences
-                        : hasOwn(body, "scope")
-                            ? body.scope
-                            : body.audience
+                      ? body.audiences
+                      : hasOwn(body, "scope")
+                        ? body.scope
+                        : body.audience
             )
 
             if (departmentId && !isValidObjectId(departmentId)) {
