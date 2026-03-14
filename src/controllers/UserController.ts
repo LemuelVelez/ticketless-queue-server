@@ -85,6 +85,48 @@ export class UserController {
         return (await UserService.getById(userId)) ?? null
     }
 
+    private static buildFallbackUserView(user: any) {
+        const id = String(user?._id ?? user?.id ?? "").trim()
+        const email = normalizeEmail(user?.email)
+        const role =
+            normalizeAccountRole(user?.role) ||
+            String(user?.role ?? "").trim().toUpperCase()
+
+        return {
+            id,
+            _id: id,
+            name: String(user?.name ?? "").trim(),
+            email,
+            role,
+            active: Boolean(user?.active),
+            studentId: String(user?.studentId ?? "").trim() || undefined,
+            avatarUrl:
+                String(user?.avatarUrl ?? user?.avatar ?? "").trim() || undefined,
+            createdAt: user?.createdAt ?? undefined,
+            updatedAt: user?.updatedAt ?? undefined,
+        }
+    }
+
+    private static async buildSafeUserView(user: any) {
+        const userId = String(user?._id ?? user?.id ?? "").trim()
+        if (!userId) {
+            return UserController.buildFallbackUserView(user)
+        }
+
+        try {
+            const hydratedUser = await UserController.buildUserView(userId)
+            if (hydratedUser) return hydratedUser
+        } catch {
+            // fall through to safer view builders
+        }
+
+        try {
+            return UserService.toView(user)
+        } catch {
+            return UserController.buildFallbackUserView(user)
+        }
+    }
+
     private static async writeAuditLog(
         req: Request,
         action: string,
@@ -506,29 +548,81 @@ export class UserController {
                 return
             }
 
-            const user = await UserModel.findById(userId)
+            const existingUser = await UserModel.findById(userId)
 
-            if (!user) {
+            if (!existingUser) {
                 ControllerUtils.sendNotFound(res, "User not found")
                 return
             }
 
-            user.active = false
-            await user.save()
+            const actorId = getActorId(req)
+            if (actorId && actorId.equals(existingUser._id)) {
+                ControllerUtils.sendBadRequest(
+                    res,
+                    "You cannot deactivate your currently signed-in account"
+                )
+                return
+            }
 
-            await UserController.writeAuditLog(req, "USER_ACCOUNT_DEACTIVATED", user, {
-                email: user.email,
-                role: user.role,
-            })
+            if (existingUser.role === "ADMIN" && existingUser.active !== false) {
+                const remainingActiveAdminCount = await UserModel.countDocuments({
+                    role: "ADMIN",
+                    active: true,
+                    _id: { $ne: existingUser._id },
+                })
 
-            const data =
-                (await UserController.buildUserView(String(user._id))) ??
-                UserService.toView(user)
+                if (remainingActiveAdminCount < 1) {
+                    ControllerUtils.sendBadRequest(
+                        res,
+                        "At least one active admin account must remain"
+                    )
+                    return
+                }
+            }
+
+            const wasAlreadyInactive = existingUser.active === false
+
+            const updatedUser = wasAlreadyInactive
+                ? existingUser
+                : await UserModel.findByIdAndUpdate(
+                      existingUser._id,
+                      {
+                          $set: {
+                              active: false,
+                          },
+                      },
+                      {
+                          new: true,
+                          runValidators: false,
+                      }
+                  )
+
+            if (!updatedUser) {
+                ControllerUtils.sendNotFound(res, "User not found")
+                return
+            }
+
+            await UserController.writeAuditLog(
+                req,
+                wasAlreadyInactive
+                    ? "USER_ACCOUNT_DEACTIVATION_SKIPPED"
+                    : "USER_ACCOUNT_DEACTIVATED",
+                updatedUser,
+                {
+                    email: updatedUser.email,
+                    role: updatedUser.role,
+                    alreadyInactive: wasAlreadyInactive,
+                }
+            )
+
+            const data = await UserController.buildSafeUserView(updatedUser)
 
             res.status(200).json({
                 ok: true,
                 data,
-                message: "Account deactivated successfully",
+                message: wasAlreadyInactive
+                    ? "Account is already deactivated"
+                    : "Account deactivated successfully",
             })
         } catch (error) {
             ControllerUtils.forwardError(error, next)
