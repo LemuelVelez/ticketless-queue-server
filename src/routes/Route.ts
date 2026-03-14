@@ -110,6 +110,17 @@ export const ROUTE_PATHS = {
 
 export const route = Router()
 
+type DepartmentPurposeGroupSource = {
+    audience?: unknown
+    items?: unknown
+}
+
+type DepartmentPurposeSource = {
+    registrarTransactionGroups?: DepartmentPurposeGroupSource[] | unknown
+    transactionManager?: unknown
+    _id?: unknown
+}
+
 function getString(value: unknown): string {
     if (Array.isArray(value)) return String(value[0] ?? "").trim()
     return String(value ?? "").trim()
@@ -339,7 +350,7 @@ function mutateDepartmentTransactionPurpose(
 }
 
 function findExistingPurposeLabel(
-    departments: Array<Record<string, unknown>>,
+    departments: DepartmentPurposeSource[],
     key: string
 ): string {
     const normalizedKey = normalizeTransactionPurposeKey(key)
@@ -351,9 +362,7 @@ function findExistingPurposeLabel(
             : []
 
         for (const group of groups) {
-            const items = Array.isArray((group as any)?.items)
-                ? ((group as any).items as unknown[])
-                : []
+            const items = Array.isArray(group?.items) ? group.items : []
 
             for (const item of items) {
                 const label = getString(item)
@@ -952,7 +961,7 @@ route.get(ROUTE_PATHS.transactionPurposes.list, async (req, res, next) => {
             .filter(Boolean)
 
         const managerByDepartmentId = new Map<string, string>()
-        for (const department of departments as Array<Record<string, unknown>>) {
+        for (const department of departments as DepartmentPurposeSource[]) {
             const id = getString(department._id)
             if (!id) continue
             managerByDepartmentId.set(
@@ -1038,14 +1047,12 @@ route.get(ROUTE_PATHS.transactionPurposes.list, async (req, res, next) => {
             })
         }
 
-        for (const department of departments as Array<Record<string, unknown>>) {
+        for (const department of departments as DepartmentPurposeSource[]) {
             const manager = normalizeTransactionManager(department.transactionManager)
             const currentDepartmentId = getString(department._id)
-            const enabled = department.enabled !== false
-            const registrarGroups = Array.isArray(
-                department.registrarTransactionGroups
-            )
-                ? (department.registrarTransactionGroups as Array<Record<string, unknown>>)
+            const enabled = (department as { enabled?: boolean }).enabled !== false
+            const registrarGroups = Array.isArray(department.registrarTransactionGroups)
+                ? department.registrarTransactionGroups
                 : []
 
             for (const group of registrarGroups) {
@@ -1220,10 +1227,7 @@ route.patch(
                 return
             }
 
-            const existingLabel = findExistingPurposeLabel(
-                departments as Array<Record<string, unknown>>,
-                currentKey
-            )
+            const existingLabel = findExistingPurposeLabel(departments, currentKey)
             const label =
                 getString(body.label) ||
                 getString(body.name) ||
@@ -1516,10 +1520,7 @@ route.delete(
                 return
             }
 
-            const existingLabel = findExistingPurposeLabel(
-                departments as Array<Record<string, unknown>>,
-                currentKey
-            )
+            const existingLabel = findExistingPurposeLabel(departments, currentKey)
 
             for (const department of departments) {
                 mutateDepartmentTransactionPurpose(department, {
