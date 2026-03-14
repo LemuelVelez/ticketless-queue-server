@@ -14,6 +14,7 @@ import {
     DepartmentModel,
     ServiceWindowModel,
     TicketModel,
+    type RegistrarTransactionAudience,
 } from "../models/Model"
 import {
     requireAuth,
@@ -67,6 +68,7 @@ export const ROUTE_PATHS = {
     },
     transactionPurposes: {
         list: "/transaction-purposes",
+        byId: "/transaction-purposes/:id",
     },
     tickets: {
         recent: "/tickets/recent",
@@ -171,11 +173,200 @@ function uniqueStrings(values: Array<string | undefined | null>): string[] {
     return out
 }
 
+function hasOwn(object: Record<string, unknown>, key: string): boolean {
+    return Object.prototype.hasOwnProperty.call(object, key)
+}
+
+function getBodyObject(req: any): Record<string, unknown> {
+    if (req?.body && typeof req.body === "object" && !Array.isArray(req.body)) {
+        return req.body as Record<string, unknown>
+    }
+
+    return {}
+}
+
+function parseAudienceList(value: unknown): RegistrarTransactionAudience[] {
+    const rawValues = Array.isArray(value) ? value : [value]
+    const out: RegistrarTransactionAudience[] = []
+
+    for (const rawValue of rawValues) {
+        const audience = normalizeAudience(rawValue)
+        if (!audience) continue
+        if (out.includes(audience)) continue
+        out.push(audience)
+    }
+
+    return out
+}
+
+function parseTransactionPurposeId(
+    value: unknown
+): { transactionManager: string; key: string } | null {
+    const rawValue = getString(value)
+    if (!rawValue) return null
+
+    const separatorIndex = rawValue.indexOf(":")
+    if (separatorIndex <= 0) return null
+
+    const transactionManager = normalizeTransactionManager(
+        rawValue.slice(0, separatorIndex)
+    )
+    const key = normalizeTransactionPurposeKey(
+        rawValue.slice(separatorIndex + 1)
+    )
+
+    if (!transactionManager || !key) return null
+
+    return {
+        transactionManager,
+        key,
+    }
+}
+
 function buildTransactionPurposeId(manager: string, keyOrLabel: string): string {
     const normalizedManager = normalizeTransactionManager(manager) || "GENERAL"
     const normalizedKey = normalizeTransactionPurposeKey(keyOrLabel)
     if (!normalizedKey) return ""
     return `${normalizedManager}:${normalizedKey}`
+}
+
+function toTransactionPurposeView(input: {
+    transactionManager: string
+    key: string
+    label: string
+    purpose?: string
+    scopes?: RegistrarTransactionAudience[]
+    departmentIds?: string[]
+    enabled?: boolean
+}) {
+    const transactionManager =
+        normalizeTransactionManager(input.transactionManager) || "GENERAL"
+    const label =
+        getString(input.label) ||
+        getString(input.purpose) ||
+        getString(input.key)
+    const key = normalizeTransactionPurposeKey(input.key || label)
+    const scopes =
+        input.scopes && input.scopes.length
+            ? input.scopes
+            : (["INTERNAL", "EXTERNAL"] as RegistrarTransactionAudience[])
+    const departmentIds = uniqueStrings(input.departmentIds || [])
+
+    return {
+        id: buildTransactionPurposeId(transactionManager, key),
+        _id: buildTransactionPurposeId(transactionManager, key),
+        key,
+        name: label,
+        label,
+        purpose: getString(input.purpose) || label,
+        transactionPurpose: getString(input.purpose) || label,
+        category: transactionManager,
+        transactionCategory: transactionManager,
+        scopes,
+        departmentIds,
+        enabled: input.enabled !== false,
+    }
+}
+
+function mutateDepartmentTransactionPurpose(
+    department: any,
+    input: {
+        currentKey: string
+        nextKey?: string
+        label?: string
+        scopes?: RegistrarTransactionAudience[]
+        remove?: boolean
+    }
+): void {
+    const currentKey = normalizeTransactionPurposeKey(input.currentKey)
+    const nextKey = normalizeTransactionPurposeKey(
+        input.nextKey || input.label || input.currentKey
+    )
+    const label = getString(input.label)
+    const scopes =
+        input.scopes && input.scopes.length
+            ? input.scopes
+            : (["INTERNAL", "EXTERNAL"] as RegistrarTransactionAudience[])
+
+    const audienceMap = new Map<RegistrarTransactionAudience, Set<string>>([
+        ["INTERNAL", new Set<string>()],
+        ["EXTERNAL", new Set<string>()],
+    ])
+
+    const existingGroups = Array.isArray(department?.registrarTransactionGroups)
+        ? department.registrarTransactionGroups
+        : []
+
+    for (const group of existingGroups) {
+        const audience = normalizeAudience(group?.audience)
+        if (audience !== "INTERNAL" && audience !== "EXTERNAL") continue
+
+        const items = Array.isArray(group?.items) ? group.items : []
+        const target = audienceMap.get(audience)
+        if (!target) continue
+
+        for (const item of items) {
+            const itemLabel = getString(item)
+            if (!itemLabel) continue
+
+            const itemKey = normalizeTransactionPurposeKey(itemLabel)
+            if (itemKey === currentKey || itemKey === nextKey) {
+                continue
+            }
+
+            target.add(itemLabel)
+        }
+    }
+
+    if (!input.remove && label) {
+        for (const scope of scopes) {
+            audienceMap.get(scope)?.add(label)
+        }
+    }
+
+    department.registrarTransactionGroups = (
+        ["INTERNAL", "EXTERNAL"] as RegistrarTransactionAudience[]
+    )
+        .map((audience) => ({
+            audience,
+            items: Array.from(audienceMap.get(audience) || []),
+        }))
+        .filter((group) => group.items.length > 0)
+
+    if (typeof department?.markModified === "function") {
+        department.markModified("registrarTransactionGroups")
+    }
+}
+
+function findExistingPurposeLabel(
+    departments: Array<Record<string, unknown>>,
+    key: string
+): string {
+    const normalizedKey = normalizeTransactionPurposeKey(key)
+    if (!normalizedKey) return ""
+
+    for (const department of departments) {
+        const groups = Array.isArray(department.registrarTransactionGroups)
+            ? department.registrarTransactionGroups
+            : []
+
+        for (const group of groups) {
+            const items = Array.isArray((group as any)?.items)
+                ? ((group as any).items as unknown[])
+                : []
+
+            for (const item of items) {
+                const label = getString(item)
+                if (!label) continue
+
+                if (normalizeTransactionPurposeKey(label) === normalizedKey) {
+                    return label
+                }
+            }
+        }
+    }
+
+    return ""
 }
 
 function parseDateKey(value: unknown): string {
@@ -505,6 +696,12 @@ route.get(
     ROUTE_PATHS.departments.byTransactionManager,
     DepartmentController.listByTransactionManager
 )
+route.post(
+    ROUTE_PATHS.departments.list,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    DepartmentController.create
+)
 route.get(ROUTE_PATHS.departments.list, async (req, res, next) => {
     try {
         const includeDisabled = parseBoolean(req.query.includeDisabled, false)
@@ -533,6 +730,24 @@ route.get(ROUTE_PATHS.departments.list, async (req, res, next) => {
     }
 })
 route.get(ROUTE_PATHS.departments.byId, DepartmentController.getById)
+route.patch(
+    ROUTE_PATHS.departments.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    DepartmentController.update
+)
+route.put(
+    ROUTE_PATHS.departments.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    DepartmentController.update
+)
+route.delete(
+    ROUTE_PATHS.departments.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    DepartmentController.delete
+)
 
 route.get(
     ROUTE_PATHS.serviceWindows.enabled,
@@ -584,6 +799,119 @@ route.get(ROUTE_PATHS.serviceWindows.list, async (req, res, next) => {
     }
 })
 route.get(ROUTE_PATHS.serviceWindows.byId, ServiceWindowController.getById)
+
+route.post(
+    ROUTE_PATHS.transactionPurposes.list,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    async (req, res, next) => {
+        try {
+            const body = getBodyObject(req)
+            const departmentId = getString(body.departmentId || req.query.departmentId)
+            const transactionManager = normalizeTransactionManager(
+                body.transactionManager ||
+                    body.manager ||
+                    body.category ||
+                    req.query.transactionManager
+            )
+            const label =
+                getString(body.label) ||
+                getString(body.name) ||
+                getString(body.purpose) ||
+                getString(body.transactionPurpose)
+            const key = normalizeTransactionPurposeKey(
+                getString(body.key) ||
+                    getString(body.transactionKey) ||
+                    label
+            )
+            const scopes = parseAudienceList(
+                hasOwn(body, "scopes")
+                    ? body.scopes
+                    : hasOwn(body, "audiences")
+                        ? body.audiences
+                        : hasOwn(body, "scope")
+                            ? body.scope
+                            : body.audience
+            )
+
+            if (departmentId && !isValidObjectId(departmentId)) {
+                res.status(400).json({
+                    message: "Invalid departmentId",
+                })
+                return
+            }
+
+            if (!departmentId && !transactionManager) {
+                res.status(400).json({
+                    message: "transactionManager or departmentId is required",
+                })
+                return
+            }
+
+            if (!label || !key) {
+                res.status(400).json({
+                    message: "Transaction purpose label is required",
+                })
+                return
+            }
+
+            const departmentFilter: Record<string, unknown> = {}
+
+            if (departmentId) {
+                departmentFilter._id = new Types.ObjectId(departmentId)
+            } else {
+                departmentFilter.transactionManager = transactionManager
+            }
+
+            const departments = await DepartmentModel.find(departmentFilter).exec()
+
+            if (!departments.length) {
+                res.status(404).json({
+                    message: "No department found for the provided transaction purpose target",
+                })
+                return
+            }
+
+            for (const department of departments) {
+                mutateDepartmentTransactionPurpose(department, {
+                    currentKey: key,
+                    nextKey: key,
+                    label,
+                    scopes,
+                    remove: false,
+                })
+
+                await department.save()
+            }
+
+            const resolvedManager =
+                transactionManager ||
+                normalizeTransactionManager(departments[0]?.transactionManager)
+
+            const data = toTransactionPurposeView({
+                transactionManager: resolvedManager,
+                key,
+                label,
+                purpose: label,
+                scopes: scopes.length
+                    ? scopes
+                    : (["INTERNAL", "EXTERNAL"] as RegistrarTransactionAudience[]),
+                departmentIds: departments.map((department) =>
+                    getString(department._id)
+                ),
+                enabled: true,
+            })
+
+            res.status(201).json({
+                data,
+                count: departments.length,
+                message: "Transaction purpose created successfully",
+            })
+        } catch (error) {
+            next(error)
+        }
+    }
+)
 
 route.get(ROUTE_PATHS.transactionPurposes.list, async (req, res, next) => {
     try {
@@ -810,6 +1138,421 @@ route.get(ROUTE_PATHS.transactionPurposes.list, async (req, res, next) => {
         next(error)
     }
 })
+
+route.patch(
+    ROUTE_PATHS.transactionPurposes.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    async (req, res, next) => {
+        try {
+            const body = getBodyObject(req)
+            const parsedId =
+                parseTransactionPurposeId(req.params.id) ||
+                parseTransactionPurposeId(body.id) ||
+                parseTransactionPurposeId(body._id)
+
+            const departmentId = getString(body.departmentId || req.query.departmentId)
+            const transactionManager = normalizeTransactionManager(
+                body.transactionManager ||
+                    body.manager ||
+                    body.category ||
+                    parsedId?.transactionManager
+            )
+            const currentKey = normalizeTransactionPurposeKey(
+                parsedId?.key ||
+                    getString(body.currentKey) ||
+                    getString(body.key) ||
+                    getString(body.transactionKey)
+            )
+            const nextKey = normalizeTransactionPurposeKey(
+                getString(body.key) ||
+                    getString(body.transactionKey) ||
+                    currentKey
+            )
+            const scopes = parseAudienceList(
+                hasOwn(body, "scopes")
+                    ? body.scopes
+                    : hasOwn(body, "audiences")
+                        ? body.audiences
+                        : hasOwn(body, "scope")
+                            ? body.scope
+                            : body.audience
+            )
+            const enabled = hasOwn(body, "enabled")
+                ? parseBoolean(body.enabled, true)
+                : true
+
+            if (departmentId && !isValidObjectId(departmentId)) {
+                res.status(400).json({
+                    message: "Invalid departmentId",
+                })
+                return
+            }
+
+            if (!currentKey) {
+                res.status(400).json({
+                    message: "Transaction purpose id or key is required",
+                })
+                return
+            }
+
+            if (!departmentId && !transactionManager) {
+                res.status(400).json({
+                    message: "transactionManager or departmentId is required",
+                })
+                return
+            }
+
+            const departmentFilter: Record<string, unknown> = {}
+
+            if (departmentId) {
+                departmentFilter._id = new Types.ObjectId(departmentId)
+            } else {
+                departmentFilter.transactionManager = transactionManager
+            }
+
+            const departments = await DepartmentModel.find(departmentFilter).exec()
+
+            if (!departments.length) {
+                res.status(404).json({
+                    message: "No department found for the provided transaction purpose target",
+                })
+                return
+            }
+
+            const existingLabel = findExistingPurposeLabel(
+                departments as Array<Record<string, unknown>>,
+                currentKey
+            )
+            const label =
+                getString(body.label) ||
+                getString(body.name) ||
+                getString(body.purpose) ||
+                getString(body.transactionPurpose) ||
+                existingLabel
+
+            if (!enabled) {
+                for (const department of departments) {
+                    mutateDepartmentTransactionPurpose(department, {
+                        currentKey,
+                        remove: true,
+                    })
+
+                    await department.save()
+                }
+
+                res.status(200).json({
+                    data: toTransactionPurposeView({
+                        transactionManager:
+                            transactionManager ||
+                            normalizeTransactionManager(
+                                departments[0]?.transactionManager
+                            ),
+                        key: nextKey || currentKey,
+                        label: label || existingLabel || currentKey,
+                        purpose: label || existingLabel || currentKey,
+                        scopes,
+                        departmentIds: departments.map((department) =>
+                            getString(department._id)
+                        ),
+                        enabled: false,
+                    }),
+                    count: departments.length,
+                    message: "Transaction purpose updated successfully",
+                })
+                return
+            }
+
+            if (!label) {
+                res.status(400).json({
+                    message: "Transaction purpose label is required",
+                })
+                return
+            }
+
+            for (const department of departments) {
+                mutateDepartmentTransactionPurpose(department, {
+                    currentKey,
+                    nextKey,
+                    label,
+                    scopes,
+                    remove: false,
+                })
+
+                await department.save()
+            }
+
+            res.status(200).json({
+                data: toTransactionPurposeView({
+                    transactionManager:
+                        transactionManager ||
+                        normalizeTransactionManager(
+                            departments[0]?.transactionManager
+                        ),
+                    key: nextKey || currentKey,
+                    label,
+                    purpose: label,
+                    scopes: scopes.length
+                        ? scopes
+                        : (["INTERNAL", "EXTERNAL"] as RegistrarTransactionAudience[]),
+                    departmentIds: departments.map((department) =>
+                        getString(department._id)
+                    ),
+                    enabled: true,
+                }),
+                count: departments.length,
+                message: "Transaction purpose updated successfully",
+            })
+        } catch (error) {
+            next(error)
+        }
+    }
+)
+
+route.put(
+    ROUTE_PATHS.transactionPurposes.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    async (req, res, next) => {
+        try {
+            req.body = {
+                ...getBodyObject(req),
+                enabled: hasOwn(getBodyObject(req), "enabled")
+                    ? getBodyObject(req).enabled
+                    : true,
+            }
+
+            next()
+        } catch (error) {
+            next(error)
+        }
+    },
+    async (req, res, next) => {
+        try {
+            const body = getBodyObject(req)
+            const parsedId =
+                parseTransactionPurposeId(req.params.id) ||
+                parseTransactionPurposeId(body.id) ||
+                parseTransactionPurposeId(body._id)
+
+            const departmentId = getString(body.departmentId || req.query.departmentId)
+            const transactionManager = normalizeTransactionManager(
+                body.transactionManager ||
+                    body.manager ||
+                    body.category ||
+                    parsedId?.transactionManager
+            )
+            const currentKey = normalizeTransactionPurposeKey(
+                parsedId?.key ||
+                    getString(body.currentKey) ||
+                    getString(body.key) ||
+                    getString(body.transactionKey)
+            )
+            const nextKey = normalizeTransactionPurposeKey(
+                getString(body.key) ||
+                    getString(body.transactionKey) ||
+                    currentKey
+            )
+            const label =
+                getString(body.label) ||
+                getString(body.name) ||
+                getString(body.purpose) ||
+                getString(body.transactionPurpose)
+            const scopes = parseAudienceList(
+                hasOwn(body, "scopes")
+                    ? body.scopes
+                    : hasOwn(body, "audiences")
+                        ? body.audiences
+                        : hasOwn(body, "scope")
+                            ? body.scope
+                            : body.audience
+            )
+
+            if (departmentId && !isValidObjectId(departmentId)) {
+                res.status(400).json({
+                    message: "Invalid departmentId",
+                })
+                return
+            }
+
+            if (!currentKey) {
+                res.status(400).json({
+                    message: "Transaction purpose id or key is required",
+                })
+                return
+            }
+
+            if (!departmentId && !transactionManager) {
+                res.status(400).json({
+                    message: "transactionManager or departmentId is required",
+                })
+                return
+            }
+
+            if (!label) {
+                res.status(400).json({
+                    message: "Transaction purpose label is required",
+                })
+                return
+            }
+
+            const departmentFilter: Record<string, unknown> = {}
+
+            if (departmentId) {
+                departmentFilter._id = new Types.ObjectId(departmentId)
+            } else {
+                departmentFilter.transactionManager = transactionManager
+            }
+
+            const departments = await DepartmentModel.find(departmentFilter).exec()
+
+            if (!departments.length) {
+                res.status(404).json({
+                    message: "No department found for the provided transaction purpose target",
+                })
+                return
+            }
+
+            for (const department of departments) {
+                mutateDepartmentTransactionPurpose(department, {
+                    currentKey,
+                    nextKey,
+                    label,
+                    scopes,
+                    remove: false,
+                })
+
+                await department.save()
+            }
+
+            res.status(200).json({
+                data: toTransactionPurposeView({
+                    transactionManager:
+                        transactionManager ||
+                        normalizeTransactionManager(
+                            departments[0]?.transactionManager
+                        ),
+                    key: nextKey || currentKey,
+                    label,
+                    purpose: label,
+                    scopes: scopes.length
+                        ? scopes
+                        : (["INTERNAL", "EXTERNAL"] as RegistrarTransactionAudience[]),
+                    departmentIds: departments.map((department) =>
+                        getString(department._id)
+                    ),
+                    enabled: true,
+                }),
+                count: departments.length,
+                message: "Transaction purpose replaced successfully",
+            })
+        } catch (error) {
+            next(error)
+        }
+    }
+)
+
+route.delete(
+    ROUTE_PATHS.transactionPurposes.byId,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    async (req, res, next) => {
+        try {
+            const body = getBodyObject(req)
+            const parsedId =
+                parseTransactionPurposeId(req.params.id) ||
+                parseTransactionPurposeId(body.id) ||
+                parseTransactionPurposeId(body._id)
+
+            const departmentId = getString(body.departmentId || req.query.departmentId)
+            const transactionManager = normalizeTransactionManager(
+                body.transactionManager ||
+                    body.manager ||
+                    body.category ||
+                    parsedId?.transactionManager
+            )
+            const currentKey = normalizeTransactionPurposeKey(
+                parsedId?.key ||
+                    getString(body.currentKey) ||
+                    getString(body.key) ||
+                    getString(body.transactionKey)
+            )
+
+            if (departmentId && !isValidObjectId(departmentId)) {
+                res.status(400).json({
+                    message: "Invalid departmentId",
+                })
+                return
+            }
+
+            if (!currentKey) {
+                res.status(400).json({
+                    message: "Transaction purpose id or key is required",
+                })
+                return
+            }
+
+            if (!departmentId && !transactionManager) {
+                res.status(400).json({
+                    message: "transactionManager or departmentId is required",
+                })
+                return
+            }
+
+            const departmentFilter: Record<string, unknown> = {}
+
+            if (departmentId) {
+                departmentFilter._id = new Types.ObjectId(departmentId)
+            } else {
+                departmentFilter.transactionManager = transactionManager
+            }
+
+            const departments = await DepartmentModel.find(departmentFilter).exec()
+
+            if (!departments.length) {
+                res.status(404).json({
+                    message: "No department found for the provided transaction purpose target",
+                })
+                return
+            }
+
+            const existingLabel = findExistingPurposeLabel(
+                departments as Array<Record<string, unknown>>,
+                currentKey
+            )
+
+            for (const department of departments) {
+                mutateDepartmentTransactionPurpose(department, {
+                    currentKey,
+                    remove: true,
+                })
+
+                await department.save()
+            }
+
+            res.status(200).json({
+                data: toTransactionPurposeView({
+                    transactionManager:
+                        transactionManager ||
+                        normalizeTransactionManager(
+                            departments[0]?.transactionManager
+                        ),
+                    key: currentKey,
+                    label: existingLabel || currentKey,
+                    purpose: existingLabel || currentKey,
+                    departmentIds: departments.map((department) =>
+                        getString(department._id)
+                    ),
+                    enabled: false,
+                }),
+                count: departments.length,
+                message: "Transaction purpose deleted successfully",
+            })
+        } catch (error) {
+            next(error)
+        }
+    }
+)
 
 route.get(ROUTE_PATHS.tickets.recent, TicketController.listRecent)
 route.get(
