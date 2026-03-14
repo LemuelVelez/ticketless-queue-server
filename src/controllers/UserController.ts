@@ -24,9 +24,88 @@ function hashPassword(password: string, salt: string, iterations: number) {
     return pbkdf2Sync(password, salt, iterations, 32, "sha256").toString("hex")
 }
 
+function normalizeAccountRole(
+    value: unknown
+): "ADMIN" | "STAFF" | "STUDENT" | "ALUMNI_VISITOR" | "GUEST" | "" {
+    const raw = String(value ?? "")
+        .trim()
+        .toUpperCase()
+        .replace(/[\s/-]+/g, "_")
+
+    if (raw === "ADMIN") return "ADMIN"
+    if (raw === "STAFF") return "STAFF"
+    if (raw === "STUDENT") return "STUDENT"
+    if (raw === "ALUMNI_VISITOR" || raw === "ALUMNI" || raw === "VISITOR") {
+        return "ALUMNI_VISITOR"
+    }
+    if (raw === "GUEST") return "GUEST"
+
+    return ""
+}
+
+function isStaffAccountRole(role: string): role is "ADMIN" | "STAFF" {
+    return role === "ADMIN" || role === "STAFF"
+}
+
+function parseBooleanLike(value: unknown, fallback = false): boolean {
+    if (typeof value === "boolean") return value
+    const raw = String(value ?? "").trim().toLowerCase()
+    if (!raw) return fallback
+    if (["1", "true", "yes", "y", "on"].includes(raw)) return true
+    if (["0", "false", "no", "n", "off"].includes(raw)) return false
+    return fallback
+}
+
+function hasOwn(object: unknown, key: string): boolean {
+    return !!object && typeof object === "object"
+        ? Object.prototype.hasOwnProperty.call(object, key)
+        : false
+}
+
+function getActorId(req: Request): Types.ObjectId | undefined {
+    const actorRaw =
+        (req as any)?.user?._id ||
+        (req as any)?.user?.id ||
+        (req as any)?.auth?.userId ||
+        ""
+
+    return actorRaw && Types.ObjectId.isValid(String(actorRaw))
+        ? new Types.ObjectId(String(actorRaw))
+        : undefined
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+    return error instanceof Error ? error.message : fallback
+}
+
 type IssueCredentialsMode = "send" | "resend"
 
 export class UserController {
+    private static async buildUserView(userId: string) {
+        return (await UserService.getById(userId)) ?? null
+    }
+
+    private static async writeAuditLog(
+        req: Request,
+        action: string,
+        user: any,
+        meta?: Record<string, unknown>
+    ) {
+        try {
+            await AuditLogModel.create({
+                actor: getActorId(req),
+                actorRole: (req as any)?.user?.role,
+                action,
+                entityType: "User",
+                entityId: user?._id,
+                meta,
+                createdAt: new Date(),
+            })
+        } catch {
+            // do not fail the main request if audit logging fails
+        }
+    }
+
     private static async issueLoginCredentials(
         req: Request,
         res: Response,
@@ -139,37 +218,18 @@ export class UserController {
                 throw mailError
             }
 
-            const actorRaw =
-                (req as any)?.user?._id ||
-                (req as any)?.user?.id ||
-                (req as any)?.auth?.userId ||
-                ""
-
-            const actorId =
-                actorRaw && Types.ObjectId.isValid(String(actorRaw))
-                    ? new Types.ObjectId(String(actorRaw))
-                    : undefined
-
-            try {
-                await AuditLogModel.create({
-                    actor: actorId,
-                    actorRole: (req as any)?.user?.role,
-                    action:
-                        mode === "resend"
-                            ? "STAFF_LOGIN_CREDENTIALS_RESENT"
-                            : "STAFF_LOGIN_CREDENTIALS_SENT",
-                    entityType: "User",
-                    entityId: user._id,
-                    meta: {
-                        email: targetEmail,
-                        role: user.role,
-                        mode,
-                    },
-                    createdAt: new Date(),
-                })
-            } catch {
-                // do not fail the main request if audit logging fails
-            }
+            await UserController.writeAuditLog(
+                req,
+                mode === "resend"
+                    ? "STAFF_LOGIN_CREDENTIALS_RESENT"
+                    : "STAFF_LOGIN_CREDENTIALS_SENT",
+                user,
+                {
+                    email: targetEmail,
+                    role: user.role,
+                    mode,
+                }
+            )
 
             res.status(200).json({
                 ok: true,
@@ -183,6 +243,292 @@ export class UserController {
                     email: user.email,
                     role: user.role,
                 },
+            })
+        } catch (error) {
+            ControllerUtils.forwardError(error, next)
+        }
+    }
+
+    static async createStaff(
+        req: Request,
+        res: Response,
+        next: NextFunction
+    ): Promise<void> {
+        try {
+            const name = String(req.body?.name ?? "").trim()
+            const email = normalizeEmail(req.body?.email)
+            const role = normalizeAccountRole(req.body?.role) || "STAFF"
+            const sendCredentials = parseBooleanLike(req.body?.sendCredentials, true)
+            const providedPassword = String(req.body?.password ?? "").trim()
+            const loginLink = String(req.body?.loginLink ?? "").trim() || undefined
+
+            if (!name) {
+                ControllerUtils.sendBadRequest(res, "Name is required")
+                return
+            }
+
+            if (!email) {
+                ControllerUtils.sendBadRequest(res, "Email is required")
+                return
+            }
+
+            if (!isStaffAccountRole(role)) {
+                ControllerUtils.sendBadRequest(
+                    res,
+                    "Only STAFF or ADMIN accounts can be created from this route"
+                )
+                return
+            }
+
+            if (!sendCredentials && !providedPassword) {
+                ControllerUtils.sendBadRequest(
+                    res,
+                    "Password is required when sendCredentials is disabled"
+                )
+                return
+            }
+
+            const existingUser = await UserModel.findOne({ email }).lean()
+
+            if (existingUser) {
+                res.status(409).json({
+                    message: "A user with this email already exists",
+                })
+                return
+            }
+
+            const temporaryPassword = providedPassword || buildTemporaryPassword()
+            const passwordSalt = randomBytes(16).toString("hex")
+            const passwordIterations = 150000
+            const passwordHash = hashPassword(
+                temporaryPassword,
+                passwordSalt,
+                passwordIterations
+            )
+
+            const createdUser = await UserModel.create({
+                name,
+                email,
+                role,
+                active: parseBooleanLike(req.body?.active, true),
+                passwordSalt,
+                passwordHash,
+                passwordAlgo: "pbkdf2-sha256",
+                passwordIterations,
+            })
+
+            let credentialsSent = false
+            let credentialsError = ""
+
+            if (sendCredentials) {
+                try {
+                    await sendLoginCredentialsEmail({
+                        to: email,
+                        name,
+                        email,
+                        password: temporaryPassword,
+                        role,
+                        loginLink,
+                    })
+
+                    credentialsSent = true
+                } catch (mailError) {
+                    credentialsError = getErrorMessage(
+                        mailError,
+                        "Failed to send login credentials email"
+                    )
+                }
+            }
+
+            await UserController.writeAuditLog(req, "STAFF_ACCOUNT_CREATED", createdUser, {
+                email,
+                role,
+                sendCredentials,
+                credentialsSent,
+                credentialsError: credentialsError || undefined,
+            })
+
+            const data =
+                (await UserController.buildUserView(String(createdUser._id))) ??
+                UserService.toView(createdUser)
+
+            res.status(201).json({
+                data,
+                credentials: {
+                    attempted: sendCredentials,
+                    sent: credentialsSent,
+                    error: credentialsError || undefined,
+                },
+                message:
+                    sendCredentials && !credentialsSent
+                        ? "Account created, but credentials email failed to send"
+                        : "Account created successfully",
+            })
+        } catch (error) {
+            ControllerUtils.forwardError(error, next)
+        }
+    }
+
+    static async updateById(
+        req: Request,
+        res: Response,
+        next: NextFunction
+    ): Promise<void> {
+        try {
+            const userId = ControllerUtils.getValue(
+                req.params.id,
+                req.params.userId,
+                req.body?.id,
+                req.body?.userId
+            )
+
+            if (!userId) {
+                ControllerUtils.sendBadRequest(res, "userId is required")
+                return
+            }
+
+            if (!isValidObjectId(userId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid userId")
+                return
+            }
+
+            const user = await UserModel.findById(userId)
+
+            if (!user) {
+                ControllerUtils.sendNotFound(res, "User not found")
+                return
+            }
+
+            if (hasOwn(req.body, "name")) {
+                const name = String(req.body?.name ?? "").trim()
+                if (!name) {
+                    ControllerUtils.sendBadRequest(res, "Name is required")
+                    return
+                }
+                user.name = name
+            }
+
+            if (hasOwn(req.body, "email")) {
+                const email = normalizeEmail(req.body?.email)
+                if (!email) {
+                    ControllerUtils.sendBadRequest(res, "Email is required")
+                    return
+                }
+
+                const existingUser = await UserModel.findOne({
+                    email,
+                    _id: { $ne: user._id },
+                }).lean()
+
+                if (existingUser) {
+                    res.status(409).json({
+                        message: "A user with this email already exists",
+                    })
+                    return
+                }
+
+                user.email = email
+            }
+
+            if (hasOwn(req.body, "role")) {
+                const role = normalizeAccountRole(req.body?.role)
+                if (!role) {
+                    ControllerUtils.sendBadRequest(res, "Invalid role")
+                    return
+                }
+                user.role = role
+            }
+
+            if (hasOwn(req.body, "active")) {
+                user.active = parseBooleanLike(req.body?.active, Boolean(user.active))
+            }
+
+            const nextPassword = String(req.body?.password ?? "").trim()
+            if (nextPassword) {
+                const passwordSalt = randomBytes(16).toString("hex")
+                const passwordIterations = Math.max(
+                    Number(user.passwordIterations || 150000),
+                    150000
+                )
+
+                user.passwordSalt = passwordSalt
+                user.passwordHash = hashPassword(
+                    nextPassword,
+                    passwordSalt,
+                    passwordIterations
+                )
+                user.passwordAlgo = "pbkdf2-sha256"
+                user.passwordIterations = passwordIterations
+            }
+
+            await user.save()
+
+            await UserController.writeAuditLog(req, "USER_ACCOUNT_UPDATED", user, {
+                updatedFields: Object.keys(req.body || {}).filter(Boolean),
+                passwordUpdated: Boolean(nextPassword),
+            })
+
+            const data =
+                (await UserController.buildUserView(String(user._id))) ??
+                UserService.toView(user)
+
+            res.status(200).json({
+                data,
+                message: nextPassword
+                    ? "Account and credential updated successfully"
+                    : "Account updated successfully",
+            })
+        } catch (error) {
+            ControllerUtils.forwardError(error, next)
+        }
+    }
+
+    static async deleteById(
+        req: Request,
+        res: Response,
+        next: NextFunction
+    ): Promise<void> {
+        try {
+            const userId = ControllerUtils.getValue(
+                req.params.id,
+                req.params.userId,
+                req.body?.id,
+                req.body?.userId
+            )
+
+            if (!userId) {
+                ControllerUtils.sendBadRequest(res, "userId is required")
+                return
+            }
+
+            if (!isValidObjectId(userId)) {
+                ControllerUtils.sendBadRequest(res, "Invalid userId")
+                return
+            }
+
+            const user = await UserModel.findById(userId)
+
+            if (!user) {
+                ControllerUtils.sendNotFound(res, "User not found")
+                return
+            }
+
+            user.active = false
+            await user.save()
+
+            await UserController.writeAuditLog(req, "USER_ACCOUNT_DEACTIVATED", user, {
+                email: user.email,
+                role: user.role,
+            })
+
+            const data =
+                (await UserController.buildUserView(String(user._id))) ??
+                UserService.toView(user)
+
+            res.status(200).json({
+                ok: true,
+                data,
+                message: "Account deactivated successfully",
             })
         } catch (error) {
             ControllerUtils.forwardError(error, next)

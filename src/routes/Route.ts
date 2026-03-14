@@ -101,6 +101,7 @@ export const ROUTE_PATHS = {
         byId: "/users/:id",
         byStudentId: "/users/student/:studentId",
         staff: "/users/staff",
+        staffById: "/users/staff/:id",
         staffSendLogin: "/users/staff/:id/send-login",
         staffResendLogin: "/users/staff/:id/resend-login",
         participants: "/users/participants",
@@ -108,6 +109,7 @@ export const ROUTE_PATHS = {
     admin: {
         auditLogs: "/admin/audit-logs",
         staff: "/admin/staff",
+        staffById: "/admin/staff/:id",
         staffSendLogin: "/admin/staff/:id/send-login",
         staffResendLogin: "/admin/staff/:id/resend-login",
         participants: "/admin/participants",
@@ -1981,6 +1983,36 @@ route.get(
     UserController.listStaff
 )
 route.post(
+    ROUTE_PATHS.users.staff,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.createStaff
+)
+route.get(
+    ROUTE_PATHS.users.staffById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.getById
+)
+route.patch(
+    ROUTE_PATHS.users.staffById,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.updateById
+)
+route.put(
+    ROUTE_PATHS.users.staffById,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.updateById
+)
+route.delete(
+    ROUTE_PATHS.users.staffById,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.deleteById
+)
+route.post(
     ROUTE_PATHS.users.staffSendLogin,
     requireAuth,
     requireRoles("ADMIN"),
@@ -1997,6 +2029,36 @@ route.get(
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     UserController.listStaff
+)
+route.post(
+    ROUTE_PATHS.admin.staff,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.createStaff
+)
+route.get(
+    ROUTE_PATHS.admin.staffById,
+    requireAuth,
+    requireRoles("ADMIN", "STAFF"),
+    UserController.getById
+)
+route.patch(
+    ROUTE_PATHS.admin.staffById,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.updateById
+)
+route.put(
+    ROUTE_PATHS.admin.staffById,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.updateById
+)
+route.delete(
+    ROUTE_PATHS.admin.staffById,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.deleteById
 )
 route.post(
     ROUTE_PATHS.admin.staffSendLogin,
@@ -2033,6 +2095,24 @@ route.get(
     requireAuth,
     requireRoles("ADMIN", "STAFF"),
     UserController.getById
+)
+route.patch(
+    ROUTE_PATHS.users.byId,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.updateById
+)
+route.put(
+    ROUTE_PATHS.users.byId,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.updateById
+)
+route.delete(
+    ROUTE_PATHS.users.byId,
+    requireAuth,
+    requireRoles("ADMIN"),
+    UserController.deleteById
 )
 
 export default route
