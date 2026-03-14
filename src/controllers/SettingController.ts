@@ -27,6 +27,14 @@ type AuthenticatedRequest = Request & {
     }
     auth?: {
         userId?: unknown
+        sub?: unknown
+    }
+    currentUser?: {
+        _id?: unknown
+        id?: unknown
+        role?: unknown
+        email?: unknown
+        name?: unknown
     }
 }
 
@@ -57,6 +65,18 @@ function normalizeNullableString(value: unknown): string | null {
 
 function normalizeEmail(value: unknown): string {
     return normalizeString(value).toLowerCase()
+}
+
+function normalizeBoolean(value: unknown, fallback = false): boolean {
+    if (typeof value === "boolean") return value
+
+    const raw = normalizeString(value).toLowerCase()
+    if (!raw) return fallback
+
+    if (["1", "true", "yes", "y", "on"].includes(raw)) return true
+    if (["0", "false", "no", "n", "off"].includes(raw)) return false
+
+    return fallback
 }
 
 function hasOwn(value: unknown, key: string) {
@@ -91,7 +111,13 @@ function verifyPassword(user: any, password: string) {
 
 function getCurrentUserId(req: AuthenticatedRequest): string {
     return normalizeString(
-        req.user?._id ?? req.user?.id ?? req.auth?.userId ?? ""
+        req.user?._id ??
+            req.user?.id ??
+            req.currentUser?.id ??
+            req.currentUser?._id ??
+            req.auth?.sub ??
+            req.auth?.userId ??
+            ""
     )
 }
 
@@ -202,17 +228,48 @@ function buildAvatarObjectKey(userId: string, contentType: string) {
 }
 
 function resolveAvatarUrl(user: any): string | null {
-    const candidate =
-        normalizeOptionalString(user?.avatarKey) ||
-        normalizeOptionalString(user?.avatarUrl)
+    const avatarKey = normalizeOptionalString(user?.avatarKey)
+    const avatarUrl = normalizeOptionalString(user?.avatarUrl)
 
-    if (!candidate) return null
-    return resolveStoredFileUrl(candidate) ?? candidate
+    if (avatarUrl) {
+        return resolveStoredFileUrl(avatarUrl) ?? avatarUrl
+    }
+
+    if (avatarKey) {
+        return resolveStoredFileUrl(avatarKey) ?? avatarKey
+    }
+
+    return null
+}
+
+function normalizeIdValue(value: unknown): string | null {
+    const clean = normalizeString(value)
+    return clean || null
+}
+
+function normalizeIdArray(values: unknown): string[] {
+    if (!Array.isArray(values)) return []
+
+    const out: string[] = []
+    const seen = new Set<string>()
+
+    for (const value of values) {
+        const clean = normalizeString(value)
+        if (!clean || seen.has(clean)) continue
+        seen.add(clean)
+        out.push(clean)
+    }
+
+    return out
 }
 
 function buildCurrentPayload(user: any) {
     const avatarKey = normalizeNullableString(user?.avatarKey)
     const avatarUrl = resolveAvatarUrl(user)
+    const assignedDepartment = normalizeIdValue(user?.assignedDepartment)
+    const assignedDepartments = normalizeIdArray(user?.assignedDepartments)
+    const assignedWindow = normalizeIdValue(user?.assignedWindow)
+    const departmentId = normalizeIdValue(user?.departmentId)
 
     return {
         user: {
@@ -220,8 +277,43 @@ function buildCurrentPayload(user: any) {
             name: normalizeString(user?.name),
             email: normalizeOptionalString(user?.email) ?? null,
             role: normalizeOptionalString(user?.role) ?? null,
+            active:
+                typeof user?.active === "boolean" ? Boolean(user.active) : true,
+            type: normalizeOptionalString(user?.type) ?? null,
+            firstName: normalizeOptionalString(user?.firstName) ?? null,
+            middleName: normalizeOptionalString(user?.middleName) ?? null,
+            lastName: normalizeOptionalString(user?.lastName) ?? null,
+            studentId: normalizeOptionalString(user?.studentId) ?? null,
+            tcNumber: normalizeOptionalString(user?.tcNumber) ?? null,
+            mobileNumber: normalizeOptionalString(user?.mobileNumber) ?? null,
+            phone: normalizeOptionalString(user?.phone) ?? null,
+            departmentId,
+            assignedDepartment,
+            assignedDepartments,
+            assignedWindow,
+            assignedTransactionManager:
+                normalizeOptionalString(user?.assignedTransactionManager) ?? null,
+            smsUpdates:
+                typeof user?.smsUpdates === "boolean"
+                    ? Boolean(user.smsUpdates)
+                    : true,
             avatarKey,
             avatarUrl,
+            createdAt: user?.createdAt ?? null,
+            updatedAt: user?.updatedAt ?? null,
+        },
+        profile: {
+            name: normalizeString(user?.name),
+            email: normalizeOptionalString(user?.email) ?? null,
+            firstName: normalizeOptionalString(user?.firstName) ?? null,
+            middleName: normalizeOptionalString(user?.middleName) ?? null,
+            lastName: normalizeOptionalString(user?.lastName) ?? null,
+            mobileNumber: normalizeOptionalString(user?.mobileNumber) ?? null,
+            phone: normalizeOptionalString(user?.phone) ?? null,
+            smsUpdates:
+                typeof user?.smsUpdates === "boolean"
+                    ? Boolean(user.smsUpdates)
+                    : true,
         },
         avatarKey,
         avatarUrl,
@@ -264,9 +356,11 @@ function parseMultipartAvatar(
     const boundary = `--${boundaryValue}`
     const raw = body.toString("latin1")
     const parts = raw.split(boundary)
+    const fieldNamePattern =
+        /name="(?:avatar|file|image|photo|picture|profile|profileImage)"/i
 
     for (const part of parts) {
-        if (!part || !part.includes('name="avatar"')) continue
+        if (!part || !fieldNamePattern.test(part)) continue
 
         const headerEnd = part.indexOf("\r\n\r\n")
         if (headerEnd < 0) continue
@@ -274,7 +368,7 @@ function parseMultipartAvatar(
         const headerText = part.slice(0, headerEnd)
         let fileText = part.slice(headerEnd + 4)
 
-        fileText = fileText.replace(/\r\n--$/, "")
+        fileText = fileText.replace(/\r\n--\s*$/, "")
         fileText = fileText.replace(/\r\n$/, "")
 
         const contentTypeMatch = headerText.match(
@@ -298,12 +392,15 @@ function parseMultipartAvatar(
 }
 
 function extractAvatarUpload(req: Request) {
-    const contentTypeHeader = normalizeString(req.headers["content-type"]).toLowerCase()
+    const rawContentTypeHeader = normalizeString(req.headers["content-type"])
+    const lowerContentTypeHeader = rawContentTypeHeader.toLowerCase()
     const body = getRawBodyBuffer(req.body)
 
     if (!body.length) return null
 
-    const directImageContentType = ensureSupportedImageContentType(contentTypeHeader)
+    const directImageContentType = ensureSupportedImageContentType(
+        rawContentTypeHeader
+    )
     if (directImageContentType) {
         return {
             buffer: body,
@@ -311,8 +408,8 @@ function extractAvatarUpload(req: Request) {
         }
     }
 
-    if (contentTypeHeader.startsWith("multipart/form-data")) {
-        return parseMultipartAvatar(body, contentTypeHeader)
+    if (lowerContentTypeHeader.startsWith("multipart/form-data")) {
+        return parseMultipartAvatar(body, rawContentTypeHeader)
     }
 
     return null
@@ -331,6 +428,18 @@ async function uploadAvatarBufferToS3(
             ContentType: contentType,
         })
     )
+}
+
+function setAvatarFields(user: any, key: string | null, url?: string | null) {
+    const normalizedKey = normalizeNullableString(key)
+    const normalizedUrl = normalizeNullableString(url)
+
+    user.avatarKey = normalizedKey
+    user.avatarUrl = normalizedKey
+        ? resolveStoredFileUrl(normalizedKey) ??
+          normalizedUrl ??
+          normalizedKey
+        : normalizedUrl
 }
 
 export class SettingController {
@@ -368,6 +477,13 @@ export class SettingController {
             const hasEmail = hasOwn(body, "email")
             const hasCurrentPassword = hasOwn(body, "currentPassword")
             const hasNewPassword = hasOwn(body, "newPassword")
+            const hasConfirmPassword = hasOwn(body, "confirmPassword")
+            const hasFirstName = hasOwn(body, "firstName")
+            const hasMiddleName = hasOwn(body, "middleName")
+            const hasLastName = hasOwn(body, "lastName")
+            const hasMobileNumber = hasOwn(body, "mobileNumber")
+            const hasPhone = hasOwn(body, "phone")
+            const hasSmsUpdates = hasOwn(body, "smsUpdates")
             const hasAvatarKey = hasOwn(body, "avatarKey")
             const hasAvatarUrl = hasOwn(body, "avatarUrl")
 
@@ -375,6 +491,7 @@ export class SettingController {
             const nextName = normalizeString(body.name)
             const nextEmail = normalizeEmail(body.email)
             const nextPassword = normalizeString(body.newPassword)
+            const confirmPassword = normalizeString(body.confirmPassword)
 
             if (hasName) {
                 if (!nextName) {
@@ -382,6 +499,48 @@ export class SettingController {
                     return
                 }
                 user.name = nextName
+            }
+
+            if (hasFirstName) {
+                user.firstName = normalizeOptionalString(body.firstName)
+            }
+
+            if (hasMiddleName) {
+                user.middleName = normalizeOptionalString(body.middleName)
+            }
+
+            if (hasLastName) {
+                user.lastName = normalizeOptionalString(body.lastName)
+            }
+
+            if (hasMobileNumber) {
+                user.mobileNumber = normalizeOptionalString(body.mobileNumber)
+            }
+
+            if (hasPhone) {
+                user.phone = normalizeOptionalString(body.phone)
+            }
+
+            if (hasSmsUpdates) {
+                user.smsUpdates = normalizeBoolean(
+                    body.smsUpdates,
+                    Boolean(user.smsUpdates)
+                )
+            }
+
+            if (!hasName && (hasFirstName || hasMiddleName || hasLastName)) {
+                const composed = [
+                    normalizeOptionalString(user.firstName),
+                    normalizeOptionalString(user.middleName),
+                    normalizeOptionalString(user.lastName),
+                ]
+                    .filter(Boolean)
+                    .join(" ")
+                    .trim()
+
+                if (composed) {
+                    user.name = composed
+                }
             }
 
             const isChangingEmail =
@@ -431,7 +590,7 @@ export class SettingController {
                 user.email = nextEmail
             }
 
-            if (hasNewPassword) {
+            if (hasNewPassword || hasConfirmPassword) {
                 if (!currentPassword) {
                     ControllerUtils.sendBadRequest(
                         res,
@@ -452,6 +611,14 @@ export class SettingController {
                     ControllerUtils.sendBadRequest(
                         res,
                         "New password must be at least 8 characters"
+                    )
+                    return
+                }
+
+                if (hasConfirmPassword && confirmPassword !== nextPassword) {
+                    ControllerUtils.sendBadRequest(
+                        res,
+                        "Confirm password does not match"
                     )
                     return
                 }
@@ -483,17 +650,21 @@ export class SettingController {
                     (body.avatarUrl === null || !normalizeString(body.avatarUrl))
 
                 if (avatarKeyWasCleared || avatarUrlWasCleared) {
-                    user.avatarKey = null
-                    user.avatarUrl = null
+                    setAvatarFields(user, null, null)
                 } else {
                     const nextAvatarKey = normalizeOptionalString(body.avatarKey)
                     const nextAvatarUrl = normalizeOptionalString(body.avatarUrl)
 
                     if (nextAvatarKey) {
-                        user.avatarKey = nextAvatarKey
-                        user.avatarUrl = nextAvatarKey
+                        setAvatarFields(
+                            user,
+                            nextAvatarKey,
+                            nextAvatarUrl ??
+                                resolveStoredFileUrl(nextAvatarKey) ??
+                                nextAvatarKey
+                        )
                     } else if (nextAvatarUrl) {
-                        user.avatarUrl = nextAvatarUrl
+                        setAvatarFields(user, user.avatarKey ?? null, nextAvatarUrl)
                     }
                 }
             }
@@ -559,10 +730,13 @@ export class SettingController {
 
             res.status(200).json({
                 data: {
+                    method: "PUT",
                     uploadUrl,
                     key,
                     objectUrl,
                     url: objectUrl,
+                    contentType,
+                    expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
                 },
             })
         } catch (error) {
@@ -633,13 +807,23 @@ export class SettingController {
 
             await uploadAvatarBufferToS3(key, buffer, contentType)
 
+            const user = await UserModel.findById(payload.sub)
+            if (!user) {
+                res.status(404).json({ message: "User not found" })
+                return
+            }
+
             const objectUrl = resolveStoredFileUrl(key) ?? key
+            setAvatarFields(user, key, objectUrl)
+            await user.save()
 
             res.status(200).json({
                 ok: true,
                 key,
                 objectUrl,
                 url: objectUrl,
+                data: buildCurrentPayload(user),
+                message: "Avatar updated successfully",
             })
         } catch (error) {
             ControllerUtils.forwardError(error, next)
@@ -690,13 +874,41 @@ export class SettingController {
 
             await uploadAvatarBufferToS3(key, upload.buffer, upload.contentType)
 
-            user.avatarKey = key
-            user.avatarUrl = key
+            const objectUrl = resolveStoredFileUrl(key) ?? key
+            setAvatarFields(user, key, objectUrl)
             await user.save()
 
             res.status(200).json({
                 data: buildCurrentPayload(user),
                 message: "Avatar updated successfully",
+            })
+        } catch (error) {
+            if ((error as any)?.status === 401) {
+                res.status(401).json({ message: "Unauthorized" })
+                return
+            }
+            if ((error as any)?.status === 404) {
+                res.status(404).json({ message: "User not found" })
+                return
+            }
+            ControllerUtils.forwardError(error, next)
+        }
+    }
+
+    static async deleteCurrentAvatar(
+        req: Request,
+        res: Response,
+        next: NextFunction
+    ): Promise<void> {
+        try {
+            const user = await getCurrentUserOrThrow(req as AuthenticatedRequest)
+
+            setAvatarFields(user, null, null)
+            await user.save()
+
+            res.status(200).json({
+                data: buildCurrentPayload(user),
+                message: "Avatar removed successfully",
             })
         } catch (error) {
             if ((error as any)?.status === 401) {

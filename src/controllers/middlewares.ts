@@ -30,6 +30,13 @@ const allowedOrigins = buildAllowedOrigins()
 export type AuthenticatedRequest = Request & {
     auth?: AccessTokenPayload
     currentUser?: UserView
+    user?: {
+        _id?: unknown
+        id?: unknown
+        role?: unknown
+        email?: unknown
+        name?: unknown
+    }
 }
 
 function extractTokenFromHeaderValue(value: unknown): string | null {
@@ -104,10 +111,14 @@ function getBearerToken(req: Request): string | null {
     const authHeader = extractTokenFromHeaderValue(req.headers.authorization)
     if (authHeader) return authHeader
 
-    const xSessionToken = extractTokenFromHeaderValue(req.headers["x-session-token"])
+    const xSessionToken = extractTokenFromHeaderValue(
+        req.headers["x-session-token"]
+    )
     if (xSessionToken) return xSessionToken
 
-    const xSessionTokenAlt = extractTokenFromHeaderValue(req.headers["x-sessiontoken"])
+    const xSessionTokenAlt = extractTokenFromHeaderValue(
+        req.headers["x-sessiontoken"]
+    )
     if (xSessionTokenAlt) return xSessionTokenAlt
 
     const cookieToken = getTokenFromCookies(req)
@@ -117,7 +128,9 @@ function getBearerToken(req: Request): string | null {
 }
 
 export const corsMiddleware: RequestHandler = (req, res, next) => {
-    const requestOrigin = String(req.headers.origin ?? "").trim().replace(/\/$/, "")
+    const requestOrigin = String(req.headers.origin ?? "")
+        .trim()
+        .replace(/\/$/, "")
 
     if (!requestOrigin) {
         next()
@@ -181,6 +194,13 @@ export const requireAuth: RequestHandler = async (req, res, next) => {
         const authReq = req as AuthenticatedRequest
         authReq.auth = payload
         authReq.currentUser = currentUser
+        authReq.user = {
+            _id: (currentUser as any)?._id ?? currentUser.id ?? payload.sub,
+            id: currentUser.id ?? (currentUser as any)?._id ?? payload.sub,
+            role: currentUser.role,
+            email: (currentUser as any)?.email,
+            name: currentUser.name,
+        }
 
         next()
     } catch {
@@ -242,9 +262,7 @@ export const errorHandler: ErrorRequestHandler = (
             : 500
 
     const message =
-        error instanceof Error
-            ? error.message
-            : "Internal server error"
+        error instanceof Error ? error.message : "Internal server error"
 
     const response: Record<string, unknown> = {
         message,

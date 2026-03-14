@@ -27,11 +27,25 @@ export const ROUTE_PATHS = {
         forgotPassword: "/auth/forgot-password",
         resetPassword: "/auth/reset-password",
         me: "/auth/me",
+        mePassword: "/auth/me/password",
+        changePassword: "/auth/change-password",
+        meAvatar: "/auth/me/avatar",
+        meAvatarPresign: "/auth/me/avatar/presign",
     },
     settings: {
         current: "/settings/current",
         avatar: "/settings/current/avatar",
         avatarPresign: "/settings/current/avatar/presign",
+    },
+    self: {
+        me: "/me",
+        mePassword: "/me/password",
+        meAvatar: "/me/avatar",
+        meAvatarPresign: "/me/avatar/presign",
+        usersMe: "/users/me",
+        usersMePassword: "/users/me/password",
+        usersMeAvatar: "/users/me/avatar",
+        usersMeAvatarPresign: "/users/me/avatar/presign",
     },
     auditLogs: {
         list: "/audit-logs",
@@ -332,24 +346,116 @@ route.post(ROUTE_PATHS.auth.register, AuthController.register)
 route.post(ROUTE_PATHS.auth.login, AuthController.login)
 route.post(ROUTE_PATHS.auth.forgotPassword, AuthController.forgotPassword)
 route.post(ROUTE_PATHS.auth.resetPassword, AuthController.resetPassword)
-route.get(ROUTE_PATHS.auth.me, requireAuth, AuthController.me)
+
+route.get(ROUTE_PATHS.auth.me, requireAuth, SettingController.getCurrent)
+route.patch(ROUTE_PATHS.auth.me, requireAuth, SettingController.updateCurrent)
+route.patch(
+    ROUTE_PATHS.auth.mePassword,
+    requireAuth,
+    SettingController.updateCurrent
+)
+route.patch(
+    ROUTE_PATHS.auth.changePassword,
+    requireAuth,
+    SettingController.updateCurrent
+)
+route.post(
+    ROUTE_PATHS.auth.meAvatarPresign,
+    requireAuth,
+    SettingController.presignCurrentAvatarUpload
+)
+route.put(
+    ROUTE_PATHS.auth.meAvatar,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.putCurrentAvatarUpload
+)
+route.post(
+    ROUTE_PATHS.auth.meAvatar,
+    requireAuth,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.uploadCurrentAvatar
+)
+route.delete(
+    ROUTE_PATHS.auth.meAvatar,
+    requireAuth,
+    SettingController.deleteCurrentAvatar
+)
+
+route.get(ROUTE_PATHS.self.me, requireAuth, SettingController.getCurrent)
+route.patch(ROUTE_PATHS.self.me, requireAuth, SettingController.updateCurrent)
+route.patch(
+    ROUTE_PATHS.self.mePassword,
+    requireAuth,
+    SettingController.updateCurrent
+)
+route.post(
+    ROUTE_PATHS.self.meAvatarPresign,
+    requireAuth,
+    SettingController.presignCurrentAvatarUpload
+)
+route.put(
+    ROUTE_PATHS.self.meAvatar,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.putCurrentAvatarUpload
+)
+route.post(
+    ROUTE_PATHS.self.meAvatar,
+    requireAuth,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.uploadCurrentAvatar
+)
+route.delete(
+    ROUTE_PATHS.self.meAvatar,
+    requireAuth,
+    SettingController.deleteCurrentAvatar
+)
+
+route.get(ROUTE_PATHS.self.usersMe, requireAuth, SettingController.getCurrent)
+route.patch(
+    ROUTE_PATHS.self.usersMe,
+    requireAuth,
+    SettingController.updateCurrent
+)
+route.patch(
+    ROUTE_PATHS.self.usersMePassword,
+    requireAuth,
+    SettingController.updateCurrent
+)
+route.post(
+    ROUTE_PATHS.self.usersMeAvatarPresign,
+    requireAuth,
+    SettingController.presignCurrentAvatarUpload
+)
+route.put(
+    ROUTE_PATHS.self.usersMeAvatar,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.putCurrentAvatarUpload
+)
+route.post(
+    ROUTE_PATHS.self.usersMeAvatar,
+    requireAuth,
+    raw({ type: () => true, limit: "5mb" }),
+    SettingController.uploadCurrentAvatar
+)
+route.delete(
+    ROUTE_PATHS.self.usersMeAvatar,
+    requireAuth,
+    SettingController.deleteCurrentAvatar
+)
 
 route.get(
     ROUTE_PATHS.settings.current,
     requireAuth,
-    requireRoles("ADMIN", "STAFF"),
     SettingController.getCurrent
 )
 route.patch(
     ROUTE_PATHS.settings.current,
     requireAuth,
-    requireRoles("ADMIN", "STAFF"),
     SettingController.updateCurrent
 )
 route.post(
     ROUTE_PATHS.settings.avatarPresign,
     requireAuth,
-    requireRoles("ADMIN", "STAFF"),
     SettingController.presignCurrentAvatarUpload
 )
 route.put(
@@ -360,9 +466,13 @@ route.put(
 route.post(
     ROUTE_PATHS.settings.avatar,
     requireAuth,
-    requireRoles("ADMIN", "STAFF"),
     raw({ type: () => true, limit: "5mb" }),
     SettingController.uploadCurrentAvatar
+)
+route.delete(
+    ROUTE_PATHS.settings.avatar,
+    requireAuth,
+    SettingController.deleteCurrentAvatar
 )
 
 route.get(
