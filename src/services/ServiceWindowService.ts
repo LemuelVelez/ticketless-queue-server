@@ -1,6 +1,14 @@
 import { Types } from "mongoose"
-import { ServiceWindowModel } from "../models/Model"
+import { ServiceWindowModel, UserModel } from "../models/Model"
 import { NameService } from "./NameService"
+
+export type ServiceWindowAssignedStaffView = {
+    id: string
+    name: string
+    email?: string
+    active: boolean
+    role: "STAFF"
+}
 
 export type ServiceWindowView = {
     id: string
@@ -12,6 +20,9 @@ export type ServiceWindowView = {
     primaryDepartmentName?: string
     departmentIds: string[]
     departmentNames: string[]
+    assignedStaffIds: string[]
+    assignedStaffNames: string[]
+    assignedStaff: ServiceWindowAssignedStaffView[]
     createdAt?: Date
     updatedAt?: Date
 }
@@ -55,8 +66,52 @@ function collectWindowDepartments(window: any) {
     return out
 }
 
+async function getAssignedStaffMap(
+    ids: Array<string | Types.ObjectId | null | undefined>
+): Promise<Map<string, ServiceWindowAssignedStaffView[]>> {
+    const normalizedWindowIds = Array.from(
+        new Set(ids.map((id) => normalizeObjectIdString(id)).filter(Boolean) as string[])
+    )
+
+    if (!normalizedWindowIds.length) return new Map()
+
+    const staffUsers = await UserModel.find({
+        role: "STAFF",
+        assignedWindow: {
+            $in: normalizedWindowIds.map((id) => new Types.ObjectId(id)),
+        },
+    })
+        .select("name email active assignedWindow")
+        .sort({ name: 1, email: 1, createdAt: 1 })
+        .lean()
+
+    const map = new Map<string, ServiceWindowAssignedStaffView[]>()
+
+    for (const user of staffUsers as any[]) {
+        const assignedWindowId = normalizeObjectIdString(user?.assignedWindow)
+        if (!assignedWindowId) continue
+
+        const current = map.get(assignedWindowId) || []
+
+        current.push({
+            id: NameService.toIdString(user?._id) ?? "",
+            name: String(user?.name ?? "").trim(),
+            email: String(user?.email ?? "").trim() || undefined,
+            active: Boolean(user?.active),
+            role: "STAFF",
+        })
+
+        map.set(assignedWindowId, current)
+    }
+
+    return map
+}
+
 export class ServiceWindowService {
-    static toView(window: any): ServiceWindowView {
+    static toView(
+        window: any,
+        assignedStaff: ServiceWindowAssignedStaffView[] = []
+    ): ServiceWindowView {
         const primaryDepartment = window?.department
         const departmentEntries = collectWindowDepartments(window)
 
@@ -70,6 +125,16 @@ export class ServiceWindowService {
                 : departmentEntries[0]?.name ?? ""
         ).trim()
 
+        const normalizedAssignedStaff = assignedStaff
+            .filter((staff) => Boolean(staff?.id))
+            .map((staff) => ({
+                id: String(staff.id).trim(),
+                name: String(staff.name ?? "").trim(),
+                email: String(staff.email ?? "").trim() || undefined,
+                active: Boolean(staff.active),
+                role: "STAFF" as const,
+            }))
+
         return {
             id: NameService.toIdString(window?._id) ?? "",
             name: String(window?.name ?? "").trim(),
@@ -82,6 +147,11 @@ export class ServiceWindowService {
             departmentNames: departmentEntries
                 .map((department) => String(department.name ?? "").trim())
                 .filter((value): value is string => Boolean(value)),
+            assignedStaffIds: normalizedAssignedStaff.map((staff) => staff.id),
+            assignedStaffNames: normalizedAssignedStaff
+                .map((staff) => staff.name)
+                .filter(Boolean),
+            assignedStaff: normalizedAssignedStaff,
             createdAt: window?.createdAt,
             updatedAt: window?.updatedAt,
         }
@@ -96,7 +166,14 @@ export class ServiceWindowService {
             .populate("departmentIds", "name code")
             .exec()
 
-        return window ? ServiceWindowService.toView(window) : null
+        if (!window) return null
+
+        const assignedStaffMap = await getAssignedStaffMap([normalizedWindowId])
+
+        return ServiceWindowService.toView(
+            window,
+            assignedStaffMap.get(normalizedWindowId) || []
+        )
     }
 
     static async list(options?: {
@@ -127,7 +204,16 @@ export class ServiceWindowService {
             .sort({ number: 1, name: 1 })
             .exec()
 
-        return windows.map((window) => ServiceWindowService.toView(window))
+        const assignedStaffMap = await getAssignedStaffMap(
+            windows.map((window) => window._id)
+        )
+
+        return windows.map((window) =>
+            ServiceWindowService.toView(
+                window,
+                assignedStaffMap.get(String(window._id)) || []
+            )
+        )
     }
 
     static async listEnabled(): Promise<ServiceWindowView[]> {

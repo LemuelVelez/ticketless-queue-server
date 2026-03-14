@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from "express"
 import { Types } from "mongoose"
 import { ServiceWindowService } from "../services/ServiceWindowService"
 import { ControllerUtils } from "./ControllerUtils"
-import { DepartmentModel, ServiceWindowModel } from "../models/Model"
+import { DepartmentModel, ServiceWindowModel, UserModel } from "../models/Model"
 
 function isValidObjectId(value: string): boolean {
     return Types.ObjectId.isValid(String(value ?? "").trim())
@@ -74,7 +74,10 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
     return out
 }
 
-function parseIdArray(value: unknown): string[] {
+function parseIdArray(
+    value: unknown,
+    keys: string[] = ["_id", "id", "departmentId", "value"]
+): string[] {
     if (!Array.isArray(value)) return []
 
     const out: string[] = []
@@ -87,10 +90,13 @@ function parseIdArray(value: unknown): string[] {
         }
 
         if (isRecord(item)) {
-            const id = getString(
-                item._id ?? item.id ?? item.departmentId ?? item.value
-            )
-            if (id) out.push(id)
+            for (const key of keys) {
+                const id = getString(item[key])
+                if (id) {
+                    out.push(id)
+                    break
+                }
+            }
         }
     }
 
@@ -99,10 +105,66 @@ function parseIdArray(value: unknown): string[] {
 
 function collectDepartmentIds(source: Record<string, unknown>): string[] {
     return uniqueStrings([
-        ...parseIdArray(source.departmentIds),
-        ...parseIdArray(source.departments),
+        ...parseIdArray(source.departmentIds, [
+            "_id",
+            "id",
+            "departmentId",
+            "value",
+        ]),
+        ...parseIdArray(source.departments, [
+            "_id",
+            "id",
+            "departmentId",
+            "value",
+        ]),
         getString(source.departmentId),
         getString(source.department),
+    ])
+}
+
+function hasAssignedStaffPayload(source: Record<string, unknown>): boolean {
+    return (
+        hasOwn(source, "assignedStaffIds") ||
+        hasOwn(source, "assignedStaff") ||
+        hasOwn(source, "staffIds") ||
+        hasOwn(source, "staff") ||
+        hasOwn(source, "assignedStaffId") ||
+        hasOwn(source, "staffId")
+    )
+}
+
+function collectAssignedStaffIds(source: Record<string, unknown>): string[] {
+    return uniqueStrings([
+        ...parseIdArray(source.assignedStaffIds, [
+            "_id",
+            "id",
+            "staffId",
+            "userId",
+            "value",
+        ]),
+        ...parseIdArray(source.assignedStaff, [
+            "_id",
+            "id",
+            "staffId",
+            "userId",
+            "value",
+        ]),
+        ...parseIdArray(source.staffIds, [
+            "_id",
+            "id",
+            "staffId",
+            "userId",
+            "value",
+        ]),
+        ...parseIdArray(source.staff, [
+            "_id",
+            "id",
+            "staffId",
+            "userId",
+            "value",
+        ]),
+        getString(source.assignedStaffId),
+        getString(source.staffId),
     ])
 }
 
@@ -110,8 +172,18 @@ function extractExistingWindowState(source: unknown) {
     const record = isRecord(source) ? source : {}
 
     const departmentIds = uniqueStrings([
-        ...parseIdArray(record.departmentIds),
-        ...parseIdArray(record.departments),
+        ...parseIdArray(record.departmentIds, [
+            "_id",
+            "id",
+            "departmentId",
+            "value",
+        ]),
+        ...parseIdArray(record.departments, [
+            "_id",
+            "id",
+            "departmentId",
+            "value",
+        ]),
         getString(record.departmentId),
         getString(record.department),
     ])
@@ -161,6 +233,131 @@ async function validateDepartmentIds(
     }
 
     return null
+}
+
+async function validateAssignedStaffIds(
+    assignedStaffIds: string[]
+): Promise<string | null> {
+    for (const staffId of assignedStaffIds) {
+        if (!isValidObjectId(staffId)) {
+            return "Invalid staffId"
+        }
+    }
+
+    if (!assignedStaffIds.length) return null
+
+    const count = await UserModel.countDocuments({
+        _id: {
+            $in: assignedStaffIds.map((staffId) => new Types.ObjectId(staffId)),
+        },
+        role: "STAFF",
+    })
+
+    if (count !== assignedStaffIds.length) {
+        return "One or more assigned staff users do not exist or are not STAFF"
+    }
+
+    return null
+}
+
+async function listAssignedStaffIdsByWindow(
+    windowId: string
+): Promise<string[]> {
+    const users = await UserModel.find({
+        role: "STAFF",
+        assignedWindow: new Types.ObjectId(windowId),
+    })
+        .select("_id")
+        .lean()
+
+    return uniqueStrings(users.map((user: any) => getString(user?._id)))
+}
+
+async function syncAssignedStaffToWindow(
+    windowId: string,
+    departmentIds: string[],
+    assignedStaffIds: string[]
+): Promise<void> {
+    const normalizedWindowId = new Types.ObjectId(windowId)
+    const normalizedAssignedStaffIds = uniqueStrings(assignedStaffIds)
+
+    const currentAssignedStaffIds = await listAssignedStaffIdsByWindow(windowId)
+
+    const removedStaffIds = currentAssignedStaffIds.filter(
+        (staffId) => !normalizedAssignedStaffIds.includes(staffId)
+    )
+
+    if (removedStaffIds.length) {
+        await UserModel.updateMany(
+            {
+                _id: {
+                    $in: removedStaffIds.map((staffId) => new Types.ObjectId(staffId)),
+                },
+                role: "STAFF",
+                assignedWindow: normalizedWindowId,
+            },
+            {
+                $unset: {
+                    assignedWindow: 1,
+                },
+            }
+        )
+    }
+
+    if (!normalizedAssignedStaffIds.length) return
+
+    const departmentDocs = await DepartmentModel.find({
+        _id: {
+            $in: departmentIds.map((departmentId) => new Types.ObjectId(departmentId)),
+        },
+    })
+        .select("_id transactionManager")
+        .lean()
+
+    const departmentMap = new Map<string, any>()
+    for (const department of departmentDocs as any[]) {
+        const id = getString(department?._id)
+        if (id) {
+            departmentMap.set(id, department)
+        }
+    }
+
+    const orderedDepartmentObjectIds = departmentIds
+        .map((departmentId) => departmentMap.get(departmentId))
+        .filter(Boolean)
+        .map((department) => new Types.ObjectId(getString(department._id)))
+
+    const primaryDepartmentId = orderedDepartmentObjectIds[0]
+    const assignedTransactionManager = getString(
+        departmentMap.get(departmentIds[0])?.transactionManager
+    ).toUpperCase()
+
+    const setPayload: Record<string, unknown> = {
+        assignedWindow: normalizedWindowId,
+        assignedDepartments: orderedDepartmentObjectIds,
+    }
+
+    if (primaryDepartmentId) {
+        setPayload.assignedDepartment = primaryDepartmentId
+    }
+
+    if (assignedTransactionManager) {
+        setPayload.assignedTransactionManager = assignedTransactionManager
+    }
+
+    await UserModel.updateMany(
+        {
+            _id: {
+                $in: normalizedAssignedStaffIds.map(
+                    (staffId) => new Types.ObjectId(staffId)
+                ),
+            },
+            role: "STAFF",
+        },
+        {
+            $set: setPayload,
+        }
+    )
 }
 
 function buildWindowPayload(
@@ -297,6 +494,7 @@ export class ServiceWindowController {
         try {
             const body = getBodyObject(req)
             const built = buildWindowPayload(body)
+            const assignedStaffIds = collectAssignedStaffIds(body)
 
             if ("error" in built) {
                 ControllerUtils.sendBadRequest(res, built.error)
@@ -312,9 +510,26 @@ export class ServiceWindowController {
                 return
             }
 
+            const staffValidationError = await validateAssignedStaffIds(
+                assignedStaffIds
+            )
+
+            if (staffValidationError) {
+                ControllerUtils.sendBadRequest(res, staffValidationError)
+                return
+            }
+
             const created = await ServiceWindowModel.create(built.payload)
+
+            await syncAssignedStaffToWindow(
+                String(created._id),
+                built.payload.departmentIds,
+                assignedStaffIds
+            )
+
             const createdView =
-                (await ServiceWindowModel.findById(created._id).lean()) || created
+                (await ServiceWindowService.getById(String(created._id))) ||
+                (await ServiceWindowModel.findById(created._id).lean())
 
             res.status(201).json({
                 data: createdView,
@@ -367,11 +582,31 @@ export class ServiceWindowController {
                 return
             }
 
+            const nextAssignedStaffIds = hasAssignedStaffPayload(body)
+                ? collectAssignedStaffIds(body)
+                : await listAssignedStaffIdsByWindow(windowId)
+
+            const staffValidationError = await validateAssignedStaffIds(
+                nextAssignedStaffIds
+            )
+
+            if (staffValidationError) {
+                ControllerUtils.sendBadRequest(res, staffValidationError)
+                return
+            }
+
             existing.set(built.payload)
             await existing.save()
 
+            await syncAssignedStaffToWindow(
+                windowId,
+                built.payload.departmentIds,
+                nextAssignedStaffIds
+            )
+
             const updated =
-                (await ServiceWindowModel.findById(windowId).lean()) || existing
+                (await ServiceWindowService.getById(windowId)) ||
+                (await ServiceWindowModel.findById(windowId).lean())
 
             res.status(200).json({
                 data: updated,
@@ -402,6 +637,18 @@ export class ServiceWindowController {
                 ControllerUtils.sendNotFound(res, "Service window not found")
                 return
             }
+
+            await UserModel.updateMany(
+                {
+                    role: "STAFF",
+                    assignedWindow: new Types.ObjectId(windowId),
+                },
+                {
+                    $unset: {
+                        assignedWindow: 1,
+                    },
+                }
+            )
 
             res.status(200).json({
                 data: deleted,
